@@ -1,0 +1,21 @@
+{
+    "folders": [
+        {
+            "name": "○ Root",
+            "path": "..",
+        },
+        {
+            "name": "◙ afl-cassowire",
+            "path": "../afl-cassowire",
+        },
+        {
+            "name": "◙ http_throughput",
+            "path": "../tools/http_throughput",
+        },
+        {
+            "name": "• AFL++",
+            "path": "../aflpp/src",
+        },
+    ],
+    "settings": {}
+}
