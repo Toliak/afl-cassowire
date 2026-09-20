@@ -1,0 +1,199 @@
+# Must be docker & podman compatible!
+
+ARG BASE_IMAGE="nothing.local/check_your_env"
+FROM ${BASE_IMAGE} AS vscode-server
+
+ENV DEBIAN_FRONTEND=noninteractive
+
+# Enable apt-get cache, see https://stackoverflow.com/a/79936062/14142236
+RUN [ -f "/etc/apt/apt.conf.d/docker-clean" ] && \
+    mv /etc/apt/apt.conf.d/docker-clean /etc/apt/apt.conf.d/docker-clean.disabled || \
+    true
+
+RUN --mount=type=cache,sharing=locked,target=/var/cache/apt \
+\
+    apt-get update -y --allow-releaseinfo-change && \
+    apt-get install -y --no-install-recommends \
+        curl \
+        ca-certificates \
+        bash
+
+RUN U_NAME=$(uname -m) && \
+    if [ "${U_NAME}" = "aarch64" ]; then \
+        ARCH="arm64"; \
+    elif [ "${U_NAME}" = "x86_64" ]; then \
+        ARCH="x64"; \
+    elif [ "${U_NAME}" = "armv7l" ]; then \
+        ARCH="armhf"; \
+    else \
+        echo "Unable to detect ARCH=$ARCH" && \
+        exit 1; \
+    fi && \
+    echo "$ARCH" > /tmp/arch
+
+COPY ./overlay/vscode/cli.sh ./overlay/vscode/server.sh     /opt/vscode/
+
+RUN mkdir -p /root/.vscode-server
+
+ARG VSCODE_VERSION
+RUN if [ -n "${VSCODE_VERSION}" ]; then \
+        bash /opt/vscode/cli.sh "${VSCODE_VERSION}" "$(cat /tmp/arch)" && \
+        bash /opt/vscode/server.sh "${VSCODE_VERSION}" "$(cat /tmp/arch)"; \
+    fi
+
+COPY ./overlay/vscode/extensions.sh ./overlay/vscode/extensions.list     /opt/vscode/
+
+RUN if [ -n "${VSCODE_VERSION}" ]; then \
+        bash /opt/vscode/extensions.sh "${VSCODE_VERSION}" /opt/vscode/extensions.list; \
+    fi
+
+# ----------------------------------------
+
+# See https://github.com/Toliak/MCE2
+FROM ${BASE_IMAGE} AS mce-configs
+
+ENV DEBIAN_FRONTEND=noninteractive
+
+# Enable apt-get cache, see https://stackoverflow.com/a/79936062/14142236
+RUN [ -f "/etc/apt/apt.conf.d/docker-clean" ] && \
+    mv /etc/apt/apt.conf.d/docker-clean /etc/apt/apt.conf.d/docker-clean.disabled || \
+    true
+
+RUN --mount=type=cache,sharing=locked,target=/var/cache/apt \
+\
+    apt-get update -y --allow-releaseinfo-change && \
+    apt-get install -y --no-install-recommends \
+        curl \
+        ca-certificates
+
+ARG MCE_VERSION
+RUN if [ -n "${MCE_VERSION}" ]; then \
+        curl -L "https://github.com/Toliak/MCE2/releases/download/v${MCE_VERSION}/mce-linux-amd64" --output /tmp/mce && \
+        chmod +x /tmp/mce && \
+        mkdir -p /opt/mce-install && \
+        /tmp/mce -ALL -y -no-ui --home-dir=/etc/skel; \
+    fi
+
+# ----------------------------------------
+
+FROM ${BASE_IMAGE} AS target
+
+ENV DEBIAN_FRONTEND=noninteractive
+
+# Enable apt-get cache, see https://stackoverflow.com/a/79936062/14142236
+RUN [ -f "/etc/apt/apt.conf.d/docker-clean" ] && \
+    mv /etc/apt/apt.conf.d/docker-clean /etc/apt/apt.conf.d/docker-clean.disabled || \
+    true
+
+RUN --mount=type=cache,sharing=locked,target=/var/cache/apt \
+\
+    apt-get update -y --allow-releaseinfo-change && \
+    apt-get install -y --no-install-recommends \
+        openssh-server \
+        sudo \
+        curl \
+        vim \
+        git \
+        golang \
+        python3 \
+        python3-venv \
+        python3-pip \
+        less \
+        make \
+        locales \
+        curl \
+        jq \
+        zsh \
+        tmux \
+        git \
+        procps \
+        podman \
+        fuse-overlayfs \
+        uidmap \
+        libcap2-bin \
+        gcc \
+        gcc-14-plugin-dev \
+        g++ \
+        build-essential \
+        python3-dev \
+        automake \
+        cmake \
+        git \
+        flex \
+        bison \
+        libglib2.0-dev \
+        libpixman-1-dev \
+        python3-setuptools \
+        cargo \
+        libgtk-3-dev \
+        wget \
+        curl \
+        psmisc \
+        xxd \
+        netcat-openbsd \
+        clang \
+        lld \
+        tree \
+        libssl-dev \
+        libperl-dev
+
+# TODO: add sloppatch
+
+RUN sed -i -e 's/# en_US.UTF-8 UTF-8/en_US.UTF-8 UTF-8/' /etc/locale.gen && \
+    locale-gen
+
+COPY --from=mce-configs /etc/skel /etc/skel
+
+ARG USER_NAME
+ARG USER_PASS
+ARG USER_UID
+ARG USER_GID
+
+# WARN: no sudo, `echo "$USER_NAME ALL=(ALL) ALL" > "/etc/sudoers.d/$USER_NAME" && \`
+RUN CURRENT_SHELL=$(getent passwd $(whoami) | cut -d: -f7) && \
+    if [ -f /etc/skel/.zshrc ]; then CURRENT_SHELL=$(which zsh); fi; \
+    groupadd --gid "${USER_GID}" "${USER_NAME}" && \
+    useradd --uid "${USER_UID}" --gid "${USER_GID}" -m "${USER_NAME}" -s "$CURRENT_SHELL" && \
+    echo "${USER_NAME}:${USER_PASS}" | chpasswd
+
+RUN mkdir -p /run/sshd && \
+    ssh-keygen -A
+
+COPY ./overlay/ssh/sshd_config /etc/ssh/sshd_config
+
+COPY --from=vscode-server /root/.vscode-server "/home/${USER_NAME}/.vscode-server"
+RUN chown "${USER_UID}:${USER_GID}" -R "/home/${USER_NAME}/.vscode-server"
+
+# For podman.
+# Add subuid and subgid.
+# Drop suid from new{u,g}idmap because it must be executed from the user that mapped to the host's subuid 0.
+COPY ./overlay/podman/etc /etc/containers
+COPY ./overlay/podman/user /home/"${USER_NAME}"/.config/containers
+
+# Add non-root uids as subuid. 
+# That increases chances to run a container from the additional-image-store without issues
+RUN echo "${USER_NAME}:100000:32768\n${USER_NAME}:1:$((USER_UID - 1))" > /etc/subuid && \
+    cp /etc/subuid /etc/subgid && \
+    chmod -s /usr/bin/newgidmap /usr/bin/newuidmap && \
+    setcap cap_setgid+ep /usr/bin/newgidmap && \
+    setcap cap_setuid+ep /usr/bin/newuidmap && \
+    chown -R "${USER_UID}:${USER_GID}" /home/"${USER_NAME}"/.config/containers/ && \
+    mkdir -p /var/lib/shared
+
+USER "${USER_NAME}"
+
+# Add ssh key
+ARG SSH_PUB_KEY
+RUN if [ -n "${SSH_PUB_KEY}" ]; then \
+        mkdir -p "/home/${USER_NAME}/.ssh" && \
+        chmod 700 "/home/${USER_NAME}/.ssh" && \
+        echo "${SSH_PUB_KEY}" > "/home/${USER_NAME}/.ssh/authorized_keys"; \
+    fi
+
+# Initialize the shell (if base_image has something to initialize) 
+RUN CURRENT_SHELL=$(getent passwd $(whoami) | cut -d: -f7) && \
+    "$CURRENT_SHELL" -i -c 'echo'
+
+USER root
+EXPOSE 22
+CMD ["/usr/sbin/sshd", "-De", "-o", "LogLevel=VERBOSE"]

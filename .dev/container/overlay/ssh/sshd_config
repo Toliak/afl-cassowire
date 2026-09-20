@@ -1,0 +1,16 @@
+Port 22
+AddressFamily any
+ListenAddress 0.0.0.0
+
+PermitRootLogin yes
+
+PasswordAuthentication yes
+
+KbdInteractiveAuthentication no
+
+AllowTcpForwarding yes
+X11Forwarding no
+PrintMotd no
+AcceptEnv LANG LC_* COLORTERM NO_COLOR
+
+Subsystem	sftp	/usr/lib/openssh/sftp-server
