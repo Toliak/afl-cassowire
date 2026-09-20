@@ -1,0 +1,63 @@
+--- a/instrumentation/SanitizerCoveragePCGUARD.so.cc
++++ b/instrumentation/SanitizerCoveragePCGUARD.so.cc
+@@ -707,6 +709,61 @@ bool ModuleSanitizerCoverageAFL::isNoAbortFunction(Function &F) {
+ void ModuleSanitizerCoverageAFL::updateCoverageBitmap(IRBuilder<> &IRB,
+                                                       Value *CoverageIndex,
+                                                       Value *MapPtr) {
++  // ========== Insert fprintf debug output ==========
++  // 1. Get the current Module
++  BasicBlock *BB = IRB.GetInsertBlock();
++  Function *F = BB->getParent();
++  Module *M = F->getParent();
++  LLVMContext &Ctx = M->getContext();
++
++  // 2. Declare fprintf (argument types: i8* and i8*)
++  Type *Int8PtrTy = PointerType::get(Type::getInt8Ty(Ctx), 0);   // i8*
++  std::vector<Type*> FPrintfArgs = {Int8PtrTy, Int8PtrTy};
++  FunctionType *FPrintfType = FunctionType::get(
++      Type::getInt32Ty(Ctx),   // return int
++      FPrintfArgs,
++      true                     // variadic
++  );
++  FunctionCallee FPrintfFunc = M->getOrInsertFunction("fprintf", FPrintfType);
++
++  // 3. Get the stderr global variable (type is i8**)
++  Type *Int8PtrPtrTy = PointerType::get(Int8PtrTy, 0);   // i8**
++  GlobalVariable *StderrVar = M->getGlobalVariable("stderr");
++  if (!StderrVar) {
++      StderrVar = new GlobalVariable(
++          *M,
++          Int8PtrPtrTy,
++          false,
++          GlobalValue::ExternalLinkage,
++          nullptr,
++          "stderr"
++      );
++  }
++  // Load the value of stderr (get i8*, i.e., FILE*)
++  Value *StderrVal = IRB.CreateLoad(Int8PtrTy, StderrVar, "stderr_load");
++
++  // 4. Create the format string constant
++  Value *FormatStr = IRB.CreateGlobalStringPtr("PCGUARD %u\n", "fmt_str");
++
++  // 5. Handle CoverageIndex type -> ensure it is i32 (to match %u)
++  Value *IdxArg = CoverageIndex;
++  Type *IdxType = IdxArg->getType();
++  if (IdxType->isIntegerTy()) {
++      unsigned BitWidth = IdxType->getIntegerBitWidth();
++      if (BitWidth != 32) {
++          IdxArg = IRB.CreateIntCast(IdxArg, Type::getInt32Ty(Ctx), false, "idx_cast");
++      }
++  } else {
++      // If CoverageIndex is not an integer (theoretically shouldn't happen), additional handling may be needed
++      // This can be ignored or an assertion can be added here
++  }
++
++  // 6. Insert the fprintf call
++  std::vector<Value*> CallArgs = {StderrVal, FormatStr, IdxArg};
++  IRB.CreateCall(FPrintfFunc, CallArgs, "fprintf_call");
++  // ========== End of insertion ==========
++
++  // Left part
+ 
+   Value *MapPtrIdx = IRB.CreateGEP(Int8Ty, MapPtr, CoverageIndex);

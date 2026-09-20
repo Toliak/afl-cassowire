@@ -1,0 +1,53 @@
+diff --git a/include/envs.h b/include/envs.h
+index 25da821..b3c70a3 100644
+--- a/include/envs.h
++++ b/include/envs.h
+@@ -147,6 +147,7 @@ static char *afl_environment_variables[] = {
+     "AFL_PRELOAD_DISCRIMINATE_FORKSERVER_PARENT", "AFL_FORKSRV_UID",
+     "AFL_FORKSRV_GID", "AFL_COMPILER_LAUNCHER", "AFL_FRAMESHIFT_DISABLE",
+     "AFL_FRAMESHIFT_MAX_OVERHEAD", "AFL_OLD_CHILD_SYNC", "AFL_CHILD_SYNC_SHM",
++    "AFL_PROXY_LLVM_ONLY_FSRV",
+ #ifdef __AFL_CODE_COVERAGE
+     "AFL_DUMP_PC_MAP",
+ #endif
+diff --git a/instrumentation/SanitizerCoveragePCGUARD.so.cc b/instrumentation/SanitizerCoveragePCGUARD.so.cc
+index ea47d84..ab9ce43 100644
+This patch required for the afl-cassowire binary. It preserves fork-server / persistence mode and removes the coverage-noise
+--- a/instrumentation/SanitizerCoveragePCGUARD.so.cc
++++ b/instrumentation/SanitizerCoveragePCGUARD.so.cc
+@@ -707,6 +707,10 @@ bool ModuleSanitizerCoverageAFL::isNoAbortFunction(Function &F) {
+ void ModuleSanitizerCoverageAFL::updateCoverageBitmap(IRBuilder<> &IRB,
+                                                       Value *CoverageIndex,
+                                                       Value *MapPtr) {
++  if (getenv("AFL_PROXY_LLVM_ONLY_FSRV")) {
++    SAYF("Skipped coverage due to AFL_PROXY_LLVM_ONLY_FSRV\n");
++    return;
++  }
+ 
+   Value *MapPtrIdx = IRB.CreateGEP(Int8Ty, MapPtr, CoverageIndex);
+ 
+diff --git a/instrumentation/afl-compiler-rt.o.c b/instrumentation/afl-compiler-rt.o.c
+index ed03ed1..683f370 100644
+This patch is also required for the afl-cassowire. It allows to set the afl_area_map size manually to correctly pass-through it to the target
+--- a/instrumentation/afl-compiler-rt.o.c
++++ b/instrumentation/afl-compiler-rt.o.c
+@@ -2850,6 +2850,19 @@ void __sanitizer_cov_trace_pc_guard_init(uint32_t *start, uint32_t *stop) {
+ 
+ #endif  // __AFL_CODE_COVERAGE
+ 
++  x = getenv("PROXY_AFL_FORCE_FINAL_LOC");
++  if (x) {
++    u32 proxy_afl_force_final_loc = (u32)atoi(x);
++
++    if (!proxy_afl_force_final_loc) {
++      fprintf(stderr, "[-] ERROR: Invalid PROXY_AFL_FORCE_FINAL_LOC\n");
++      abort();
++    }
++
++    __afl_final_loc = proxy_afl_force_final_loc;
++
++  }
++
+   if (__afl_debug) {
+ 
+     fprintf(stderr,
