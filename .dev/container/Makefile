@@ -30,7 +30,7 @@ SHARED_RUN_OPTS := 		--rm \
 						--device /dev/fuse \
 						-e TERM=xterm-256color \
 						-p "$(SSH_ADDR):22" \
-						-v "$$PWD/../..:/opt/workdir" \
+						-v "$(MAKEFILE_DIR)/../..:/opt/workdir" \
 						-v "$$HOME/.local/share/containers/storage:/var/lib/shared:ro" \
 						--name "$(CONTAINER_NAME)"
 
