@@ -1,0 +1,4 @@
+```
+meson setup build
+meson 
+```
