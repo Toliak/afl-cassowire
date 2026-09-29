@@ -1,0 +1,53 @@
+{
+    "folders": [
+        {
+            "name": "○ Root",
+            "path": "..",
+        },
+        {
+            "name": "◙ afl-cassowire",
+            "path": "../afl-cassowire",
+        },
+        {
+            "name": "◙ http_throughput",
+            "path": "../tools/http_throughput",
+        },
+        {
+            "name": "• AFL++",
+            "path": "../aflpp/src",
+        },
+    ],
+    "settings": {
+        "todohighlight.keywords": [
+            {
+                "text": "WARN:",
+                "backgroundColor": "rgb(255,122,42)",
+                "color": "#ffffff",
+                "overviewRulerColor": "rgba(255,122,42, 0.8)"
+            },
+            {
+                "text": "TODO:",
+                "color": "#fff",
+                "backgroundColor": "rgb(255,189,42)",
+                "overviewRulerColor": "rgba(255,189,42, 0.8)"
+            },
+            {
+                "text": "FIXME:",
+                "color": "#fff",
+                "backgroundColor": "rgb(240,98,146)",
+                "overviewRulerColor": "rgba(240,98,146, 0.8)"
+            },
+            {
+                "text": "------------------",
+                "color": "#fff",
+                "backgroundColor": "rgb(113, 113, 113)",
+                "overviewRulerColor": "rgba(113, 113, 113, 0.8)"
+            }
+        ]
+    },
+    "extensions": {
+        "recommendations": [
+            "mesonbuild.mesonbuild"
+        ]
+    }
+}
