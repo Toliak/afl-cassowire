@@ -7,6 +7,7 @@
 #include <variant>
 #include <optional>
 #include <cstdlib>
+#include <cstring>
 #include <csignal>
 #include <filesystem>
 #include <unistd.h>
@@ -18,11 +19,12 @@
 
 #include <argparse/argparse.hpp>
 
-#include "afl_compat.hpp"
 #include "config.hpp"
 #include "process.hpp"
 #include "network.hpp"
 #include "utils.hpp"
+
+__AFL_FUZZ_INIT();
 
 // Global state for signal handler
 volatile sig_atomic_t g_child_pid = 0;
@@ -125,7 +127,7 @@ int run_proxy_mode(const Config& cfg) {
     }
 
     // Eager log file creation
-    if (!create_log_file(cfg.target.log.stdout) || !create_log_file(cfg.target.log.stderr)) {
+    if (!create_log_file(cfg.target.log.stdout_path) || !create_log_file(cfg.target.log.stderr_path)) {
         return 1;
     }
 

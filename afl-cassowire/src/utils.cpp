@@ -5,6 +5,7 @@
 #include <csignal>
 #include <cstdlib>
 #include <unistd.h>
+#include <errno.h>
 
 namespace utils {
 
