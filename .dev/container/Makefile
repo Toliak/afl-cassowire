@@ -1,6 +1,4 @@
-MAKEFILE_DIR := $(dir $(abspath $(lastword $(MAKEFILE_LIST))))
-
-include $(MAKEFILE_DIR).env.mk
+include .env.mk
 
 # Check .env
 REQUIRED_VARS := BASE_IMAGE USER_NAME USER_PASS SSH_ADDR PROJECT_NAME
@@ -30,7 +28,7 @@ SHARED_RUN_OPTS := 		--rm \
 						--device /dev/fuse \
 						-e TERM=xterm-256color \
 						-p "$(SSH_ADDR):22" \
-						-v "$(MAKEFILE_DIR)/../..:/opt/workdir" \
+						-v "$$PWD/../..:/opt/workdir" \
 						-v "$$HOME/.local/share/containers/storage:/var/lib/shared:ro" \
 						--name "$(CONTAINER_NAME)"
 

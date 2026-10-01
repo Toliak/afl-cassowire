@@ -1,5 +1,3 @@
-MAKEFILE_DIR := $(dir $(abspath $(lastword $(MAKEFILE_LIST))))
-
 AFLPP_URL := https://github.com/aflplusplus/aflplusplus
 AFLPP_TAG := v5.02c
 
@@ -11,22 +9,22 @@ GIT_ARGS := --progress --depth 1
 help:
 	@echo "prepare -- git clone the AFL++ repo"
 
-$(MAKEFILE_DIR)/src:
-	git clone $(AFLPP_URL) $(GIT_ARGS) --branch=$(AFLPP_TAG) $(MAKEFILE_DIR)/src
+src:
+	git clone $(AFLPP_URL) $(GIT_ARGS) --branch=$(AFLPP_TAG) ./src
 
-prepare: $(MAKEFILE_DIR)/src
+prepare: src
 
-$(MAKEFILE_DIR)/src/.patched: prepare
-	cd "$(MAKEFILE_DIR)/src" && \
-		for F in "$(MAKEFILE_DIR)/patch"/*.patch; do \
+src/.patched: prepare
+	cd "./src" && \
+		for F in "./patch"/*.patch; do \
 			patch -p1 -i "$$F" || exit 1; \
 		done
-	touch $(MAKEFILE_DIR)/src/.patched
+	touch ./src/.patched
 
-patch: $(MAKEFILE_DIR)/src/.patched
+patch: src/.patched
 
 build: patch
-	cd "$(MAKEFILE_DIR)/src" && \
+	cd "./src" && \
 		make $(AFLPP_MAKE_ARGS) $(AFLPP_MAKE_ARGS_ADD) \
 			PERFORMANCE=1 \
 			NO_PYTHON=0 \
@@ -37,7 +35,7 @@ build: patch
 			NO_UNICORN=1
 
 install:
-	cd "$(MAKEFILE_DIR)/src" && \
+	cd "./src" && \
 		make $(AFLPP_MAKE_ARGS) $(AFLPP_MAKE_ARGS_ADD) \
 			PREFIX=distrib install
 
