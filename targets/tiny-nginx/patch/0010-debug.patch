@@ -1,0 +1,61 @@
+--- a/src/server.c
++++ b/src/server.c
+@@ -35,6 +35,7 @@
+ #include "server.h"
+ 
+ TCPServer* tcp_server_init() {
++    debug("Log: tcp_server_init");
+     TCPServer* server = (TCPServer*) malloc(sizeof(TCPServer));
+     check_mem(server);
+ 
+@@ -48,6 +49,7 @@ error:
+ }
+ 
+ void tcp_server_start(TCPServer* server, uint16_t port) {
++    debug("Log: tcp_server_start");
+     int fd = socket(AF_INET, SOCK_STREAM | SOCK_NONBLOCK, 0);
+     check(fd != -1, "Server socket creation failed");
+ 
+--- a/src/worker.c
++++ b/src/worker.c
+@@ -72,6 +72,7 @@ static const char* get_mime_type(const char* path);
+ static void set_up_signal_event(EventBase* e);
+ 
+ void run_worker_process(TCPServer* server) {
++    debug("Log: run_worker_process");
+     bool running = true;
+ 
+     EventBase signal;
+@@ -118,6 +119,7 @@ error:
+ }
+ 
+ static void accept_client(EventSystem* es, TCPServer* server) {
++    debug("Log: accept_client");
+     struct sockaddr_in client_addr;
+     socklen_t client_addr_size = sizeof(client_addr);
+ 
+@@ -143,6 +145,7 @@ error:
+ }
+ 
+ static void receive_from_client(EventSystem* es, HTTPClient* client) {
++    debug("Log: receive_from_client");
+     switch (client->state) {
+         case CLIENT_RECEIVING_REQUEST:
+             return receive_request(es, client);
+@@ -153,6 +156,7 @@ static void receive_from_client(EventSystem* es, HTTPClient* client) {
+ }
+ 
+ static void send_to_client(EventSystem* es, HTTPClient* client) {
++    debug("Log: send_to_client");
+     switch (client->state) {
+         case CLIENT_SENDING_HEADERS:
+             return send_headers(es, client);
+@@ -251,7 +255,8 @@ static void close_client(EventSystem* es, HTTPClient* client) {
+     free(client);
+ }
+ 
+ static void parse_http_request(HTTPClient* client) {
++    debug("Log: parse_http_request");
+     char* request_line = strtok(client->request, "\r\n");
+ 
+     if (request_line == NULL)

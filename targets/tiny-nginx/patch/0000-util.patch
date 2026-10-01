@@ -1,0 +1,19 @@
+--- a/Makefile
++++ b/Makefile
+@@ -3,6 +3,7 @@ TARGET = tinynginx
+ CC = gcc
+ DEP_FLAGS = -MP -MD
+ C_FLAGS = -std=c11 -Wall -Werror -Wextra -march=native -O2 -DPUBLIC_DIR="\"$(realpath ./public)\""
++C_ADD_FLAGS = 
+ 
+ BUILD_DIR = build
+ SRC_DIR = src
+@@ -26,7 +27,7 @@ $(BUILD_DIR)/$(TARGET): $(OBJ_FILES)
+ 	$(CC) -o $@ $^
+ 
+ %.o: %.c
+-	$(CC) $(C_FLAGS) $(DEP_FLAGS) -I$(SRC_DIR) -c -o $@ $<
++	$(CC) $(C_FLAGS) $(C_ADD_FLAGS) $(DEP_FLAGS) -I$(SRC_DIR) -c -o $@ $<
+ 
+ -include $(DEP_FILES)
+ 

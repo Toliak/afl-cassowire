@@ -1,0 +1,56 @@
+--- a/src/master.c
++++ b/src/master.c
+@@ -38,6 +38,7 @@
+ #include "server.h"
+ #include "master.h"
+ #include "worker.h"
++#include "max_workers.h"
+ 
+ static void spawn_worker_processes(MasterProcess* master);
+ 
+@@ -58,7 +59,8 @@ MasterProcess* master_process_init(uint16_t port) {
+     cpu_set_t cpu_set;
+     CPU_ZERO(&cpu_set);
+     check(sched_getaffinity(0, sizeof(cpu_set), &cpu_set) != -1, "Failed retrieving cpu affinity mask");
+-    master->workers_count = CPU_COUNT(&cpu_set);
++    int cpu_count = CPU_COUNT(&cpu_set);
++    master->workers_count = get_env_workers(cpu_count);
+ 
+     master->server = tcp_server_init();
+     tcp_server_start(master->server, port);
+@@ -93,12 +95,22 @@ void free_master_process(MasterProcess* master) {
+ }
+ 
+--- /dev/null
++++ b/src/max-workers.h
+ #include <stdlib.h>
+ #include "dbg.h"
+ 
+ static int get_env_workers(int max_workers) {
+     // 1. Retrieve the environment variable
+     char *env_str = getenv("WORKERS");
+ 
+     if (env_str == NULL) {
+         return max_workers;
+     }
+ 
+     // 2. Parse the string into a long integer
+     char *endptr;
+     long workers = strtol(env_str, &endptr, 10); // Base 10 parsing [1]
+ 
+     // 3. Robust Error Validation
+     if (env_str == endptr) {
+         log_warn("Error: No numeric digits were found in the string.");
+         return max_workers;
+     }
+     if (*endptr != '\0') {
+         log_warn("Partial error: Leftover non-numeric characters: '%s'", endptr);
+         return max_workers;
+     }
+     if (workers > max_workers) {
+         log_warn("Workers %ld is above max_workers %d", workers, max_workers);
+         return max_workers;
+     }
+ 
+     return (int)workers;
+ }

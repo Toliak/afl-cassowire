@@ -1,30 +1,28 @@
-MAKEFILE_DIR := $(dir $(abspath $(lastword $(MAKEFILE_LIST))))
-
 GIT_ARGS := --progress --depth 1
+GIT_ARGS_ADD := 
+GIT := git
+GIT_CLONE_CMD = $(GIT) clone $(GIT_ARGS) $(GIT_ARGS_ADD)
 
-TINY_NGINX_URL := https://github.com/gd-arnold/tiny-nginx
+help:
+	@echo "TODO"
+
+
+targets/tiny-nginx:
 
 NGINX_URL := https://github.com/nginx/nginx
 NGINX_TAG := release-1.31.4
 
+targets/nginx:
+	$(GIT_CLONE_CMD) --branch=$(NGINX_TAG) $(NGINX_URL) $@
+
 HAPROXY_URL := https://github.com/haproxy/haproxy
 HAPROXY_TAG := v3.4.0
 
-help:
-	@echo "clone -- clone all the target repositories"
-	@echo "  tiny-nginx -- clone tiny-nginx"
-	@echo "  nginx -- clone nginx"
-	@echo "  haproxy -- clone haproxy"
+targets/haproxy:
+	$(GIT_CLONE_CMD) --branch=$(HAPROXY_TAG) $(HAPROXY_URL) $@
 
-tiny-nginx:
-	git clone $(GIT_ARGS) $(TINY_NGINX_URL)
+ALL_TARGETS := targets/tiny-nginx targets/nginx targets/haproxy
 
-nginx:
-	git clone $(GIT_ARGS) --branch=$(NGINX_TAG) $(NGINX_URL)
-
-haproxy:
-	git clone $(GIT_ARGS) --branch=$(HAPROXY_TAG) $(HAPROXY_URL)
-
-clone: tiny-nginx nginx haproxy
+clone: $(ALL_TARGETS)
 
 .PHONY: help clone
