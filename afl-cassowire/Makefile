@@ -13,4 +13,4 @@ build:
 clean:
 	rm -rf build
 
-.PHONY: prepare prepare2 build
+.PHONY: prepare prepare2 build clean

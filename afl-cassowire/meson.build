@@ -1,9 +1,9 @@
-project('afl-proxy', 'cpp',
+project('afl-cassowire', 'cpp',
     version : '0.1.0',
     default_options : [
         'cpp_std=c++20',
         'warning_level=3',
-        'werror=false',
+        'werror=true',
     ])
 
 # Check the compiler
@@ -37,7 +37,8 @@ sources = files(
     'src/utils.cpp',
 )
 
-executable('afl-proxy',
+executable(
+    'afl-cassowire',
     sources,
     include_directories : include_dirs,
     dependencies : [thread_dep, yaml_cpp_dep, argparse_dep],
