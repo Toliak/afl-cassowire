@@ -4,7 +4,7 @@
 //   g++ -O2 -std=c++17 -Wall -Wextra -o http_bench http_bench.cpp
 //
 // Example:
-//   ./http_bench --host 192.168.1.10 --port 8080 --cpu 2
+//   ./http_bench --host 192.168.1.10 --port 8080 --cpu 2 --delay 5
 
 #include <arpa/inet.h>
 #include <cerrno>
@@ -34,13 +34,14 @@ struct Args {
     std::string host;
     std::string port;
     int cpu = 0;
+    int delay = 10;
 };
 
 void usage(const char* program)
 {
     std::cerr
         << "Usage: " << program
-        << " --host <ip> --port <port> [--cpu <cpu_id>]\n";
+        << " --host <ip> --port <port> [--cpu <cpu_id>] [--delay <seconds>]\n";
 }
 
 bool parse_args(int argc, char** argv, Args& args)
@@ -48,15 +49,15 @@ bool parse_args(int argc, char** argv, Args& args)
     for (int i = 1; i < argc; ++i) {
         std::string arg = argv[i];
 
-        if (arg == "--host") {
+        if (arg == "--host" || arg == "-h") {
             if (++i >= argc)
                 return false;
             args.host = argv[i];
-        } else if (arg == "--port") {
+        } else if (arg == "--port" || arg == "-p") {
             if (++i >= argc)
                 return false;
             args.port = argv[i];
-        } else if (arg == "--cpu") {
+        } else if (arg == "--cpu" || arg == "-c") {
             if (++i >= argc)
                 return false;
 
@@ -69,6 +70,19 @@ bool parse_args(int argc, char** argv, Args& args)
             }
 
             args.cpu = static_cast<int>(cpu);
+        } else if (arg == "--delay" || arg == "-d") {
+            if (++i >= argc)
+                return false;
+
+            char* end = nullptr;
+            long delay = std::strtol(argv[i], &end, 10);
+
+            if (*argv[i] == '\0' || *end != '\0' || delay < 1) {
+                std::cerr << "Invalid delay: " << argv[i] << '\n';
+                return false;
+            }
+
+            args.delay = static_cast<int>(delay);
         } else if (arg == "--help" || arg == "-h") {
             usage(argv[0]);
             std::exit(0);
@@ -230,6 +244,10 @@ int main(int argc, char** argv)
     std::signal(SIGINT, signal_handler);
     std::signal(SIGTERM, signal_handler);
 
+    std::cout << "began benchmark for " << args.host << ":" << args.port
+              << " at CPU " << args.cpu << '\n';
+    std::cout.flush();
+
     using clock = std::chrono::steady_clock;
 
     auto interval_start = clock::now();
@@ -250,7 +268,7 @@ int main(int argc, char** argv)
                 now - interval_start
             );
 
-        if (elapsed.count() >= 10) {
+        if (elapsed.count() >= args.delay) {
             double seconds =
                 std::chrono::duration<double>(now - interval_start).count();
 
