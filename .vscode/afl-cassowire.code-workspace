@@ -43,7 +43,17 @@
                 "backgroundColor": "rgb(113, 113, 113)",
                 "overviewRulerColor": "rgba(113, 113, 113, 0.8)"
             }
-        ]
+        ],
+        "terminal.integrated.profiles.linux": {
+            "PROJ ZSH": {
+                "path": "zsh",
+                "icon": "terminal",
+                "env": {
+                    "PROJECT_DIR": "${workspaceFolder:○ Root}",
+                },
+                "args": ["-i", "-c", ". \"$PROJECT_DIR/.dev/bashrc/.bashrc\"; zsh"]
+            },
+        },
     },
     "extensions": {
         "recommendations": [
