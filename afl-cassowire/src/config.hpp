@@ -6,6 +6,7 @@
 #include <vector>
 #include <variant>
 #include <optional>
+#include <unordered_map>
 
 struct ConfigError {
     std::string path;     // e.g., "network.port"
@@ -25,6 +26,7 @@ struct TargetConfig {
     std::string binary;
     std::vector<std::string> args;
     TargetLog log;
+    std::unordered_map<std::string, std::string> env;  // Environment variables for target
 };
 
 struct NetworkConfig {

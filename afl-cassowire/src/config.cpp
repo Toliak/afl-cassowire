@@ -59,6 +59,20 @@ std::variant<Config, ConfigError> load_config(const std::string& path) {
             cfg.target.args.push_back(cfg.target.binary);
         }
 
+        // --- Parse target.env ---
+        if (target_node["env"]) {
+            if (!target_node["env"].IsMap()) {
+                return ConfigError{"target.env", "Invalid 'env' section", "map of strings", "not a map"};
+            }
+            YAML::Node env_node = target_node["env"];
+            for (YAML::Node::iterator it = env_node.begin(); it != env_node.end(); ++it) {
+                if (!it->first.IsScalar() || !it->second.IsScalar()) {
+                    return ConfigError{"target.env", "Invalid key-value pair", "string key -> string value", "invalid type"};
+                }
+                cfg.target.env[it->first.as<std::string>()] = it->second.as<std::string>();
+            }
+        }
+
         if (target_node["log"]) {
             if (!target_node["log"].IsMap()) {
                 return ConfigError{"target.log", "Invalid 'log' section", "map", "not a map"};

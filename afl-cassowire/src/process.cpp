@@ -207,7 +207,7 @@ pid_t spawn_target(const Config& cfg, bool is_map_size_pass, bool is_proxy_mode)
             raise(SIGSTOP);
         }
 
-        // Set environment variables
+        // Set additional environment variables for special passes
         if (is_map_size_pass) {
             setenv("AFL_DUMP_MAP_SIZE", "1", 1);
         }
@@ -219,10 +219,24 @@ pid_t spawn_target(const Config& cfg, bool is_map_size_pass, bool is_proxy_mode)
         }
         c_args.push_back(nullptr);
 
-        execv(cfg.target.binary.c_str(), c_args.data());
+        // Build environment array for execve
+        std::vector<std::string> c_env_strings;
+        c_env_strings.push_back("PATH=" + std::string(getenv("PATH")));
+        for (const auto& [key, value] : cfg.target.env) {
+            c_env_strings.push_back(key + "=" + value);
+        }
+
+        // Convert to char** for execve
+        std::vector<char*> c_env;
+        c_env.reserve(c_env_strings.size());
+        for (const auto& s : c_env_strings) {
+            c_env.push_back(const_cast<char*>(s.c_str()));
+        }
+
+        int rc = execve(cfg.target.binary.c_str(), c_args.data(), c_env.data());
         
-        // If execv fails
-        std::cerr << "proxy: execv failed for " << cfg.target.binary << ": " << strerror(errno) << "\n";
+        // If execve fails
+        std::cerr << "proxy: execve failed for " << cfg.target.binary << ": " << strerror(errno) << "\n";
         _exit(127);
     }
 
