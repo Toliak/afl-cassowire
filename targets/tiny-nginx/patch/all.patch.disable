@@ -1,0 +1,212 @@
+diff --git a/src/main.c b/src/main.c
+index b646282..e3beac8 100644
+--- a/src/main.c
++++ b/src/main.c
+@@ -33,6 +33,7 @@
+ uint16_t parse_port(int argc, char* argv[]);
+ uint16_t port_to_num(const char* port_str);
+ 
++#ifndef AFL_PERSISTENT_PATCH
+ int main(int argc, char* argv[]) {
+     uint16_t port = parse_port(argc, argv);
+ 
+@@ -43,6 +44,7 @@ int main(int argc, char* argv[]) {
+ 
+     exit(EXIT_SUCCESS);
+ }
++#endif //AFL_PERSISTENT_PATCH
+ 
+ uint16_t parse_port(int argc, char* argv[]) {
+     uint16_t port = 0;
+diff --git a/src/master.c b/src/master.c
+index 035c668..ccd143c 100644
+--- a/src/master.c
++++ b/src/master.c
+@@ -58,7 +58,10 @@ MasterProcess* master_process_init(uint16_t port) {
+     cpu_set_t cpu_set;
+     CPU_ZERO(&cpu_set);
+     check(sched_getaffinity(0, sizeof(cpu_set), &cpu_set) != -1, "Failed retrieving cpu affinity mask");
+-    master->workers_count = CPU_COUNT(&cpu_set);
++    // master->workers_count = CPU_COUNT(&cpu_set);
++    uint8_t cpu_count = CPU_COUNT(&cpu_set);
++    uint8_t max_workers = 4;
++    master->workers_count = (cpu_count <= max_workers) ? cpu_count : max_workers;
+ 
+     master->server = tcp_server_init();
+     tcp_server_start(master->server, port);
+@@ -93,12 +96,22 @@ void free_master_process(MasterProcess* master) {
+ }
+ 
+ static void spawn_worker_processes(MasterProcess* master) {
++    // usleep(1 * 1000);
+     for (size_t i = 0; i < master->workers_count; i++) {
++#ifdef NO_FORK
++        pid_t pid = 0;
++#else
+         pid_t pid = fork();
++#endif
+         check(pid != -1, "Failed forking worker process");
+ 
+         master->w_pids[i] = pid;
+         if (pid == 0) {
++            // if (setpgid(0, 0) == -1) {
++            //     perror("setpgid failed");
++            //     return;
++            // }
++
+             pid_t w_pid = getpid();
+ 
+             // bind w_pid to a cpu
+diff --git a/src/server.c b/src/server.c
+index 7931456..997a87d 100644
+--- a/src/server.c
++++ b/src/server.c
+@@ -35,6 +35,7 @@
+ #include "server.h"
+ 
+ TCPServer* tcp_server_init() {
++    debug("Log: tcp_server_init");
+     TCPServer* server = (TCPServer*) malloc(sizeof(TCPServer));
+     check_mem(server);
+ 
+@@ -48,6 +49,7 @@ error:
+ }
+ 
+ void tcp_server_start(TCPServer* server, uint16_t port) {
++    debug("Log: tcp_server_start");
+     int fd = socket(AF_INET, SOCK_STREAM | SOCK_NONBLOCK, 0);
+     check(fd != -1, "Server socket creation failed");
+ 
+diff --git a/src/worker.c b/src/worker.c
+index c24e419..6c28a97 100644
+--- a/src/worker.c
++++ b/src/worker.c
+@@ -72,6 +72,7 @@ static const char* get_mime_type(const char* path);
+ static void set_up_signal_event(EventBase* e);
+ 
+ void run_worker_process(TCPServer* server) {
++    debug("Log: run_worker_process");
+     bool running = true;
+ 
+     EventBase signal;
+@@ -118,6 +119,7 @@ error:
+ }
+ 
+ static void accept_client(EventSystem* es, TCPServer* server) {
++    debug("Log: accept_client");
+     struct sockaddr_in client_addr;
+     socklen_t client_addr_size = sizeof(client_addr);
+ 
+@@ -143,6 +145,7 @@ error:
+ }
+ 
+ static void receive_from_client(EventSystem* es, HTTPClient* client) {
++    debug("Log: receive_from_client");
+     switch (client->state) {
+         case CLIENT_RECEIVING_REQUEST:
+             return receive_request(es, client);
+@@ -153,6 +156,7 @@ static void receive_from_client(EventSystem* es, HTTPClient* client) {
+ }
+ 
+ static void send_to_client(EventSystem* es, HTTPClient* client) {
++    debug("Log: send_to_client");
+     switch (client->state) {
+         case CLIENT_SENDING_HEADERS:
+             return send_headers(es, client);
+@@ -251,7 +255,10 @@ static void close_client(EventSystem* es, HTTPClient* client) {
+     free(client);
+ }
+ 
++volatile int* ptr;
++
+ static void parse_http_request(HTTPClient* client) {
++    debug("Log: parse_http_request");
+     char* request_line = strtok(client->request, "\r\n");
+ 
+     if (request_line == NULL)
+@@ -267,6 +274,11 @@ static void parse_http_request(HTTPClient* client) {
+     if (strncmp(method, "GET", 3) != 0)
+         return set_http_error_headers(client, "501 Not Implemented");
+ 
++    if (strncmp(version, "HEHE2", 10) == 0) {
++        *ptr = 0x0uL;  // Point to nothing
++        *ptr = 42;        // CRASH: Trying to write to address 0
++    }
++
+     if (strncmp(version, "HTTP/1.", 7) != 0)
+         return set_http_error_headers(client, "505 HTTP Version Not Supported");
+ 
+@@ -420,3 +432,73 @@ static void set_up_signal_event(EventBase* e) {
+ error:
+     exit(EXIT_FAILURE);
+ }
++
++#ifdef AFL_PERSISTENT_PATCH
++
++__AFL_FUZZ_INIT();
++
++int main(int argc, char* argv[]) {
++    (void)argc;
++    (void)argv;
++
++    /* Create a minimal public directory for path resolution tests.
++     * In a real setup, you'd pre-populate this with test files. */
++    (void)mkdir(PUBLIC_DIR, 0755);
++
++#ifdef __AFL_HAVE_MANUAL_CONTROL
++    /* Deferred forkserver: initialize AFTER we've done any one-time setup,
++     * but BEFORE we enter the hot loop. */
++    __AFL_INIT();
++#endif
++
++    /* Shared memory fuzzing: get pointer to AFL++'s input buffer */
++    unsigned char *buf = __AFL_FUZZ_TESTCASE_BUF;
++
++    while (__AFL_LOOP(10000)) {
++        int len = __AFL_FUZZ_TESTCASE_LEN;
++
++        /* Skip empty inputs */
++        if (len < 1) continue;
++
++        /* Allocate and reset client state for each iteration.
++         * This is CRITICAL for persistent mode: every iteration must
++         * start from a clean state to avoid false positives and
++         * stability degradation. */
++        HTTPClient* client = http_client_init(-1, CLIENT_RECEIVING_REQUEST);
++        if (!client) continue;
++
++        /* Copy fuzz input into the client's request buffer.
++         * Ensure null-termination and respect buffer limits. */
++        size_t copy_len = (size_t)len < (MAX_CLIENT_REQUEST_BUFFER - 1)
++                          ? (size_t)len
++                          : (MAX_CLIENT_REQUEST_BUFFER - 1);
++
++        memcpy(client->request, buf, copy_len);
++        client->request[copy_len] = '\0';
++        client->request_len = copy_len;
++
++        /* Only parse if we have a complete HTTP request (ends with \r\n\r\n)
++         * OR if the input is large enough to be interesting.
++         * This mimics the real receive_request() logic. */
++        if (strstr(client->request, "\r\n\r\n") != NULL ||
++            copy_len >= MAX_CLIENT_REQUEST_BUFFER - 2) {
++
++            /* Call the function under test */
++            parse_http_request(client);
++        }
++
++        /* =========================================================================
++         * STATE RESET: Clean up any resources allocated during parsing.
++         * ========================================================================= */
++        if (client->file_fd != -1) {
++            close(client->file_fd);
++        }
++
++        /* Free the client - this prevents memory leaks across iterations */
++        free(client);
++    }
++
++    return 0;
++}
++
++#endif  //AFL_PERSISTENT_PATCH

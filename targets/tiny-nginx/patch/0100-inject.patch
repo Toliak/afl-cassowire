@@ -1,6 +1,6 @@
 --- a/src/worker.c
 +++ b/src/worker.c
-@@ -251,7 +255,10 @@ static void close_client(EventSystem* es, HTTPClient* client) {
+@@ -255,8 +255,10 @@ static void close_client(EventSystem* es, HTTPClient* client) {
      free(client);
  }
  
@@ -11,8 +11,7 @@
      char* request_line = strtok(client->request, "\r\n");
  
      if (request_line == NULL)
-
-@@ -267,6 +274,11 @@ static void parse_http_request(HTTPClient* client) {
+@@ -274,6 +274,11 @@ static void parse_http_request(HTTPClient* client) {
      if (strncmp(method, "GET", 3) != 0)
          return set_http_error_headers(client, "501 Not Implemented");
  

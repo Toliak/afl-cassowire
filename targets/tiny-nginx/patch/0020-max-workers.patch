@@ -18,39 +18,37 @@
  
      master->server = tcp_server_init();
      tcp_server_start(master->server, port);
-@@ -93,12 +95,22 @@ void free_master_process(MasterProcess* master) {
- }
- 
 --- /dev/null
-+++ b/src/max-workers.h
- #include <stdlib.h>
- #include "dbg.h"
- 
- static int get_env_workers(int max_workers) {
-     // 1. Retrieve the environment variable
-     char *env_str = getenv("WORKERS");
- 
-     if (env_str == NULL) {
-         return max_workers;
-     }
- 
-     // 2. Parse the string into a long integer
-     char *endptr;
-     long workers = strtol(env_str, &endptr, 10); // Base 10 parsing [1]
- 
-     // 3. Robust Error Validation
-     if (env_str == endptr) {
-         log_warn("Error: No numeric digits were found in the string.");
-         return max_workers;
-     }
-     if (*endptr != '\0') {
-         log_warn("Partial error: Leftover non-numeric characters: '%s'", endptr);
-         return max_workers;
-     }
-     if (workers > max_workers) {
-         log_warn("Workers %ld is above max_workers %d", workers, max_workers);
-         return max_workers;
-     }
- 
-     return (int)workers;
- }
++++ b/src/max_workers.h
+@@ -0,0 +1,31 @@
++#include <stdlib.h>
++#include "dbg.h"
++
++static int get_env_workers(int max_workers) {
++    // 1. Retrieve the environment variable
++    char *env_str = getenv("WORKERS");
++
++    if (env_str == NULL) {
++        return max_workers;
++    }
++
++    // 2. Parse the string into a long integer
++    char *endptr;
++    long workers = strtol(env_str, &endptr, 10); // Base 10 parsing [1]
++
++    // 3. Robust Error Validation
++    if (env_str == endptr) {
++        log_warn("Error: No numeric digits were found in the string.");
++        return max_workers;
++    }
++    if (*endptr != '\0') {
++        log_warn("Partial error: Leftover non-numeric characters: '%s'", endptr);
++        return max_workers;
++    }
++    if (workers > max_workers) {
++        log_warn("Workers %ld is above max_workers %d", workers, max_workers);
++        return max_workers;
++    }
++
++    return (int)workers;
++}
