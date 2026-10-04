@@ -1,5 +1,7 @@
 AFLPP_DISTRIB_DIR := $(shell realpath "$$PWD/../aflpp/src/distrib")
 
+.DEFAULT_GOAL := build
+
 prepare:
 	meson subprojects download
 

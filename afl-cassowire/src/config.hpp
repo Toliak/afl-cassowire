@@ -27,6 +27,7 @@ struct TargetConfig {
     std::vector<std::string> args;
     TargetLog log;
     std::unordered_map<std::string, std::string> env;  // Environment variables for target
+    bool env_preserve = false;  // Preserve parent environment variables
 };
 
 struct NetworkConfig {

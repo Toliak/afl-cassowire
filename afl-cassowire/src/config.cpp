@@ -72,6 +72,14 @@ std::variant<Config, ConfigError> load_config(const std::string& path) {
                 cfg.target.env[it->first.as<std::string>()] = it->second.as<std::string>();
             }
         }
+        // --- Parse target.env_preserve ---
+        if (target_node["env_preserve"]) {
+            try {
+                cfg.target.env_preserve = target_node["env_preserve"].as<bool>();
+            } catch (const YAML::BadConversion&) {
+                return ConfigError{"target.env_preserve", "Invalid type", "boolean", target_node["env_preserve"].Scalar()};
+            }
+        }
 
         if (target_node["log"]) {
             if (!target_node["log"].IsMap()) {

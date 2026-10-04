@@ -28,6 +28,8 @@
 #include <cstdlib>
 #include <cerrno>
 
+extern char** environ;
+
 namespace process {
 
 void cleanup_stale_processes(const CleanupConfig& cleanup_cfg) {
@@ -113,7 +115,7 @@ void cleanup_stale_processes(const CleanupConfig& cleanup_cfg) {
     }
 }
 
-pid_t spawn_target(const Config& cfg, bool is_map_size_pass, bool is_proxy_mode) {
+pid_t spawn_target(const Config& cfg, const bool is_map_size_pass, const bool is_proxy_mode) {
     int pipefd[2] = {-1, -1};
     if (is_map_size_pass) {
         if (pipe(pipefd) < 0) {
@@ -134,13 +136,31 @@ pid_t spawn_target(const Config& cfg, bool is_map_size_pass, bool is_proxy_mode)
 
     if (pid == 0) {
         // --- Child Process ---
+
+        // Ask the Linux kernel to send SIGKILL to this child if the parent dies
+        prctl(PR_SET_PDEATHSIG, SIGKILL); 
         
+        // Safety check: Did the parent die right before we called prctl()?
+        if (getppid() == 1) { 
+            _exit(0); // Parent already died and we got adopted by init, exit now
+        }
+
+        int original_stderr = dup(STDERR_FILENO);
+        if (original_stderr == -1) {
+            // If this fails, we can still use the raw STDERR_FILENO to complain
+            perror("child: dup stderr failed");
+            _exit(EXIT_FAILURE);
+        }
+        fcntl(original_stderr, F_SETFD, FD_CLOEXEC);
+
+        dprintf(original_stderr, "Begin\n");
+
         if (is_map_size_pass) {
             close(pipefd[0]);
             dup2(pipefd[1], STDOUT_FILENO);
             close(pipefd[1]);
             
-            int devnull = open("/dev/null", O_WRONLY);
+            int devnull = open("/dev/null", O_RDWR);
             if (devnull >= 0) {
                 dup2(devnull, STDERR_FILENO);
                 dup2(devnull, STDIN_FILENO);
@@ -195,7 +215,7 @@ pid_t spawn_target(const Config& cfg, bool is_map_size_pass, bool is_proxy_mode)
                     // Return ALLOW
                     BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_ALLOW)
                 };
-                
+\
                 struct sock_fprog prog = {
                     .len = (unsigned short)(sizeof(filter) / sizeof(filter[0])),
                     .filter = filter,
@@ -207,11 +227,6 @@ pid_t spawn_target(const Config& cfg, bool is_map_size_pass, bool is_proxy_mode)
             raise(SIGSTOP);
         }
 
-        // Set additional environment variables for special passes
-        if (is_map_size_pass) {
-            setenv("AFL_DUMP_MAP_SIZE", "1", 1);
-        }
-
         // Prepare argv
         std::vector<char*> c_args;
         for (const auto& arg : cfg.target.args) {
@@ -221,9 +236,30 @@ pid_t spawn_target(const Config& cfg, bool is_map_size_pass, bool is_proxy_mode)
 
         // Build environment array for execve
         std::vector<std::string> c_env_strings;
-        c_env_strings.push_back("PATH=" + std::string(getenv("PATH")));
-        for (const auto& [key, value] : cfg.target.env) {
+
+        if (cfg.target.env_preserve) {
+            for (char** envp = ::environ; *envp != nullptr; ++envp) {
+                c_env_strings.push_back(*envp);
+            }
+        } else {
+            c_env_strings.push_back("PATH=" + std::string(getenv("PATH")));
+        }
+
+        auto set_env_var = [&](const std::string& key, const std::string& value) {
+            auto it = std::remove_if(c_env_strings.begin(), c_env_strings.end(),
+                [&](const std::string& s) {
+                    return s.find(key + "=") == 0;
+                });
+            c_env_strings.erase(it, c_env_strings.end());
             c_env_strings.push_back(key + "=" + value);
+        };
+
+        for (const auto& [key, value] : cfg.target.env) {
+            set_env_var(key, value);
+        }
+
+        if (is_map_size_pass) {
+            set_env_var("AFL_DUMP_MAP_SIZE", "1");
         }
 
         // Convert to char** for execve
@@ -232,11 +268,30 @@ pid_t spawn_target(const Config& cfg, bool is_map_size_pass, bool is_proxy_mode)
         for (const auto& s : c_env_strings) {
             c_env.push_back(const_cast<char*>(s.c_str()));
         }
+        c_env.push_back(nullptr);
+
+
+        dprintf(original_stderr, "execve binary=%s\n", cfg.target.binary.c_str());
+        dprintf(original_stderr, "args:\n");
+        for (const auto& arg : cfg.target.args) {
+            dprintf(original_stderr, "  - %s\n", arg.c_str());
+        }
+        dprintf(original_stderr, "env:\n");
+        for (const auto& env : c_env_strings) {
+            const size_t separator = env.find('=');
+            if (separator == std::string::npos) {
+                dprintf(original_stderr, "  %s\n", env.c_str());
+            } else {
+                dprintf(original_stderr, "  %.*s:%s\n",
+                    static_cast<int>(separator), env.c_str(), env.c_str() + separator + 1);
+            }
+        }
 
         int rc = execve(cfg.target.binary.c_str(), c_args.data(), c_env.data());
-        
-        // If execve fails
-        std::cerr << "proxy: execve failed for " << cfg.target.binary << ": " << strerror(errno) << "\n";
+
+        dprintf(original_stderr, "proxy: execve failed (%d) for %s: %s\n",
+            rc, cfg.target.binary.c_str(), strerror(errno));
+        close(original_stderr);
         _exit(127);
     }
 
@@ -244,10 +299,11 @@ pid_t spawn_target(const Config& cfg, bool is_map_size_pass, bool is_proxy_mode)
     
     if (is_map_size_pass) {
         close(pipefd[1]);
-        
+
         char buffer[1024] = {0};
         ssize_t bytes_read = read(pipefd[0], buffer, sizeof(buffer) - 1);
         close(pipefd[0]);
+        std::cerr << "Bytes read: " << bytes_read << "\n";
         
         if (bytes_read > 0) {
             std::string output(buffer, bytes_read);
