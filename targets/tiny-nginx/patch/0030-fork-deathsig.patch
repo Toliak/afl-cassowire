@@ -1,0 +1,26 @@
+diff --git a/src/master.c b/src/master.c
+index 5e8d06b..f983e2a 100644
+--- a/src/master.c
++++ b/src/master.c
+@@ -33,6 +33,8 @@
+ #include <unistd.h>
+ #include <stdbool.h>
+ #include <signal.h>
++#include <linux/prctl.h>
++#include <sys/prctl.h>
+ 
+ #include "dbg.h"
+ #include "server.h"
+@@ -101,6 +103,12 @@ static void spawn_worker_processes(MasterProcess* master) {
+ 
+         master->w_pids[i] = pid;
+         if (pid == 0) {
++            // Ask the Linux kernel to send SIGKILL to this child if the parent dies
++            prctl(PR_SET_PDEATHSIG, SIGKILL);
++            if (getppid() == 1) {
++                _exit(0);
++            }
++
+             pid_t w_pid = getpid();
+ 
+             // bind w_pid to a cpu

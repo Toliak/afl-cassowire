@@ -1,0 +1,36 @@
+# Default configuration for afl-cassowire
+# Copy this to config.yaml and adjust values as needed.
+
+target:
+  binary: "./src/build/afl-clang-lto/tinynginx"           # Path to the target binary (required)
+  args: ["tinynginx", "-p", "8080"]                     # Additional arguments (binary is added automatically)
+  env:
+    WORKERS: 1
+
+  # log:
+  #   stdout: ""                 # Redirect target stdout to this file (optional)
+  #   stderr: ""                 # Redirect target stderr to this file (optional)
+
+network:
+  host: "127.0.0.1"            # TCP host to connect to
+  port: 8080                   # Port to connect to (1-65535, required)
+  timeout_ms: 200              # Network send/recv timeout in milliseconds
+  initial_ms: 200              # Port detection timeout in milliseconds
+
+afl:
+  loop_count: 50000            # Number of __AFL_LOOP iterations
+  enable_cmplog: false         # Enable AFL compare log (requires __AFL_CMPLOG_SHM_ID)
+
+port_detection:
+  primary: "procfs"            # Method: "procfs", "ptrace", or "seccomp"
+
+cleanup:
+  force_kill_ms: 2000          # Wait time after SIGTERM before SIGKILL
+  kill_pattern: "tinynginx"               # Optional: auto-kill stale target processes
+    # Scalar form — matches /proc/<pid>/comm:
+    # "nginx"
+    #
+    # Object form — explicit match:
+    # type: comm                   # or "regexp"
+    # value: "nginx"
+    # target: "comm"              # or "argv0", "argv"

@@ -1,5 +1,6 @@
-include ../_shared/git.mk
-include ../_shared/aflpp.mk
+include ../_mk/git.mk
+include ../_mk/aflpp.mk
+include ../_mk/fuzz.mk
 
 TINY_NGINX_URL := https://github.com/gd-arnold/tiny-nginx
 TINY_NGINX_COMMIT := 0a4900630457ede33abdb836f54a4d2aee6a6c3b
@@ -30,5 +31,14 @@ $(ALL_BUILD_SUBTARGETS): build_%:
 		make $(BUILD_MAKE_ARGS) -C src CC="$*" BUILD_DIR="build/$*"
 
 build: $(ALL_BUILD_SUBTARGETS)
+
+fuzz:
+	mkdir -p ./out ./in
+	cp -f $(FUZZ_SHARED_DIR)/in_http/* ./in/.
+ifdef FUZZ_DEBUG
+	@echo "AFL++ debug mode"
+endif
+	$(AFL_FUZZ_ENV) afl-fuzz -i ./in -o ./out -x $(FUZZ_SHARED_DIR)/dict/http.dict -- \
+		afl-cassowire --config cassowire.yaml proxy
 
 .PHONY: build prepare
