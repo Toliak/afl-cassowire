@@ -3,6 +3,7 @@
 #include "network.hpp"
 #include "utils.hpp"
 
+#include <chrono>
 #include <iostream>
 #include <fstream>
 #include <sstream>
@@ -245,14 +246,17 @@ void wait_response(int sock, int timeout_ms) {
         int remaining = timeout_ms - (int)(utils::get_time_ms() - start);
         if (remaining <= 0) break;
         
+        // TODO: why no epoll here?
         int poll_res = poll(&pfd, 1, remaining);
+        std::cerr <<  std::chrono::system_clock::now() << " poll_res " << poll_res << "\n";
         if (poll_res <= 0) break;
-        
+
         ssize_t n = recv(sock, buf, sizeof(buf), 0);
         if (n <= 0) break;
-        
+
         // Print response to console as per spec for test mode
-        write(STDOUT_FILENO, buf, n);
+        // write(STDOUT_FILENO, buf, n);
+        std::cout << "buf len = " << n << "\n";
     }
 }
 

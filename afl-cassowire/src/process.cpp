@@ -116,6 +116,101 @@ void cleanup_stale_processes(const CleanupConfig& cleanup_cfg) {
 }
 
 pid_t spawn_target(const Config& cfg, const bool is_map_size_pass, const bool is_proxy_mode) {
+    // ---------------------------------------------------------------------------
+    // Prepare everything that can be prepared ONCE, before fork(): the tracer
+    // flags, argv, the environment and the seccomp filter program. The child
+    // section below then only has to redirect its file descriptors, arm
+    // ptrace/seccomp and call execve() — no logging, no allocations and no
+    // std::string/std::vector work between the redirection and execve().
+    // ---------------------------------------------------------------------------
+
+    const bool use_ptrace = (cfg.port_detection.primary == "ptrace");
+    const bool use_seccomp = (cfg.port_detection.primary == "seccomp");
+
+    // Prepare argv (the pointers refer to cfg.target.args, which outlives fork)
+    std::vector<char*> c_args;
+    for (const auto& arg : cfg.target.args) {
+        c_args.push_back(const_cast<char*>(arg.c_str()));
+    }
+    c_args.push_back(nullptr);
+
+    // Build environment array for execve
+    std::vector<std::string> c_env_strings;
+
+    if (cfg.target.env_preserve) {
+        for (char** envp = ::environ; *envp != nullptr; ++envp) {
+            c_env_strings.push_back(*envp);
+        }
+    } else {
+        const char* path = getenv("PATH");
+        c_env_strings.push_back("PATH=" + std::string(path ? path : ""));
+        const char* afl_shm_id = getenv("__AFL_SHM_ID");
+        c_env_strings.push_back("__AFL_SHM_ID=" + std::string(afl_shm_id ? afl_shm_id : ""));
+    }
+
+    auto set_env_var = [&](const std::string& key, const std::string& value) {
+        auto it = std::remove_if(c_env_strings.begin(), c_env_strings.end(),
+            [&](const std::string& s) {
+                return s.find(key + "=") == 0;
+            });
+        c_env_strings.erase(it, c_env_strings.end());
+        c_env_strings.push_back(key + "=" + value);
+    };
+
+    for (const auto& [key, value] : cfg.target.env) {
+        set_env_var(key, value);
+    }
+
+    if (is_map_size_pass) {
+        set_env_var("AFL_DUMP_MAP_SIZE", "1");
+    }
+
+    // Convert to char** for execve (fork() duplicates the address space, so
+    // these pointers stay valid in the child)
+    std::vector<char*> c_env;
+    c_env.reserve(c_env_strings.size());
+    for (const auto& s : c_env_strings) {
+        c_env.push_back(const_cast<char*>(s.c_str()));
+    }
+    c_env.push_back(nullptr);
+
+    // Seccomp program that traces bind() so the parent can rewrite the port
+    struct sock_filter seccomp_filter[] = {
+        // Load syscall number
+        BPF_STMT(BPF_LD | BPF_W | BPF_ABS, offsetof(struct seccomp_data, nr)),
+        // Jump if equal to __NR_bind (49 on x86_64)
+        BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, __NR_bind, 0, 1),
+        // Return TRACE
+        BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_TRACE),
+        // Return ALLOW
+        BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_ALLOW)
+    };
+
+    struct sock_fprog seccomp_prog = {
+        .len = (unsigned short)(sizeof(seccomp_filter) / sizeof(seccomp_filter[0])),
+        .filter = seccomp_filter,
+    };
+
+    // Log the exact command the child is about to execute. This runs in the
+    // parent, before fork(), so the child never logs between its stderr
+    // redirection and the execve() call.
+    dprintf(STDERR_FILENO, "Begin\n");
+    dprintf(STDERR_FILENO, "execve binary=%s\n", cfg.target.binary.c_str());
+    dprintf(STDERR_FILENO, "args:\n");
+    for (const auto& arg : cfg.target.args) {
+        dprintf(STDERR_FILENO, "  - %s\n", arg.c_str());
+    }
+    dprintf(STDERR_FILENO, "env:\n");
+    for (const auto& env : c_env_strings) {
+        const size_t separator = env.find('=');
+        if (separator == std::string::npos) {
+            dprintf(STDERR_FILENO, "  %s\n", env.c_str());
+        } else {
+            dprintf(STDERR_FILENO, "  %.*s:%s\n",
+                static_cast<int>(separator), env.c_str(), env.c_str() + separator + 1);
+        }
+    }
+
     int pipefd[2] = {-1, -1};
     if (is_map_size_pass) {
         if (pipe(pipefd) < 0) {
@@ -145,6 +240,10 @@ pid_t spawn_target(const Config& cfg, const bool is_map_size_pass, const bool is
             _exit(0); // Parent already died and we got adopted by init, exit now
         }
 
+        // Keep the original stderr around: after the redirection below it may
+        // point at /dev/null or a log file, so execve() failures are reported
+        // through this saved descriptor. Nothing else is logged by the child
+        // between the redirection and execve().
         int original_stderr = dup(STDERR_FILENO);
         if (original_stderr == -1) {
             // If this fails, we can still use the raw STDERR_FILENO to complain
@@ -152,8 +251,6 @@ pid_t spawn_target(const Config& cfg, const bool is_map_size_pass, const bool is
             _exit(EXIT_FAILURE);
         }
         fcntl(original_stderr, F_SETFD, FD_CLOEXEC);
-
-        dprintf(original_stderr, "Begin\n");
 
         if (is_map_size_pass) {
             close(pipefd[0]);
@@ -194,103 +291,31 @@ pid_t spawn_target(const Config& cfg, const bool is_map_size_pass, const bool is
                 close(devnull);
             }
         }
+        // Put child in a new process group, making it the leader
+        if (setpgid(0,0) == -1) {
+            dprintf(original_stderr, "proxy: setpgid failed: %s\n", strerror(errno));
+            _exit(127);
+        }
+
 
         // Ptrace/Seccomp setup
-        bool use_ptrace = (cfg.port_detection.primary == "ptrace");
-        bool use_seccomp = (cfg.port_detection.primary == "seccomp");
-
         if (use_ptrace || use_seccomp) {
             ptrace(PTRACE_TRACEME, 0, nullptr, nullptr);
-            
+
             if (use_seccomp) {
                 prctl(PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0);
-                
-                struct sock_filter filter[] = {
-                    // Load syscall number
-                    BPF_STMT(BPF_LD | BPF_W | BPF_ABS, offsetof(struct seccomp_data, nr)),
-                    // Jump if equal to __NR_bind (49 on x86_64)
-                    BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, __NR_bind, 0, 1),
-                    // Return TRACE
-                    BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_TRACE),
-                    // Return ALLOW
-                    BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_ALLOW)
-                };
-\
-                struct sock_fprog prog = {
-                    .len = (unsigned short)(sizeof(filter) / sizeof(filter[0])),
-                    .filter = filter,
-                };
-                
-                prctl(PR_SET_SECCOMP, SECCOMP_MODE_FILTER, &prog);
+                prctl(PR_SET_SECCOMP, SECCOMP_MODE_FILTER, &seccomp_prog);
             }
-            
+
             raise(SIGSTOP);
         }
 
-        // Prepare argv
-        std::vector<char*> c_args;
-        for (const auto& arg : cfg.target.args) {
-            c_args.push_back(const_cast<char*>(arg.c_str()));
-        }
-        c_args.push_back(nullptr);
+        execve(cfg.target.binary.c_str(), c_args.data(), c_env.data());
 
-        // Build environment array for execve
-        std::vector<std::string> c_env_strings;
-
-        if (cfg.target.env_preserve) {
-            for (char** envp = ::environ; *envp != nullptr; ++envp) {
-                c_env_strings.push_back(*envp);
-            }
-        } else {
-            c_env_strings.push_back("PATH=" + std::string(getenv("PATH")));
-        }
-
-        auto set_env_var = [&](const std::string& key, const std::string& value) {
-            auto it = std::remove_if(c_env_strings.begin(), c_env_strings.end(),
-                [&](const std::string& s) {
-                    return s.find(key + "=") == 0;
-                });
-            c_env_strings.erase(it, c_env_strings.end());
-            c_env_strings.push_back(key + "=" + value);
-        };
-
-        for (const auto& [key, value] : cfg.target.env) {
-            set_env_var(key, value);
-        }
-
-        if (is_map_size_pass) {
-            set_env_var("AFL_DUMP_MAP_SIZE", "1");
-        }
-
-        // Convert to char** for execve
-        std::vector<char*> c_env;
-        c_env.reserve(c_env_strings.size());
-        for (const auto& s : c_env_strings) {
-            c_env.push_back(const_cast<char*>(s.c_str()));
-        }
-        c_env.push_back(nullptr);
-
-
-        dprintf(original_stderr, "execve binary=%s\n", cfg.target.binary.c_str());
-        dprintf(original_stderr, "args:\n");
-        for (const auto& arg : cfg.target.args) {
-            dprintf(original_stderr, "  - %s\n", arg.c_str());
-        }
-        dprintf(original_stderr, "env:\n");
-        for (const auto& env : c_env_strings) {
-            const size_t separator = env.find('=');
-            if (separator == std::string::npos) {
-                dprintf(original_stderr, "  %s\n", env.c_str());
-            } else {
-                dprintf(original_stderr, "  %.*s:%s\n",
-                    static_cast<int>(separator), env.c_str(), env.c_str() + separator + 1);
-            }
-        }
-
-        int rc = execve(cfg.target.binary.c_str(), c_args.data(), c_env.data());
-
+        // execve() only returns on failure. stderr may already have been
+        // redirected above, so report through the saved original stderr.
         dprintf(original_stderr, "proxy: execve failed (%d) for %s: %s\n",
-            rc, cfg.target.binary.c_str(), strerror(errno));
+            errno, cfg.target.binary.c_str(), strerror(errno));
         close(original_stderr);
         _exit(127);
     }
@@ -329,18 +354,15 @@ pid_t spawn_target(const Config& cfg, const bool is_map_size_pass, const bool is
         }
     }
 
-    bool use_ptrace_parent = (cfg.port_detection.primary == "ptrace");
-    bool use_seccomp_parent = (cfg.port_detection.primary == "seccomp");
-
-    if (use_ptrace_parent || use_seccomp_parent) {
+    if (use_ptrace || use_seccomp) {
         int status;
         // Wait for SIGSTOP from child
         waitpid(pid, &status, 0);
         if (WIFSTOPPED(status) && WSTOPSIG(status) == SIGSTOP) {
             long opts = 0;
-            if (use_ptrace_parent) {
+            if (use_ptrace) {
                 opts = PTRACE_O_TRACESYSGOOD;
-            } else if (use_seccomp_parent) {
+            } else if (use_seccomp) {
                 opts = PTRACE_O_TRACESECCOMP | PTRACE_O_TRACESYSGOOD;
             }
             ptrace(PTRACE_SETOPTIONS, pid, 0, opts);

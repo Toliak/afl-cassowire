@@ -9,6 +9,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <csignal>
+#include <cstdint>
 #include <filesystem>
 #include <unistd.h>
 #include <fcntl.h>
@@ -16,6 +17,7 @@
 #include <sys/types.h>
 #include <sys/stat.h>
 #include <time.h>
+#include <chrono>
 
 #include <argparse/argparse.hpp>
 
@@ -23,12 +25,18 @@
 #include "process.hpp"
 #include "network.hpp"
 #include "utils.hpp"
+#include "afl_compat.h"
 
 __AFL_FUZZ_INIT();
 
 // Global state for signal handler
 volatile sig_atomic_t g_child_pid = 0;
 int g_force_kill_ms = 2000;
+
+void kill_pgid(pid_t pgid) {
+    if (pgid <= 0) return;
+    kill(-pgid, SIGKILL);
+}
 
 // Async-signal-safe timed kill for process group
 void timed_kill_pgid(pid_t pgid, int ms) {
@@ -115,6 +123,22 @@ std::vector<uint8_t> read_input_file(const std::string& path) {
     return buffer;
 }
 
+// Strictly parses a decimal unsigned 64-bit integer.
+// Accepts only non-empty strings of ASCII digits that fit into uint64_t
+// (no sign, no whitespace, no suffix, no overflow).
+static bool parse_u64_strict(const char* s, uint64_t* out) {
+    if (!s || *s == '\0') return false;
+    for (const char* p = s; *p; ++p) {
+        if (*p < '0' || *p > '9') return false;
+    }
+    errno = 0;
+    char* end = nullptr;
+    unsigned long long value = strtoull(s, &end, 10);
+    if (errno == ERANGE || end == s || (end && *end != '\0')) return false;
+    *out = static_cast<uint64_t>(value);
+    return true;
+}
+
 int run_proxy_mode(const Config& cfg) {
     // Check AFL SHM IDs
     if (!getenv("__AFL_SHM_ID")) {
@@ -126,13 +150,32 @@ int run_proxy_mode(const Config& cfg) {
         return 1;
     }
 
+    // PROXY_AFL_FORCE_FINAL_LOC is consumed by the target's AFL++ runtime to
+    // force __afl_final_loc. In proxy mode it must be set and be a valid
+    // uint64 integer.
+    const char* final_loc_str = getenv("PROXY_AFL_FORCE_FINAL_LOC");
+    if (!final_loc_str) {
+        std::cerr << "proxy: PROXY_AFL_FORCE_FINAL_LOC not found in environment. Run with PROXY_AFL_FORCE_FINAL_LOC=<uint64>.\n";
+        return 1;
+    }
+
+    uint64_t force_final_loc = 0;
+    if (!parse_u64_strict(final_loc_str, &force_final_loc)) {
+        std::cerr << "proxy: PROXY_AFL_FORCE_FINAL_LOC must be an integer (uint64), got: '" << final_loc_str << "'\n";
+        return 1;
+    }
+
+    std::cout << "proxy: PROXY_AFL_FORCE_FINAL_LOC = " << force_final_loc << std::endl;
+
     // Eager log file creation
     if (!create_log_file(cfg.target.log.stdout_path) || !create_log_file(cfg.target.log.stderr_path)) {
         return 1;
     }
 
     // Initialize AFL persistent mode
+    #ifdef __AFL_HAVE_MANUAL_CONTROL
     __AFL_INIT();
+    #endif
 
     // Spawn target
     g_child_pid = process::spawn_target(cfg, false, true);
@@ -150,23 +193,32 @@ int run_proxy_mode(const Config& cfg) {
 
     // Main AFL Loop
     while (__AFL_LOOP(cfg.afl.loop_count)) {
+        std::cout << std::chrono::system_clock::now() << " loop beginning\n";
         int len = __AFL_FUZZ_TESTCASE_LEN;
         uint8_t* buf = __AFL_FUZZ_TESTCASE_BUF;
 
         int sock = network::connect_target(cfg.network);
+        std::cout << std::chrono::system_clock::now() <<  " sock " << sock << "\n";
         if (sock < 0) {
             // Connection failed, target might be dead.
             // Check health immediately.
             int status;
             if (waitpid(g_child_pid, &status, WNOHANG) == g_child_pid && WIFSIGNALED(status)) {
+                std::cout << "Crash it\n";
                 raise(SIGSEGV); // Crash proxy so AFL respawns
             }
-            continue;
+            // TODO: why do we have continue here???
+            // continue;
+            break;
         }
+        std::cout <<  std::chrono::system_clock::now() << " Successfully connected\n";
 
         network::send_all(sock, buf, len, cfg.network.timeout_ms);
         network::wait_response(sock, cfg.network.timeout_ms);
+        // TODO: here. i need to understand here was the response timed out. And, if so, break the loop
         close(sock);
+
+        std::cout <<  std::chrono::system_clock::now() << " One iteration\n";
 
         // Health check
         int status;
@@ -175,10 +227,14 @@ int run_proxy_mode(const Config& cfg) {
             // Target crashed
             raise(SIGSEGV);
         }
+        // TODO: what if the target exited?????
+        std::cout << std::chrono::system_clock::now() << " waitpid res " << res << "\n";
     }
 
     // Clean exit of AFL loop
-    timed_kill_pgid(g_child_pid, cfg.cleanup.force_kill_ms);
+    // timed_kill_pgid(g_child_pid, cfg.cleanup.force_kill_ms);
+    kill_pgid(g_child_pid);
+    std::cout << std::chrono::system_clock::now() << " kill " << g_child_pid << "\n";
     return 0;
 }
 
