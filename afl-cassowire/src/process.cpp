@@ -33,6 +33,12 @@ extern char** environ;
 namespace process {
 
 void cleanup_stale_processes(const CleanupConfig& cleanup_cfg) {
+    // TODO(claude): DANGEROUS. (1) This is a global /proc scan with no protection against matching the proxy
+    //   itself, its parent (afl-fuzz / shell) or the new target just about to be spawned. A broad pattern
+    //   (e.g. type=regexp value=".*" target=argv) makes the proxy SIGKILL the kernel-ish set of every
+    //   user process - including the session running it. (2) It never re-checks that a matched pid is still
+    //   the same process after the grace period (pid reuse), and it always sleeps the full force_kill_ms even
+    //   when nothing is alive.
     if (!cleanup_cfg.kill_pattern) return;
 
     const KillPattern& kp = cleanup_cfg.kill_pattern.value();
@@ -64,6 +70,9 @@ void cleanup_stale_processes(const CleanupConfig& cleanup_cfg) {
         }
         if (!is_pid) continue;
 
+        // TODO(claude): std::stoi throws std::out_of_range (uncaught -> std::terminate) for an all-digit
+        //   directory whose value exceeds INT_MAX; use std::from_chars and handle the error. The comment
+        //   below mentions kernel threads but only pid<=1 is skipped (kernel threads have /proc/<pid>/comm).
         pid_t pid = std::stoi(entry->d_name);
         if (pid <= 1) continue; // Skip init and kernel threads
 
@@ -71,6 +80,9 @@ void cleanup_stale_processes(const CleanupConfig& cleanup_cfg) {
         bool match = false;
 
         if (kp.type == "comm" || (kp.type == "regexp" && kp.target == "comm")) {
+            // TODO(claude): reads /proc/<pid>/comm which is the *thread* name of the main thread only. A
+            //   target whose workers renamed themselves (nginx: comm="nginx", setproctitle aside) matches by
+            //   comm but the actual listener may be a child - document that this is main-thread comm only.
             std::ifstream comm_file(proc_path + "/comm");
             std::string comm;
             if (std::getline(comm_file, comm)) {
@@ -81,6 +93,9 @@ void cleanup_stale_processes(const CleanupConfig& cleanup_cfg) {
                 }
             }
         } else if (kp.type == "regexp" && (kp.target == "argv0" || kp.target == "argv")) {
+            // TODO(claude): kernel threads have an EMPTY cmdline, so any regex that matches the empty string
+            //   (e.g. `.*`, `^$`) matches every kernel thread and they cannot be killed - the proxy then
+            //   "waits" for them pointlessly. Skip pids with an empty cmdline.
             std::ifstream cmdline_file(proc_path + "/cmdline", std::ios::binary);
             std::string cmdline((std::istreambuf_iterator<char>(cmdline_file)), std::istreambuf_iterator<char>());
             
@@ -102,6 +117,9 @@ void cleanup_stale_processes(const CleanupConfig& cleanup_cfg) {
     closedir(proc_dir);
 
     for (pid_t pid : matched_pids) {
+        // TODO(claude): no EPERM handling (kill returns -1 for other users' processes and is ignored). Also
+        //   the spec (5.1) describes cleanup only in terms of the kill_pattern, but the proxy's own child
+        //   process group and its own pid are never explicitly excluded from `matched_pids`.
         kill(pid, SIGTERM);
     }
 
@@ -142,6 +160,13 @@ pid_t spawn_target(const Config& cfg, const bool is_map_size_pass, const bool is
             c_env_strings.push_back(*envp);
         }
     } else {
+        // TODO(claude): __AFL_CMPLOG_SHM_ID and AFL_DUMP_MAP_SIZE handling: the AFL++ CMPLOG shm id is NOT
+        //   propagated to the target here, so `afl.enable_cmplog` (checked in main.cpp) has no effect - the
+        //   instrumented target gets no cmplog map. Must be added when cfg.afl.enable_cmplog is set.
+        //   Also AFL++ runs set many other vars (AFL_MAP_SIZE, LD_PRELOAD/__AFL_PRELOAD, AFL_* debug vars,
+        //   ASAN_OPTIONS, ...); a whitelist of PATH + __AFL_SHM_ID is easy to get wrong.
+        // TODO(claude): PROXY_AFL_FORCE_FINAL_LOC is documented in main.cpp as "consumed by the target's AFL++
+        //   runtime to force __afl_final_loc", but it is never copied into the child environment here.
         const char* path = getenv("PATH");
         c_env_strings.push_back("PATH=" + std::string(path ? path : ""));
         const char* afl_shm_id = getenv("__AFL_SHM_ID");
@@ -175,6 +200,12 @@ pid_t spawn_target(const Config& cfg, const bool is_map_size_pass, const bool is
     c_env.push_back(nullptr);
 
     // Seccomp program that traces bind() so the parent can rewrite the port
+    // TODO(claude): the spec requires the BPF filter to be ARCH-AWARE (it runs on a possibly different arch
+    //   than the tracer via SECCOMP_RET_TRACE). This filter only checks the syscall number (__NR_bind from
+    //   the *current* headers) and never loads/checks arch in seccomp_data -> a 32-bit/compat process can
+    //   hit a different syscall with nr 49. Also it must load the args (or at least not assume the tracer
+    //   reads them from registers) if the filter needs to distinguish, and it ignores the wide-argument
+    //   (x32) bit in seccomp_data->arch.
     struct sock_filter seccomp_filter[] = {
         // Load syscall number
         BPF_STMT(BPF_LD | BPF_W | BPF_ABS, offsetof(struct seccomp_data, nr)),
@@ -194,6 +225,9 @@ pid_t spawn_target(const Config& cfg, const bool is_map_size_pass, const bool is
     // Log the exact command the child is about to execute. This runs in the
     // parent, before fork(), so the child never logs between its stderr
     // redirection and the execve() call.
+    // TODO(claude): DEBUG output on every spawn, always to the proxy's stderr (also in proxy mode under
+    //   afl-fuzz) - dumps the full environment, which may contain secrets. Also the spec says Pass 1 must keep
+    //   stderr clean; this runs in the parent so it is OK there, but gate it behind a verbose option.
     dprintf(STDERR_FILENO, "Begin\n");
     dprintf(STDERR_FILENO, "execve binary=%s\n", cfg.target.binary.c_str());
     dprintf(STDERR_FILENO, "args:\n");
@@ -230,12 +264,19 @@ pid_t spawn_target(const Config& cfg, const bool is_map_size_pass, const bool is
     }
 
     if (pid == 0) {
+        // TODO(claude): fork() + iostream comes with the usual caveats: the child must not allocate or lock
+        //   anything before execve(). The code below honours that (dprintf/write only, no std::string in the
+        //   child path) - keep it that way if this block is edited.
         // --- Child Process ---
 
         // Ask the Linux kernel to send SIGKILL to this child if the parent dies
         prctl(PR_SET_PDEATHSIG, SIGKILL); 
         
         // Safety check: Did the parent die right before we called prctl()?
+        // TODO(claude): TOCTOU race: if the parent died between prctl() and this check, getppid() may
+        //   already be 1 and we exit; but if the parent died before prctl(), PR_SET_PDEATHSIG is also
+        //   cleared on setuid-like transitions in some cases. The check itself should compare against a
+        //   stored parent pid captured before fork() to be race-free.
         if (getppid() == 1) { 
             _exit(0); // Parent already died and we got adopted by init, exit now
         }
@@ -264,6 +305,11 @@ pid_t spawn_target(const Config& cfg, const bool is_map_size_pass, const bool is
                 close(devnull);
             }
         } else if (is_proxy_mode) {
+            // TODO(claude): the log fds are re-opened with O_TRUNC here even though main.cpp already created
+            //   them; two sources of truth, and the child truncates again. More importantly the spec says
+            //   the log files "must be created before process management" and "if the log file cannot be
+            //   created, fail" - if this per-child open() fails (fd < 0) we silently keep the proxy's own
+            //   stdout/stderr instead of failing.
             int devnull = open("/dev/null", O_RDONLY);
             if (devnull >= 0) {
                 dup2(devnull, STDIN_FILENO);
@@ -292,6 +338,11 @@ pid_t spawn_target(const Config& cfg, const bool is_map_size_pass, const bool is
             }
         }
         // Put child in a new process group, making it the leader
+        // TODO(claude): setpgid() is called here (after fd redirection, before PTRACE_TRACEME/execve) but the
+        //   parent does NOT call setpgid(pid,pid); if the parent's timed_kill_pgid(-child) / kill_pgid() runs
+        //   before the child reached this point, the signal goes to the wrong group (or fails). Also
+        //   credentials/session handling (setsid) is not done, so Ctrl+C at the terminal may reach the child
+        //   independently of the proxy.
         if (setpgid(0,0) == -1) {
             dprintf(original_stderr, "proxy: setpgid failed: %s\n", strerror(errno));
             _exit(127);
@@ -300,6 +351,11 @@ pid_t spawn_target(const Config& cfg, const bool is_map_size_pass, const bool is
 
         // Ptrace/Seccomp setup
         if (use_ptrace || use_seccomp) {
+            // TODO(claude): the return value of ptrace(PTRACE_TRACEME) is ignored; if it fails the tracee
+            //   continues untraced but the parent below still blocks in waitpid() forever. Check it and
+            //   _exit on failure. Also PR_SET_SECCOMP's return value and the prctl(PR_SET_NO_NEW_PRIVS) result
+            //   are ignored: if seccomp install fails the child runs with a filter that is not installed and
+            //   the parent waits for a PTRACE_EVENT_SECCOMP that never comes.
             ptrace(PTRACE_TRACEME, 0, nullptr, nullptr);
 
             if (use_seccomp) {
@@ -322,9 +378,18 @@ pid_t spawn_target(const Config& cfg, const bool is_map_size_pass, const bool is
 
     // --- Parent Process ---
     
+    // TODO(claude): DEADLOCK in test mode Pass 1 when port_detection.primary is ptrace/seccomp: the child
+    //   does raise(SIGSTOP) BEFORE execve(), but the parent reaches the blocking read() on the pipe below
+    //   before the "wait for SIGSTOP / PTRACE_CONT" block further down. The child never execs, the pipe never
+    //   gets data or EOF -> hang. The ptrace handshake must be done before reading the pipe. Moreover Pass 1
+    //   does not need ptrace/seccomp at all (spec: only map size is captured) - skip it for is_map_size_pass.
     if (is_map_size_pass) {
         close(pipefd[1]);
-
+        // TODO(claude): this read() is BLOCKING and happens only ONCE: if the target writes the integer in
+        //   several write()s the rest is lost, and a target that writes nothing but stays alive makes the
+        //   proxy block here forever (no timeout). Read until EOF with a poll() timeout. Also the Pass 1
+        //   child is never reaped inside this function (main.cpp does waitpid(map_pid) afterwards - keep
+        //   them in sync), and a blocking waitpid() there has no timeout either.
         char buffer[1024] = {0};
         ssize_t bytes_read = read(pipefd[0], buffer, sizeof(buffer) - 1);
         close(pipefd[0]);
@@ -345,6 +410,12 @@ pid_t spawn_target(const Config& cfg, const bool is_map_size_pass, const bool is
                     if (is_digit) {
                         std::cout << "Map size: " << trimmed << std::endl;
                     } else {
+                        // TODO(claude): spec 6.2 requires this to be a hard error ("assuming the target lacks
+                        //   proper AFL++ instrumentation" -> return an error). Here only a message is printed
+                        //   and spawn_target() still returns a pid, so main.cpp continues as if all was well.
+                        //   Also the spec says the integer must be on the first line with no extra text; the
+                        //   code silently takes the first line and ignores everything after it (e.g. a target
+                        //   that prints "MAP_SIZE: 65536" fails, but one that prints "65536\ngarbage" passes).
                         std::cerr << "proxy: failed to parse map size from target output. Output: '" << trimmed << "'\n";
                     }
                 }
@@ -357,8 +428,14 @@ pid_t spawn_target(const Config& cfg, const bool is_map_size_pass, const bool is
     if (use_ptrace || use_seccomp) {
         int status;
         // Wait for SIGSTOP from child
+        // TODO(claude): blocking waitpid() without a timeout - if PTRACE_TRACEME failed in the child (its
+        //   return value is ignored) this blocks forever, and the proxy has no way to reap the child it just
+        //   forked. Also the ptrace() calls below ignore their return values.
         waitpid(pid, &status, 0);
         if (WIFSTOPPED(status) && WSTOPSIG(status) == SIGSTOP) {
+            // TODO(claude): the child is resumed with PTRACE_CONT even in `ptrace` mode, but syscall-stops
+            //   (the ones trace_port() waits for) only happen after PTRACE_SYSCALL. This is why
+            //   `primary: ptrace` never detects the bind: no stop is ever generated.
             long opts = 0;
             if (use_ptrace) {
                 opts = PTRACE_O_TRACESYSGOOD;

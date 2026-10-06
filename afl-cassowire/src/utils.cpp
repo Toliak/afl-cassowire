@@ -27,6 +27,8 @@ void sleep_ms(int ms) {
     }
 }
 
+// TODO(claude): crash_proxy() is never used: main.cpp calls raise(SIGSEGV) directly (and then falls through
+//   if the signal is blocked/ignored). Use this helper there. Also `_exit(139)` below is unreachable after abort().
 [[noreturn]] void crash_proxy() {
     raise(SIGSEGV);
     // Fallback in case SIGSEGV is somehow blocked, ignored, or caught

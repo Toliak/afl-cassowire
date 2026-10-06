@@ -27,6 +27,10 @@
 
 namespace network {
 
+// TODO(claude): procfs detection is global (spec accepts that) but it also cannot notice that the target
+//   already died: it polls the whole initial_ms even if the child exited. Consider a waitpid(WNOHANG) check
+//   on the target pid inside the loop (needs target_pid passed in). It can also false-positive on a port that
+//   is held by a stale/other process.
 static bool check_procfs(int target_port, uint64_t timeout_ms) {
     uint64_t start = utils::get_time_ms();
     while (utils::get_time_ms() - start < timeout_ms) {
@@ -72,6 +76,9 @@ static bool trace_port(pid_t pid, int target_port, uint64_t timeout_ms, bool use
     bool in_syscall = false;
     
     while (utils::get_time_ms() - start < timeout_ms) {
+        // TODO(claude): BUG: blocking waitpid (no WNOHANG). The timeout is only evaluated between events, so
+        //   if the target never produces a stop (e.g. never calls bind) initial_ms is NOT enforced and the
+        //   proxy hangs here. Poll with WNOHANG + short sleep, or use a timer/signalfd.
         pid_t res = waitpid(pid, &status, __WALL);
         if (res == -1) {
             if (errno == EINTR) continue;
@@ -79,9 +86,13 @@ static bool trace_port(pid_t pid, int target_port, uint64_t timeout_ms, bool use
         }
         
         if (WIFEXITED(status) || WIFSIGNALED(status)) {
+            // TODO(claude): silent failure - the target died during startup but nothing says so (exit code /
+            //   signal is lost, and it is already reaped here so main.cpp's later waitpid will not see it).
             return false;
         }
         
+        // TODO(claude): confusing condition `WIFSTOPPED(res == pid ? status : 0)`; res is always pid here
+        //   (waitpid(pid, ...)). Just use WIFSTOPPED(status).
         if (WIFSTOPPED(res == pid ? status : 0)) { // waitpid returns pid on success
             int sig = WSTOPSIG(status);
             int event = (status >> 16);
@@ -108,6 +119,11 @@ static bool trace_port(pid_t pid, int target_port, uint64_t timeout_ms, bool use
                         uintptr_t addr_ptr = regs.rsi;
                         socklen_t addrlen = regs.rdx;
                         
+                        // TODO(claude): `addrlen > 0` is too weak: reading ss_family needs >= 2 bytes,
+                        //   sin_port >= 4 (AF_INET) / sin6_port >= 4 (AF_INET6); with a shorter addrlen the
+                        //   fields below are read from uninitialised stack memory. Also `addr` is not
+                        //   zero-initialised. Also regs.rsi/rdx are x86_64-only (fine per spec, but no
+                        //   #if defined(__x86_64__) guard / static check).
                         if (addrlen > 0 && addrlen <= sizeof(struct sockaddr_storage)) {
                             struct sockaddr_storage addr;
                             struct iovec local_iov = { &addr, sizeof(addr) };
@@ -115,6 +131,10 @@ static bool trace_port(pid_t pid, int target_port, uint64_t timeout_ms, bool use
                             
                             if (process_vm_readv(pid, &local_iov, 1, &remote_iov, 1, 0) == (ssize_t)addrlen) {
                                 int port = 0;
+                                // TODO(claude): spec 5.2 says the intercepted bind() must be VERIFIED to be the
+                                //   right one; only the port is compared here - address/interface (INADDR_ANY
+                                //   vs a specific IP) and the socklen are ignored. Also IPv6-in-IPv4
+                                //   (V4MAPPED) binds are not handled.
                                 if (addr.ss_family == AF_INET) {
                                     struct sockaddr_in* in = (struct sockaddr_in*)&addr;
                                     port = ntohs(in->sin_port);
@@ -126,6 +146,17 @@ static bool trace_port(pid_t pid, int target_port, uint64_t timeout_ms, bool use
                                 if (port == 0) {
                                     std::cerr << "proxy: target requested ephemeral port (0), skipping...\n";
                                 } else if (port == target_port) {
+                                    // TODO(claude): two problems. (1) We are at bind() ENTRY: the target is
+                                    //   declared "ready" before bind() succeeded and before listen() ran, so
+                                    //   the first connect_target() can get ECONNREFUSED (race). Bind may
+                                    //   even fail (EADDRINUSE). Consider also confirming via procfs/retrying
+                                    //   connect within initial_ms.
+                                    //   (2) In seccomp mode the BPF filter stays installed after DETACH (it
+                                    //   cannot be removed) and is inherited by forked workers. With
+                                    //   SECCOMP_RET_TRACE and NO tracer the kernel fails the syscall with
+                                    //   ENOSYS, so any later bind() in the target (or its children, e.g.
+                                    //   nginx workers/reload) will break. Also ptrace() return value is
+                                    //   unchecked.
                                     ptrace(PTRACE_DETACH, pid, 0, 0);
                                     return true;
                                 }
@@ -135,6 +166,13 @@ static bool trace_port(pid_t pid, int target_port, uint64_t timeout_ms, bool use
                 }
             }
             
+            // TODO(claude): CRITICAL BUG for `primary: ptrace`: syscall-stops are only produced if the
+            //   tracee is resumed with PTRACE_SYSCALL (spec 5.2 says so). Here (and in process.cpp after
+            //   PTRACE_SETOPTIONS) PTRACE_CONT is always used, so in ptrace mode no bind() is ever seen and
+            //   the loop just hangs in waitpid. Use PTRACE_SYSCALL when !use_seccomp.
+            //   Also: group-stop / SIGSTOP signal-delivery-stops are re-injected with `sig` which can leave
+            //   the tracee stopped; and the tracer sees only `pid` (no PTRACE_O_TRACEFORK), so forked
+            //   children are not traced (fine for the master, but should be documented).
             if (sig != SIGTRAP && sig != (SIGTRAP | 0x80) && event == 0) {
                 ptrace(PTRACE_CONT, pid, 0, sig);
             } else {
@@ -143,6 +181,9 @@ static bool trace_port(pid_t pid, int target_port, uint64_t timeout_ms, bool use
         }
     }
     
+    // TODO(claude): after a timeout the tracee is usually RUNNING (not in ptrace-stop), so PTRACE_DETACH
+    //   fails with ESRCH and the child stays traced; the error is ignored. Also the timeout is only reached
+    //   if waitpid above returned, see the blocking-waitpid TODO.
     // Timeout reached, detach before returning false
     ptrace(PTRACE_DETACH, pid, 0, 0);
     return false;
@@ -160,13 +201,20 @@ bool wait_for_port(pid_t target_pid, const Config& cfg) {
 }
 
 int connect_target(const NetworkConfig& net_cfg) {
+    // TODO(claude): (1) the socket is switched back to BLOCKING mode after connect, so send_all()'s timeout
+    //   is not enforced: send() can block forever if the target stops reading (the EAGAIN/poll branch in
+    //   send_all is dead code). Keep O_NONBLOCK or set SO_SNDTIMEO.
+    //   (2) Thousands of iterations/s create thousands of TIME_WAIT sockets on the client side; consider
+    //   SO_LINGER{1,0} (RST on close) to avoid ephemeral-port exhaustion. Also no TCP_NODELAY / SOCK_CLOEXEC.
+    //   (3) Only AF_INET + inet_pton is supported; host "localhost"/IPv6 (accepted by config.cpp) fails.
+    //   (4) poll() returning -1/EINTR is treated as a connect failure.
     int sock = socket(AF_INET, SOCK_STREAM, 0);
     if (sock < 0) return -1;
 
     int flags = fcntl(sock, F_GETFL, 0);
     fcntl(sock, F_SETFL, flags | O_NONBLOCK);
 
-    struct sockaddr_in addr;
+    struct sockaddr_in addr;  // TODO(claude): not zero-initialised (sin_zero garbage); use `= {}`.
     addr.sin_family = AF_INET;
     addr.sin_port = htons(net_cfg.port);
     if (inet_pton(AF_INET, net_cfg.host.c_str(), &addr.sin_addr) <= 0) {
@@ -208,6 +256,8 @@ int connect_target(const NetworkConfig& net_cfg) {
 }
 
 bool send_all(int sock, const uint8_t* buf, size_t len, int timeout_ms) {
+    // TODO(claude): `buf` may be nullptr/len 0 (placeholder AFL macros) - harmless here, but the callers in
+    //   main.cpp ignore the return value, so a failed/partial send (target died) is silently dropped.
     size_t sent = 0;
     uint64_t start = utils::get_time_ms();
     
@@ -233,7 +283,18 @@ bool send_all(int sock, const uint8_t* buf, size_t len, int timeout_ms) {
     return true;
 }
 
-void wait_response(int sock, int timeout_ms) {
+// TODO(claude): multiple problems in wait_response():
+//   - Return value contradicts network.hpp: poll timeout / poll error / recv error all `break` and return
+//     true; only the `remaining <= 0` paths return false. Callers cannot distinguish timeout vs EOF.
+//   - Debug output on EVERY poll (std::cerr << system_clock::now()) and "buf len" on stdout in the fuzz hot
+//     loop: heavy slowdown, and printing std::chrono::system_clock::time_point needs a very recent C++20
+//     stdlib. Remove, or guard behind a verbose flag.
+//   - Spec 6.2 requires the response to be printed in test mode, but the write() is commented out, so the
+//     response is never shown; data should be returned to the caller.
+//   - Reading "until EOF or timeout" against a keep-alive server (nginx) always burns the full timeout_ms
+//     per iteration, capping throughput at 1000/timeout_ms exec/s (5/s with the default 200ms).
+//   - recv() n < 0 with EINTR is treated as end of stream.
+bool wait_response(int sock, int timeout_ms) {
     uint8_t buf[4096];
     uint64_t start = utils::get_time_ms();
     
@@ -244,9 +305,8 @@ void wait_response(int sock, int timeout_ms) {
         pfd.fd = sock;
         pfd.events = POLLIN;
         int remaining = timeout_ms - (int)(utils::get_time_ms() - start);
-        if (remaining <= 0) break;
+        if (remaining <= 0) return false;
         
-        // TODO: why no epoll here?
         int poll_res = poll(&pfd, 1, remaining);
         std::cerr <<  std::chrono::system_clock::now() << " poll_res " << poll_res << "\n";
         if (poll_res <= 0) break;
@@ -258,6 +318,8 @@ void wait_response(int sock, int timeout_ms) {
         // write(STDOUT_FILENO, buf, n);
         std::cout << "buf len = " << n << "\n";
     }
+
+    return true;
 }
 
 } // namespace network

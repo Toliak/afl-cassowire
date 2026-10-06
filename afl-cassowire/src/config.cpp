@@ -28,6 +28,10 @@ std::variant<Config, ConfigError> load_config(const std::string& path) {
     Config cfg;
     
     try {
+        // TODO(claude): spec 4.2 says the loader "strictly validates", but unknown/misspelled keys at any level
+        //   (e.g. `netwrok:`, `timeout:`) are silently ignored. Consider rejecting unknown keys.
+        // TODO(claude): spec 4 says "without exceptions", yet this whole function relies on try/catch around
+        //   yaml-cpp. Acceptable for yaml-cpp, but the catch-all hides which key failed (path is empty).
         YAML::Node root = YAML::LoadFile(path);
         if (!root.IsMap()) {
             return ConfigError{"", "Root node must be a map", "map", root.Type() == YAML::NodeType::Null ? "null" : "other"};
@@ -55,6 +59,10 @@ std::variant<Config, ConfigError> load_config(const std::string& path) {
                 cfg.target.args.push_back(arg.as<std::string>());
             }
         } else {
+            // TODO(claude): an explicit empty list `args: []` is accepted and yields argv == {nullptr} in execve
+            //   (no argv[0]; some programs crash/misbehave). Require >= 1 element. Also the "default to
+            //   [binary]" behaviour is not described in the spec.
+
             // Default to [binary] if args is omitted
             cfg.target.args.push_back(cfg.target.binary);
         }
@@ -104,6 +112,10 @@ std::variant<Config, ConfigError> load_config(const std::string& path) {
         
         if (net_node["host"]) {
             if (!net_node["host"].IsScalar()) return ConfigError{"network.host", "Invalid type", "string", "not a string"};
+            // TODO(claude): host is not validated, but network.cpp connect_target() uses inet_pton(AF_INET) only:
+            //   "localhost", hostnames and IPv6 literals are accepted here and then fail at connect time.
+            //   Validate here (IPv4 literal) or resolve with getaddrinfo().
+            // SOLUTION: write comment that we not support ipv6
             cfg.network.host = net_node["host"].as<std::string>();
         }
         
@@ -149,6 +161,8 @@ std::variant<Config, ConfigError> load_config(const std::string& path) {
             YAML::Node afl_node = root["afl"];
             if (afl_node["loop_count"]) {
                 try {
+                    // TODO(claude): no range validation: 0 or negative loop_count is accepted and passed to __AFL_LOOP().
+                    //   Require > 0 (the spec only gives a default, but a non-positive value is meaningless).
                     cfg.afl.loop_count = afl_node["loop_count"].as<int>();
                 } catch (const YAML::BadConversion&) {
                     return ConfigError{"afl.loop_count", "Invalid type", "integer", afl_node["loop_count"].Scalar()};
@@ -201,6 +215,9 @@ std::variant<Config, ConfigError> load_config(const std::string& path) {
                 KillPattern kp;
                 if (kp_node.IsScalar()) {
                     kp.type = "comm";
+                    // TODO(claude): /proc/<pid>/comm is truncated by the kernel to 15 chars (TASK_COMM_LEN-1). A comm
+                    //   value longer than 15 chars can never match; warn/reject it here.
+                    // SOLUTION: yes, that is intended when the user selects "comm"
                     kp.value = kp_node.as<std::string>();
                     kp.target = "comm";
                 } else if (kp_node.IsMap()) {
@@ -228,6 +245,12 @@ std::variant<Config, ConfigError> load_config(const std::string& path) {
                         }
                         // Validate regex syntax
                         try {
+                            // TODO(claude): `type: comm` objects silently ignore an extra `target` key, and the regex is
+                            //   compiled with the default ECMAScript flavour (spec only says "standard C++ regex").
+                            //   Also an empty/over-broad pattern (e.g. `.*` with target argv) would match every
+                            //   process - see the self/parent-protection TODO in process.cpp.
+                            // SOLUTION: yes, error empty pattern. But broad pattern i don't care, if the user sets it.
+                            //           ECMAScript is ok for it.
                             std::regex r(kp.value);
                         } catch (const std::regex_error&) {
                             return ConfigError{"cleanup.kill_pattern.value", "Invalid regular expression", "valid regex", kp.value};

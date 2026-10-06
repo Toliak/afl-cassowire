@@ -30,6 +30,11 @@ namespace process {
      *                      If false (and not map size pass), inherits the proxy's stdout/stderr.
      * @return pid_t The PID of the spawned child process, or -1 on failure.
      */
+    // TODO(claude): API design problems. (1) Spec 5.1 lists "Health Checks" (waitpid/WIFSIGNALED) and signal
+    //   cleanup under process.*, but there is no such function: the logic is duplicated inline in main.cpp.
+    //   (2) spawn_target does map-size parsing + printing itself and still returns a valid pid on parse
+    //   failure, so the caller cannot detect the error the spec requires ("return an error").
+    //   (3) Two bools (is_map_size_pass, is_proxy_mode) encode 3 modes; an enum would be clearer.
     pid_t spawn_target(const Config& cfg, bool is_map_size_pass, bool is_proxy_mode);
 
 } // namespace process

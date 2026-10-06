@@ -39,10 +39,15 @@ namespace network {
 
     /**
      * @brief Reads from the socket until EOF or timeout.
-     * 
+     *
      * @param sock The socket file descriptor.
      * @param timeout_ms The timeout in milliseconds.
+     * @return true if data was received or connection closed without timeout, false on timeout.
      */
-    void wait_response(int sock, int timeout_ms);
+    // TODO(claude): the documented contract ("false on timeout") is not what network.cpp does: a poll()
+    //   timeout/error returns true, only the "remaining <= 0" path returns false. Also the response data is
+    //   neither returned nor printed (spec 6.2 wants the response printed in test mode) - consider returning
+    //   the bytes / status instead of a bool.
+    bool wait_response(int sock, int timeout_ms);
 
 } // namespace network
