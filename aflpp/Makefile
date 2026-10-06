@@ -16,7 +16,7 @@ prepare: src
 
 src/.patched: prepare
 	cd "./src" && \
-		for F in "./patch"/*.patch; do \
+		for F in "../patch"/*.patch; do \
 			patch -p1 -i "$$F" || exit 1; \
 		done
 	touch ./src/.patched

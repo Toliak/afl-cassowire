@@ -38,7 +38,7 @@ fuzz:
 ifdef FUZZ_DEBUG
 	@echo "AFL++ debug mode"
 endif
-	$(AFL_FUZZ_ENV) afl-fuzz -i ./in -o ./out -x $(FUZZ_SHARED_DIR)/dict/http.dict -- \
+	$(AFL_FUZZ_ENV) afl-fuzz -i ./in -o ./out -x $(FUZZ_SHARED_DIR)/dict/http.dict -t 1500 -- \
 		afl-cassowire --config cassowire.yaml proxy
 
 .PHONY: build prepare
