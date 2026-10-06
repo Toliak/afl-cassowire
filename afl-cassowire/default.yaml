@@ -6,6 +6,9 @@
 target:
   binary: "./target"           # Path to the target binary (required)
   args: []                     # Additional arguments (binary is added automatically)
+  # env_preserve: afl_only     # Parent env inheritance: "nothing", "afl_only"
+                               # (PATH, __AFL_SHM_ID, __AFL_CMPLOG_SHM_ID), or "all"
+  # TODO: remove that and replace with logging library.
   log:
     stdout: ""                 # Redirect target stdout to this file (optional)
     stderr: ""                 # Redirect target stderr to this file (optional)
@@ -33,3 +36,16 @@ cleanup:
     # type: comm                   # or "regexp"
     # value: "nginx"
     # target: "comm"              # or "argv0", "argv"
+
+# Optional payload wrapping: every payload sent to the target (in `proxy`
+# and `test` mode) is transmitted as: prefix + fuzz input + suffix.
+# Values may be a plain string or `!!binary` base64-encoded bytes.
+payload:
+  # Ability to add the payload prefix
+  # prefix: "GET /index.html HTTP/1.1"
+
+  # Ability to add the payload suffix
+  suffix: !!binary DQoNCg==
+
+  # The prefix and suffix may be string or bytes
+  # Omit the whole section (or a key) to send the payload unmodified.

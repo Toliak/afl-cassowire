@@ -2,6 +2,7 @@
 
 #pragma once
 
+#include <cstdint>
 #include <string>
 #include <vector>
 #include <variant>
@@ -26,15 +27,14 @@ struct TargetConfig {
     std::string binary;
     std::vector<std::string> args;
     TargetLog log;
-    // TODO(claude): `env` and `env_preserve` are not in the spec's YAML schema (sec. 4.2) - either document
-    //   them in the spec or remove. Also: with env_preserve=false the target gets ONLY PATH + __AFL_SHM_ID
-    //   (see process.cpp), which is a surprising default for an AFL harness.
-    // SOLUTION: yes, let's change from bool to enum: `nothing`, `afl-only`, `all`.
-    //           nothing -- literally no variables. 
-    //           afl-only -- `PATH`, `__AFL_SHM_ID` and `__AFL_CMPLOG_SHM_ID`. 
-    //           all -- everything.
+    // Environment variable handling for the target process.
+    enum class EnvPreserveLevel {
+        nothing,   // Inherit no environment variables
+        afl_only,  // Inherit only PATH, __AFL_SHM_ID, and __AFL_CMPLOG_SHM_ID
+        all        // Inherit the entire parent environment
+    };
     std::unordered_map<std::string, std::string> env;  // Environment variables for target
-    bool env_preserve = false;  // Preserve parent environment variables
+    EnvPreserveLevel env_preserve = EnvPreserveLevel::afl_only;  // How to handle parent environment
 };
 
 struct NetworkConfig {
@@ -64,12 +64,25 @@ struct CleanupConfig {
     std::optional<KillPattern> kill_pattern;
 };
 
+// Optional prefix/suffix wrapped around every payload sent to the target
+// (both in `proxy` and `test` mode). The data transmitted over TCP is:
+//   prefix + fuzz input + suffix
+// Values are raw bytes; in YAML they may be plain strings or `!!binary`.
+struct PayloadConfig {
+    std::vector<uint8_t> prefix;  // Prepended to each payload (empty if unset)
+    std::vector<uint8_t> suffix;  // Appended to each payload (empty if unset)
+
+    // Builds the final payload from the fuzz input buffer.
+    std::vector<uint8_t> wrap(const uint8_t* data, size_t len) const;
+};
+
 struct Config {
     TargetConfig target;
     NetworkConfig network;
     AflConfig afl;
     PortDetectionConfig port_detection;
     CleanupConfig cleanup;
+    PayloadConfig payload;
 };
 
 // Loads and strictly validates the YAML configuration file.

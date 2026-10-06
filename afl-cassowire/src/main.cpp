@@ -234,6 +234,11 @@ int run_proxy_mode(const Config& cfg) {
     //   iteration - very slow in a fuzz hot loop. Remove or gate behind a verbose flag. Also
     //   __AFL_FUZZ_TESTCASE_BUF/LEN only work if the shmem testcase feature is enabled by the AFL toolchain;
     //   `buf` is used without a null check, and len == 0 still opens a connection and sends nothing.
+    // Scratch buffer reused every iteration to send prefix + fuzz data + suffix
+    // (clear() keeps its capacity, so the hot loop does not reallocate).
+    std::vector<uint8_t> payload_buf;
+    payload_buf.reserve(cfg.payload.prefix.size() + cfg.payload.suffix.size() + 4096);
+
     while (__AFL_LOOP(cfg.afl.loop_count)) {
         std::cout << std::chrono::system_clock::now() << " loop beginning\n";
         int len = __AFL_FUZZ_TESTCASE_LEN;
@@ -260,7 +265,13 @@ int run_proxy_mode(const Config& cfg) {
         }
         std::cout <<  std::chrono::system_clock::now() << " Successfully connected\n";
 
-        network::send_all(sock, buf, len, cfg.network.timeout_ms);
+        // Final payload = configured prefix + fuzz data + configured suffix
+        payload_buf.clear();
+        payload_buf.insert(payload_buf.end(), cfg.payload.prefix.begin(), cfg.payload.prefix.end());
+        payload_buf.insert(payload_buf.end(), buf, buf + len);
+        payload_buf.insert(payload_buf.end(), cfg.payload.suffix.begin(), cfg.payload.suffix.end());
+
+        network::send_all(sock, payload_buf.data(), payload_buf.size(), cfg.network.timeout_ms);
         network::wait_response(sock, cfg.network.timeout_ms);
         close(sock);
 

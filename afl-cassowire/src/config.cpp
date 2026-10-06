@@ -6,6 +6,7 @@
 #include <regex>
 #include <iostream>
 #include <filesystem>
+#include <unordered_set>
 
 std::string ConfigError::to_string() const {
     std::stringstream ss;
@@ -24,24 +25,64 @@ std::string ConfigError::to_string() const {
     return ss.str();
 }
 
+// Builds the final payload transmitted to the target:
+//   prefix + fuzz input + suffix
+std::vector<uint8_t> PayloadConfig::wrap(const uint8_t* data, size_t len) const {
+    std::vector<uint8_t> out;
+    out.reserve(prefix.size() + len + suffix.size());
+    out.insert(out.end(), prefix.begin(), prefix.end());
+    if (len > 0) {
+        out.insert(out.end(), data, data + len);
+    }
+    out.insert(out.end(), suffix.begin(), suffix.end());
+    return out;
+}
+
+
 std::variant<Config, ConfigError> load_config(const std::string& path) {
     Config cfg;
     
     try {
-        // TODO(claude): spec 4.2 says the loader "strictly validates", but unknown/misspelled keys at any level
-        //   (e.g. `netwrok:`, `timeout:`) are silently ignored. Consider rejecting unknown keys.
-        // TODO(claude): spec 4 says "without exceptions", yet this whole function relies on try/catch around
-        //   yaml-cpp. Acceptable for yaml-cpp, but the catch-all hides which key failed (path is empty).
         YAML::Node root = YAML::LoadFile(path);
         if (!root.IsMap()) {
             return ConfigError{"", "Root node must be a map", "map", root.Type() == YAML::NodeType::Null ? "null" : "other"};
         }
+        // Helper function to check for unknown keys in a YAML map node
+        auto check_unknown_keys = [&](const YAML::Node& node, const std::unordered_set<std::string>& allowed, const std::string& prefix) -> ConfigError {
+            for (YAML::const_iterator it = node.begin(); it != node.end(); ++it) {
+                std::string key = it->first.as<std::string>();
+                if (allowed.find(key) == allowed.end()) {
+                    std::string full_key = prefix.empty() ? key : prefix + "." + key;
+                    return ConfigError{full_key, "Unknown key: " + full_key, "", ""};
+                }
+            }
+            return ConfigError{"", "", "", ""}; // no error
+        };
+
+        // --- Check for unknown keys at root ---
+        {
+            static const std::unordered_set<std::string> root_allowed = {"target", "network", "afl", "port_detection", "cleanup"};
+            ConfigError err = check_unknown_keys(root, root_allowed, "");
+            if (!err.message.empty()) {
+                return err;
+            }
+        }
+
 
         // --- Parse target ---
         if (!root["target"] || !root["target"].IsMap()) {
             return ConfigError{"target", "Missing or invalid 'target' section", "map", "missing/invalid"};
         }
         YAML::Node target_node = root["target"];
+        // --- Check for unknown keys in target ---
+        {
+            static const std::unordered_set<std::string> target_allowed = {"binary", "args", "env", "env_preserve", "log"};
+            ConfigError err = check_unknown_keys(target_node, target_allowed, "target");
+            if (!err.message.empty()) {
+                return err;
+            }
+        }
+
         
         if (!target_node["binary"] || !target_node["binary"].IsScalar()) {
             return ConfigError{"target.binary", "Missing or invalid 'binary'", "string", "missing/invalid"};
@@ -52,6 +93,9 @@ std::variant<Config, ConfigError> load_config(const std::string& path) {
             if (!target_node["args"].IsSequence()) {
                 return ConfigError{"target.args", "Invalid 'args'", "list of strings", "not a list"};
             }
+            if (target_node["args"].size() == 0) {
+                return ConfigError{"target.args", "Must have at least one element", "list of strings with at least one element", "empty list"};
+            }
             for (const auto& arg : target_node["args"]) {
                 if (!arg.IsScalar()) {
                     return ConfigError{"target.args", "Invalid element in 'args'", "string", "not a string"};
@@ -59,10 +103,6 @@ std::variant<Config, ConfigError> load_config(const std::string& path) {
                 cfg.target.args.push_back(arg.as<std::string>());
             }
         } else {
-            // TODO(claude): an explicit empty list `args: []` is accepted and yields argv == {nullptr} in execve
-            //   (no argv[0]; some programs crash/misbehave). Require >= 1 element. Also the "default to
-            //   [binary]" behaviour is not described in the spec.
-
             // Default to [binary] if args is omitted
             cfg.target.args.push_back(cfg.target.binary);
         }
@@ -82,10 +122,18 @@ std::variant<Config, ConfigError> load_config(const std::string& path) {
         }
         // --- Parse target.env_preserve ---
         if (target_node["env_preserve"]) {
-            try {
-                cfg.target.env_preserve = target_node["env_preserve"].as<bool>();
-            } catch (const YAML::BadConversion&) {
-                return ConfigError{"target.env_preserve", "Invalid type", "boolean", target_node["env_preserve"].Scalar()};
+            if (!target_node["env_preserve"].IsScalar()) {
+                return ConfigError{"target.env_preserve", "Invalid type", "string", "not a string"};
+            }
+            std::string env_preserve = target_node["env_preserve"].as<std::string>();
+            if (env_preserve == "nothing") {
+                cfg.target.env_preserve = TargetConfig::EnvPreserveLevel::nothing;
+            } else if (env_preserve == "afl_only") {
+                cfg.target.env_preserve = TargetConfig::EnvPreserveLevel::afl_only;
+            } else if (env_preserve == "all") {
+                cfg.target.env_preserve = TargetConfig::EnvPreserveLevel::all;
+            } else {
+                return ConfigError{"target.env_preserve", "Invalid enum value", "nothing, afl_only, or all", env_preserve};
             }
         }
 
@@ -94,6 +142,15 @@ std::variant<Config, ConfigError> load_config(const std::string& path) {
                 return ConfigError{"target.log", "Invalid 'log' section", "map", "not a map"};
             }
             YAML::Node log_node = target_node["log"];
+        // --- Check for unknown keys in target.log ---
+        {
+            static const std::unordered_set<std::string> log_allowed = {"stdout", "stderr"};
+            ConfigError err = check_unknown_keys(log_node, log_allowed, "target.log");
+            if (!err.message.empty()) {
+                return err;
+            }
+        }
+
             if (log_node["stdout"]) {
                 if (!log_node["stdout"].IsScalar()) return ConfigError{"target.log.stdout", "Invalid type", "string", "not a string"};
                 cfg.target.log.stdout_path = log_node["stdout"].as<std::string>();
@@ -109,13 +166,20 @@ std::variant<Config, ConfigError> load_config(const std::string& path) {
             return ConfigError{"network", "Missing or invalid 'network' section", "map", "missing/invalid"};
         }
         YAML::Node net_node = root["network"];
+        // --- Check for unknown keys in network ---
+        {
+            static const std::unordered_set<std::string> network_allowed = {"host", "port", "timeout_ms", "initial_ms"};
+            ConfigError err = check_unknown_keys(net_node, network_allowed, "network");
+            if (!err.message.empty()) {
+                return err;
+            }
+        }
+
         
         if (net_node["host"]) {
             if (!net_node["host"].IsScalar()) return ConfigError{"network.host", "Invalid type", "string", "not a string"};
-            // TODO(claude): host is not validated, but network.cpp connect_target() uses inet_pton(AF_INET) only:
-            //   "localhost", hostnames and IPv6 literals are accepted here and then fail at connect time.
-            //   Validate here (IPv4 literal) or resolve with getaddrinfo().
-            // SOLUTION: write comment that we not support ipv6
+            // WARN: host is not validated beyond being a string; network.cpp connect_target() uses inet_pton(AF_INET) only:
+            //   IPv4 literals work, but hostnames, IPv6 literals, and invalid strings are accepted here and may fail at connect time.
             cfg.network.host = net_node["host"].as<std::string>();
         }
         
@@ -159,11 +223,21 @@ std::variant<Config, ConfigError> load_config(const std::string& path) {
                 return ConfigError{"afl", "Invalid 'afl' section", "map", "not a map"};
             }
             YAML::Node afl_node = root["afl"];
+        // --- Check for unknown keys in afl ---
+        {
+            static const std::unordered_set<std::string> afl_allowed = {"loop_count", "enable_cmplog"};
+            ConfigError err = check_unknown_keys(afl_node, afl_allowed, "afl");
+            if (!err.message.empty()) {
+                return err;
+            }
+        }
+
             if (afl_node["loop_count"]) {
                 try {
-                    // TODO(claude): no range validation: 0 or negative loop_count is accepted and passed to __AFL_LOOP().
-                    //   Require > 0 (the spec only gives a default, but a non-positive value is meaningless).
                     cfg.afl.loop_count = afl_node["loop_count"].as<int>();
+                    if (cfg.afl.loop_count <= 0) {
+                        return ConfigError{"afl.loop_count", "Must be > 0", "integer > 0", std::to_string(cfg.afl.loop_count)};
+                    }
                 } catch (const YAML::BadConversion&) {
                     return ConfigError{"afl.loop_count", "Invalid type", "integer", afl_node["loop_count"].Scalar()};
                 }
@@ -183,6 +257,15 @@ std::variant<Config, ConfigError> load_config(const std::string& path) {
                 return ConfigError{"port_detection", "Invalid 'port_detection' section", "map", "not a map"};
             }
             YAML::Node pd_node = root["port_detection"];
+        // --- Check for unknown keys in port_detection ---
+        {
+            static const std::unordered_set<std::string> pd_allowed = {"primary"};
+            ConfigError err = check_unknown_keys(pd_node, pd_allowed, "port_detection");
+            if (!err.message.empty()) {
+                return err;
+            }
+        }
+
             if (pd_node["primary"]) {
                 if (!pd_node["primary"].IsScalar()) return ConfigError{"port_detection.primary", "Invalid type", "string", "not a string"};
                 std::string primary = pd_node["primary"].as<std::string>();
@@ -199,6 +282,15 @@ std::variant<Config, ConfigError> load_config(const std::string& path) {
                 return ConfigError{"cleanup", "Invalid 'cleanup' section", "map", "not a map"};
             }
             YAML::Node clean_node = root["cleanup"];
+        // --- Check for unknown keys in cleanup ---
+        {
+            static const std::unordered_set<std::string> cleanup_allowed = {"force_kill_ms", "kill_pattern"};
+            ConfigError err = check_unknown_keys(clean_node, cleanup_allowed, "cleanup");
+            if (!err.message.empty()) {
+                return err;
+            }
+        }
+
             if (clean_node["force_kill_ms"]) {
                 try {
                     cfg.cleanup.force_kill_ms = clean_node["force_kill_ms"].as<int>();
@@ -215,12 +307,25 @@ std::variant<Config, ConfigError> load_config(const std::string& path) {
                 KillPattern kp;
                 if (kp_node.IsScalar()) {
                     kp.type = "comm";
-                    // TODO(claude): /proc/<pid>/comm is truncated by the kernel to 15 chars (TASK_COMM_LEN-1). A comm
-                    //   value longer than 15 chars can never match; warn/reject it here.
-                    // SOLUTION: yes, that is intended when the user selects "comm"
+                    // WARN: /proc/<pid>/comm is truncated by the kernel to 15 chars (TASK_COMM_LEN-1). A comm
+                    //   value longer than 15 chars can never match; this is intentional when the user selects "comm"
                     kp.value = kp_node.as<std::string>();
                     kp.target = "comm";
                 } else if (kp_node.IsMap()) {
+
+
+                     // --- Check for unknown keys in cleanup.kill_pattern (if it's a map) ---
+                     {
+                         std::unordered_set<std::string> kp_allowed = {"type", "value"};
+                         if (kp.type == "regexp") {
+                             kp_allowed.insert("target");
+                         }
+                         ConfigError err = check_unknown_keys(kp_node, kp_allowed, "cleanup.kill_pattern");
+                         if (!err.message.empty()) {
+                             return err;
+                         }
+                     }
+
                     if (!kp_node["type"] || !kp_node["value"]) {
                         return ConfigError{"cleanup.kill_pattern", "Missing 'type' or 'value'", "object with type and value", "missing fields"};
                     }
@@ -245,12 +350,13 @@ std::variant<Config, ConfigError> load_config(const std::string& path) {
                         }
                         // Validate regex syntax
                         try {
-                            // TODO(claude): `type: comm` objects silently ignore an extra `target` key, and the regex is
+                            // WARN: `type: comm` objects silently ignore an extra `target` key, and the regex is
                             //   compiled with the default ECMAScript flavour (spec only says "standard C++ regex").
-                            //   Also an empty/over-broad pattern (e.g. `.*` with target argv) would match every
-                            //   process - see the self/parent-protection TODO in process.cpp.
-                            // SOLUTION: yes, error empty pattern. But broad pattern i don't care, if the user sets it.
-                            //           ECMAScript is ok for it.
+                            //   Note: we do not validate against empty or over-broad patterns (e.g. `.*` with target argv)
+                            //   as that is the user's responsibility; see the self/parent-protection TODO in process.cpp.
+                            if (kp.value.empty()) {
+                                return ConfigError{"cleanup.kill_pattern.value", "Pattern must not be empty", "non-empty string", ""};
+                            }
                             std::regex r(kp.value);
                         } catch (const std::regex_error&) {
                             return ConfigError{"cleanup.kill_pattern.value", "Invalid regular expression", "valid regex", kp.value};
@@ -268,7 +374,7 @@ std::variant<Config, ConfigError> load_config(const std::string& path) {
     } catch (const YAML::BadFile& e) {
         return ConfigError{"", "Failed to load YAML file: " + std::string(e.what()), "valid file", path};
     } catch (const std::exception& e) {
-        return ConfigError{"", "Unexpected error parsing config: " + std::string(e.what()), "valid config", "exception"};
+        return ConfigError{path, "Unexpected error parsing config: " + std::string(e.what()), "valid config", "exception"};
     }
 
     return cfg;
