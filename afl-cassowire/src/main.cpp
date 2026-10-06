@@ -9,6 +9,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <csignal>
+#include <cerrno>
 #include <cstdint>
 #include <filesystem>
 #include <unistd.h>
@@ -41,9 +42,6 @@ __AFL_FUZZ_INIT();
 volatile sig_atomic_t g_child_pid = 0;
 int g_force_kill_ms = 2000;
 
-// TODO(claude): name is misleading: kill_pgid() sends SIGKILL (no SIGTERM, no wait, no reap). The spec
-//   (5.1 "Signal Handling" + 6.1) wants SIGTERM -> wait force_kill_ms -> SIGKILL; the proxy-mode loop exit
-//   uses this one (see the commented-out timed_kill_pgid in run_proxy_mode).
 void kill_pgid(pid_t pgid) {
     if (pgid <= 0) return;
     kill(-pgid, SIGKILL);
@@ -52,43 +50,51 @@ void kill_pgid(pid_t pgid) {
 // Async-signal-safe timed kill for process group
 void timed_kill_pgid(pid_t pgid, int ms) {
     if (pgid <= 0) return;
-    
+
     // Send SIGTERM to process group
     kill(-pgid, SIGTERM);
-    
+
     struct timespec start, now;
     clock_gettime(CLOCK_MONOTONIC, &start);
-    
+
     while (true) {
         int status;
         // Check if the process group leader has exited
         pid_t res = waitpid(pgid, &status, WNOHANG);
-        // TODO(claude): `errno` is used but <cerrno> is not included in main.cpp (compiles only through
-        //   transitive includes). Also if waitpid returns -1/EINTR or another error it is treated as "still
-        //   running" and loops; and a tracee (ptrace mode) in a stop state will not exit on SIGTERM until
-        //   resumed - SIGKILL after the timeout is then the only thing that works.
-        if (res == pgid || (res == -1 && errno == ECHILD)) {
-            return; // Process exited
+        if (res == pgid) {
+            break; // Process exited
+        } else if (res == -1) {
+            if (errno == ECHILD) {
+                break; // No child processes
+            } else if (errno == EINTR) {
+                // Try again, so do nothing and continue the loop.
+            } else {
+                // Unexpected error: break out of the loop to send SIGKILL.
+                break;
+            }
         }
-        
+        // res == 0 means the process is still alive (or stopped, etc.)
+
         clock_gettime(CLOCK_MONOTONIC, &now);
         long long elapsed_ms = (now.tv_sec - start.tv_sec) * 1000LL + 
                                (now.tv_nsec - start.tv_nsec) / 1000000LL;
-                               
+                                
         if (elapsed_ms >= ms) {
-            // Timeout reached, send SIGKILL
-            // TODO(claude): SIGKILL is sent but the child is never reaped (no final waitpid) -> zombie in
-            //   test mode / when the proxy continues. Also when the group leader exits normally after SIGTERM,
-            //   other members of the group (e.g. nginx workers) are NOT sent SIGKILL even if they ignore
-            //   SIGTERM, since we only wait for the leader.
-            kill(-pgid, SIGKILL);
-            return;
+            // Timeout reached, break to send SIGKILL
+            break;
         }
-        
+
         // Short sleep to avoid busy-waiting (nanosleep is async-signal-safe)
         struct timespec req = {0, 10000000}; // 10ms
         nanosleep(&req, nullptr);
     }
+
+    // Send SIGKILL to the entire process group to ensure cleanup
+    kill(-pgid, SIGKILL);
+
+    // Reap the leader to avoid zombie (if it hasn't been reaped already)
+    int status;
+    waitpid(pgid, &status, 0);
 }
 
 void signal_handler(int signum) {
@@ -106,6 +112,11 @@ void setup_signal_handlers() {
     sigaction(SIGTERM, &sa, nullptr);
 }
 
+// TODO: i guess we have to use logging library. Or at least make some useful workarounds
+// NOTES: well, about log
+// If we will use logging to logger we have to capture the output from the binaries
+// And it must be configurable
+// 
 bool create_log_file(const std::string& path) {
     // TODO(claude): spec says stdout/stderr logs are optional "only for proxy mode" and creation failure
     //   must fail - OK, but if both paths are the same file, or the path is a dir/relative to a different
@@ -204,23 +215,23 @@ int run_proxy_mode(const Config& cfg) {
     }
 
     // Initialize AFL persistent mode
-    // TODO(claude): __AFL_INIT() is guarded by `#ifdef __AFL_HAVE_MANUAL_CONTROL`; if that macro is missing
-    //   the forkserver is silently NOT initialised. Per spec it must be unconditional (afl_compat.hpp should
-    //   #error instead). Also placement: spec 6.1 puts __AFL_INIT before spawning the target, which means the
-    //   forkserver forks first and each forked child would spawn its own target - confirm this is intended
-    //   (see question to the user).
-    #ifdef __AFL_HAVE_MANUAL_CONTROL
     __AFL_INIT();
-    #endif
 
     // Spawn target
     // TODO(claude): g_child_pid is assigned from the return value only after fork(); the signal handler can
     //   fire in between (see handler TODO). Block SIGINT/SIGTERM around spawn_target().
-    g_child_pid = process::spawn_target(cfg, false, true);
-    if (g_child_pid <= 0) {
+    auto prep_opt = process::prepare_target(cfg, process::SpawnMode::ProxyMode);
+    if (!prep_opt) {
+        std::cerr << "proxy: failed to prepare target process.\n";
+        return 1;
+    }
+    process::SpawnedTarget spawned = process::fork_target(cfg, *prep_opt, process::SpawnMode::ProxyMode, &g_child_pid);
+    if (spawned.pid <= 0) {
         std::cerr << "proxy: failed to spawn target process.\n";
         return 1;
     }
+    process::handshake_tracer(spawned.pid, cfg);
+    g_child_pid = spawned.pid;
 
     // Wait for port readiness
     if (!network::wait_for_port(g_child_pid, cfg)) {
@@ -315,14 +326,22 @@ int run_test_mode(const Config& cfg, const std::string& input_path) {
 
     // --- Pass 1: Map Size Extraction ---
     // TODO(claude): setenv(AFL_DUMP_MAP_SIZE) on the PROXY's own environment is redundant (spawn_target already
-    //   adds it via set_env_var when is_map_size_pass) and, with env_preserve=true, leaks into the proxy's
+    //   adds it via set_env_var when is_map_size_pass) and, with env_preserve: all, leaks into the proxy's
     //   environ; if spawn fails (early return below) it is never unset.
     setenv("AFL_DUMP_MAP_SIZE", "1", 1);
-    pid_t map_pid = process::spawn_target(cfg, true, false);
-    if (map_pid <= 0) {
-        std::cerr << "proxy: failed to spawn target for map size extraction.\n";
+    auto prep_opt1 = process::prepare_target(cfg, process::SpawnMode::MapSizePass);
+    if (!prep_opt1) {
+        std::cerr << "proxy: failed to prepare target for map size extraction.\n";
+        unsetenv("AFL_DUMP_MAP_SIZE");
         return 1;
     }
+    process::SpawnedTarget spawned1 = process::fork_target(cfg, *prep_opt1, process::SpawnMode::MapSizePass, nullptr);
+    if (spawned1.pid <= 0) {
+        std::cerr << "proxy: failed to spawn target for map size extraction.\n";
+        unsetenv("AFL_DUMP_MAP_SIZE");
+        return 1;
+    }
+    process::handshake_tracer(spawned1.pid, cfg);
 
     int status;
     // TODO(claude): BUG/spec: (1) blocking waitpid() with no timeout: a long-running target (nginx stays up
@@ -331,7 +350,12 @@ int run_test_mode(const Config& cfg, const std::string& input_path) {
     //   Pass 1 target process": it must be killed (SIGTERM->SIGKILL via timed_kill_pgid), not waited for.
     //   (2) g_child_pid is not set during Pass 1, so Ctrl+C during Pass 1 kills nothing. (3) The exit status
     //   is ignored.
-    waitpid(map_pid, &status, 0);
+    waitpid(spawned1.pid, &status, 0);
+    
+    // Collect map size from the pipe
+    if (spawned1.map_size_fd >= 0) {
+        process::collect_map_size(spawned1.map_size_fd);
+    }
     unsetenv("AFL_DUMP_MAP_SIZE");
 
     // TODO(claude): stale/confusing comment (hedges "OR"); also Pass 1 failure (no/invalid map size) is NOT
@@ -348,17 +372,28 @@ int run_test_mode(const Config& cfg, const std::string& input_path) {
     //   the child, fine, but an empty regular file is reported as "failed to read" (see read_input_file).
     //   Also spec 6.2 step 3 says the --input validation must be done BEFORE Pass 1; it is (input_path.empty()
     //   check), but the file itself is only opened after Pass 1 - validate readability up front to fail early.
-    std::vector<uint8_t> payload = read_input_file(input_path);
-    if (payload.empty() && input_path != "-") {
+    std::vector<uint8_t> input_data = read_input_file(input_path);
+    if (input_data.empty() && input_path != "-") {
+        // TODO: yes, empty file is a file! It is not fail!
         std::cerr << "proxy: failed to read payload from " << input_path << "\n";
         return 1;
     }
 
-    g_child_pid = process::spawn_target(cfg, false, false);
-    if (g_child_pid <= 0) {
+    // Final payload = configured prefix + input data + configured suffix
+    std::vector<uint8_t> payload = cfg.payload.wrap(input_data.data(), input_data.size());
+
+    auto prep_opt2 = process::prepare_target(cfg, process::SpawnMode::PlainTest);
+    if (!prep_opt2) {
+        std::cerr << "proxy: failed to prepare target for test iteration.\n";
+        return 1;
+    }
+    process::SpawnedTarget spawned2 = process::fork_target(cfg, *prep_opt2, process::SpawnMode::PlainTest, &g_child_pid);
+    if (spawned2.pid <= 0) {
         std::cerr << "proxy: failed to spawn target for test iteration.\n";
         return 1;
     }
+    process::handshake_tracer(spawned2.pid, cfg);
+    g_child_pid = spawned2.pid;
 
     if (!network::wait_for_port(g_child_pid, cfg)) {
         std::cerr << "proxy: target failed to bind to expected port.\n";
