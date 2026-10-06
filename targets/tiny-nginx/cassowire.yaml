@@ -2,7 +2,7 @@
 # Copy this to config.yaml and adjust values as needed.
 
 target:
-  binary: "./src/build/afl-clang-lto/tinynginx"           # Path to the target binary (required)
+  binary: "./src/build/afl-clang-fast/tinynginx"           # Path to the target binary (required)
   args: ["tinynginx", "-p", "8080"]                     # Additional arguments (binary is added automatically)
   env:
     WORKERS: 1
@@ -18,14 +18,14 @@ network:
   initial_ms: 200              # Port detection timeout in milliseconds
 
 afl:
-  loop_count: 50000            # Number of __AFL_LOOP iterations
+  loop_count: 10            # Number of __AFL_LOOP iterations
   enable_cmplog: false         # Enable AFL compare log (requires __AFL_CMPLOG_SHM_ID)
 
 port_detection:
   primary: "procfs"            # Method: "procfs", "ptrace", or "seccomp"
 
 cleanup:
-  force_kill_ms: 2000          # Wait time after SIGTERM before SIGKILL
+  force_kill_ms: 150          # Wait time after SIGTERM before SIGKILL
   kill_pattern: "tinynginx"               # Optional: auto-kill stale target processes
     # Scalar form — matches /proc/<pid>/comm:
     # "nginx"

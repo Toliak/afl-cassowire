@@ -6,7 +6,7 @@ prepare:
 	meson subprojects download
 
 prepare2:
-	CXX="$(AFLPP_DISTRIB_DIR)/bin/afl-clang-lto++" meson setup build
+	CXX="$(AFLPP_DISTRIB_DIR)/bin/afl-clang-fast++" meson setup build
 
 build:
 	export AFL_PROXY_LLVM_ONLY_FSRV=1 && \
