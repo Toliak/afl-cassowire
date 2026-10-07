@@ -89,10 +89,13 @@ void cleanup_stale_processes(const CleanupConfig& cleanup_cfg) {
         }
         if (!is_pid) continue;
 
-        // TODO(claude): std::stoi throws std::out_of_range (uncaught -> std::terminate) for an all-digit
-        //   directory whose value exceeds INT_MAX; use std::from_chars and handle the error. The comment
-        //   below mentions kernel threads but only pid<=1 is skipped (kernel threads have /proc/<pid>/comm).
-        pid_t pid = std::stoi(entry->d_name);
+        // TODO(claude): the comment below mentions kernel threads but only pid<=1 is skipped (kernel threads
+        //   have /proc/<pid>/comm).
+        // std::stoi was replaced by the exception-free utils::parse_u32_strict: an all-digit directory whose
+        //   value exceeds the type range used to throw std::out_of_range uncaught (-> std::terminate).
+        auto parsed_pid = utils::parse_u32_strict(entry->d_name);
+        if (!std::holds_alternative<std::uint32_t>(parsed_pid)) continue;
+        pid_t pid = static_cast<pid_t>(std::get<std::uint32_t>(parsed_pid));
         if (pid <= 1) continue; // Skip init and kernel threads
 
         std::string proc_path = std::string("/proc/") + entry->d_name;

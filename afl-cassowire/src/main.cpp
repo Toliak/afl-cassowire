@@ -30,17 +30,7 @@
 
 __AFL_FUZZ_INIT();
 
-// TODO(claude): globals/handlers. (1) `g_force_kill_ms` is a plain int read from the signal handler - make it
-//   volatile sig_atomic_t / std::atomic. (2) signal_handler() calls timed_kill_pgid() which loops with
-//   nanosleep for up to force_kill_ms inside a signal handler and uses `errno` (not saved/restored) and
-//   waitpid on the *group id* (works only because pgid == child pid). It also calls waitpid() on the
-//   child while the main flow may be in waitpid() for the same pid -> racy reaping. Prefer: set a flag in the
-//   handler, do the cleanup in the main loop. (3) the handler is installed AFTER load_config but before
-//   cleanup_stale_processes() - fine - but SIGINT/SIGTERM are not blocked during fork, so g_child_pid==0
-//   -> `pgid <= 0` makes the handler a no-op and exits immediately without killing a child that is
-//   already forked but whose pid has not yet been stored in g_child_pid.
 volatile sig_atomic_t g_child_pid = 0;
-int g_force_kill_ms = 2000;
 
 void kill_pgid(pid_t pgid) {
     if (pgid <= 0) return;
@@ -97,21 +87,6 @@ void timed_kill_pgid(pid_t pgid, int ms) {
     waitpid(pgid, &status, 0);
 }
 
-void signal_handler(int signum) {
-    timed_kill_pgid(g_child_pid, g_force_kill_ms);
-    _exit(128 + signum);
-}
-
-void setup_signal_handlers() {
-    struct sigaction sa{};
-    sa.sa_handler = signal_handler;
-    sigemptyset(&sa.sa_mask);
-    sa.sa_flags = 0; // Do not use SA_RESTART so blocking calls exit on signal
-    
-    sigaction(SIGINT, &sa, nullptr);
-    sigaction(SIGTERM, &sa, nullptr);
-}
-
 // TODO: i guess we have to use logging library. Or at least make some useful workarounds
 // NOTES: well, about log
 // If we will use logging to logger we have to capture the output from the binaries
@@ -128,51 +103,6 @@ bool create_log_file(const std::string& path) {
         return false;
     }
     close(fd);
-    return true;
-}
-
-std::vector<uint8_t> read_input_file(const std::string& path) {
-    // TODO(claude): cannot distinguish "empty file / empty stdin" from "error": both return an empty vector.
-    //   The caller then treats an empty regular file as a read failure (`payload.empty() && path != "-"`),
-    //   but an empty stdin is accepted and a read() error (-1) from stdin is silently treated as EOF.
-    //   Return std::optional<std::vector<uint8_t>> instead. EINTR on read() is also not handled.
-    std::vector<uint8_t> buffer;
-    if (path == "-") {
-        // Read from stdin
-        uint8_t chunk[4096];
-        ssize_t bytes_read;
-        while ((bytes_read = read(STDIN_FILENO, chunk, sizeof(chunk))) > 0) {
-            buffer.insert(buffer.end(), chunk, chunk + bytes_read);
-        }
-    } else {
-        FILE* f = fopen(path.c_str(), "rb");
-        if (!f) {
-            std::cerr << "proxy: failed to open input file: " << path << "\n";
-            return {};
-        }
-        uint8_t chunk[4096];
-        size_t bytes_read;
-        while ((bytes_read = fread(chunk, 1, sizeof(chunk), f)) > 0) {
-            buffer.insert(buffer.end(), chunk, chunk + bytes_read);
-        }
-        fclose(f);
-    }
-    return buffer;
-}
-
-// Strictly parses a decimal unsigned 64-bit integer.
-// Accepts only non-empty strings of ASCII digits that fit into uint64_t
-// (no sign, no whitespace, no suffix, no overflow).
-static bool parse_u64_strict(const char* s, uint64_t* out) {
-    if (!s || *s == '\0') return false;
-    for (const char* p = s; *p; ++p) {
-        if (*p < '0' || *p > '9') return false;
-    }
-    errno = 0;
-    char* end = nullptr;
-    unsigned long long value = strtoull(s, &end, 10);
-    if (errno == ERANGE || end == s || (end && *end != '\0')) return false;
-    *out = static_cast<uint64_t>(value);
     return true;
 }
 
@@ -202,7 +132,10 @@ int run_proxy_mode(const Config& cfg) {
     }
 
     uint64_t force_final_loc = 0;
-    if (!parse_u64_strict(final_loc_str, &force_final_loc)) {
+    if (auto parsed = utils::parse_u64_strict(final_loc_str);
+        std::holds_alternative<uint64_t>(parsed)) {
+        force_final_loc = std::get<uint64_t>(parsed);
+    } else {
         std::cerr << "proxy: PROXY_AFL_FORCE_FINAL_LOC must be an integer (uint64), got: '" << final_loc_str << "'\n";
         return 1;
     }
@@ -218,8 +151,6 @@ int run_proxy_mode(const Config& cfg) {
     __AFL_INIT();
 
     // Spawn target
-    // TODO(claude): g_child_pid is assigned from the return value only after fork(); the signal handler can
-    //   fire in between (see handler TODO). Block SIGINT/SIGTERM around spawn_target().
     auto prep_opt = process::prepare_target(cfg, process::SpawnMode::ProxyMode);
     if (!prep_opt) {
         std::cerr << "proxy: failed to prepare target process.\n";
@@ -234,8 +165,10 @@ int run_proxy_mode(const Config& cfg) {
     g_child_pid = spawned.pid;
 
     // Wait for port readiness
-    if (!network::wait_for_port(g_child_pid, cfg)) {
-        std::cerr << "proxy: target failed to bind to expected port within timeout.\n";
+    auto port_res = network::wait_for_port(g_child_pid, cfg);
+    if (std::holds_alternative<network::DetectError>(port_res)) {
+        std::cerr << "proxy: failed to detect port " << cfg.network.port << ": "
+                  << std::get<network::DetectError>(port_res).to_string() << "\n";
         timed_kill_pgid(g_child_pid, cfg.cleanup.force_kill_ms);
         return 1;
     }
@@ -255,9 +188,10 @@ int run_proxy_mode(const Config& cfg) {
         int len = __AFL_FUZZ_TESTCASE_LEN;
         uint8_t* buf = __AFL_FUZZ_TESTCASE_BUF;
 
-        int sock = network::connect_target(cfg.network);
-        std::cout << std::chrono::system_clock::now() <<  " sock " << sock << "\n";
-        if (sock < 0) {
+        auto conn = network::connect_target(cfg.network);
+        if (std::holds_alternative<network::ConnectError>(conn)) {
+            std::cerr << "proxy: failed to connect to " << cfg.network.host << ":" << cfg.network.port << ": "
+                      << std::get<network::ConnectError>(conn).to_string() << "\n";
             // Connection failed, target might be dead.
             // Check health immediately.
             // TODO(claude): BUGS. (1) A connect failure when the target is alive (or exited normally, not
@@ -274,6 +208,8 @@ int run_proxy_mode(const Config& cfg) {
             // continue;
             break;
         }
+        utils::FdGuard sock = std::get<utils::FdGuard>(std::move(conn));
+        std::cout << std::chrono::system_clock::now() << " sock " << sock.get() << "\n";
         std::cout <<  std::chrono::system_clock::now() << " Successfully connected\n";
 
         // Final payload = configured prefix + fuzz data + configured suffix
@@ -282,9 +218,17 @@ int run_proxy_mode(const Config& cfg) {
         payload_buf.insert(payload_buf.end(), buf, buf + len);
         payload_buf.insert(payload_buf.end(), cfg.payload.suffix.begin(), cfg.payload.suffix.end());
 
-        network::send_all(sock, payload_buf.data(), payload_buf.size(), cfg.network.timeout_ms);
-        network::wait_response(sock, cfg.network.timeout_ms);
-        close(sock);
+        if (auto send_res = network::send_all(sock.get(), payload_buf.data(), payload_buf.size(), cfg.network.timeout_ms);
+            std::holds_alternative<network::SendError>(send_res)) {
+            std::cerr << "proxy: send failed: "
+                      << std::get<network::SendError>(send_res).to_string() << "\n";
+        }
+        if (auto wait_res = network::wait_response(sock.get(), cfg.network.timeout_ms);
+            std::holds_alternative<network::WaitError>(wait_res)) {
+            std::cerr << "proxy: waiting for response failed: "
+                      << std::get<network::WaitError>(wait_res).to_string() << "\n";
+        }
+        // The socket is closed when `sock` goes out of scope at the end of the iteration.
 
         std::cout <<  std::chrono::system_clock::now() << " One iteration\n";
 
@@ -369,10 +313,19 @@ int run_test_mode(const Config& cfg, const std::string& input_path) {
 
     // --- Pass 2: Single Iteration ---
     // TODO(claude): ordering/stdin issue: reading the payload from stdin ("-") happens AFTER Pass 1 spawned
-    //   the child, fine, but an empty regular file is reported as "failed to read" (see read_input_file).
-    //   Also spec 6.2 step 3 says the --input validation must be done BEFORE Pass 1; it is (input_path.empty()
-    //   check), but the file itself is only opened after Pass 1 - validate readability up front to fail early.
-    std::vector<uint8_t> input_data = read_input_file(input_path);
+    //   the child, fine, but an empty regular file is reported as "failed to read" (see
+    //   utils::read_input_file). Also spec 6.2 step 3 says the --input validation must be done BEFORE
+    //   Pass 1; it is (input_path.empty() check), but the file itself is only opened after Pass 1 -
+    //   validate readability up front to fail early.
+    std::vector<uint8_t> input_data;
+    if (auto input_res = utils::read_input_file(input_path);
+        std::holds_alternative<std::error_code>(input_res)) {
+        std::cerr << "proxy: failed to read payload from " << input_path << ": "
+                  << std::get<std::error_code>(input_res).message() << "\n";
+        return 1;
+    } else {
+        input_data = std::get<std::vector<uint8_t>>(std::move(input_res));
+    }
     if (input_data.empty() && input_path != "-") {
         // TODO: yes, empty file is a file! It is not fail!
         std::cerr << "proxy: failed to read payload from " << input_path << "\n";
@@ -395,27 +348,48 @@ int run_test_mode(const Config& cfg, const std::string& input_path) {
     process::handshake_tracer(spawned2.pid, cfg);
     g_child_pid = spawned2.pid;
 
-    if (!network::wait_for_port(g_child_pid, cfg)) {
-        std::cerr << "proxy: target failed to bind to expected port.\n";
+    auto port_res2 = network::wait_for_port(g_child_pid, cfg);
+    if (std::holds_alternative<network::DetectError>(port_res2)) {
+        std::cerr << "proxy: failed to detect port " << cfg.network.port << ": "
+                  << std::get<network::DetectError>(port_res2).to_string() << "\n";
         timed_kill_pgid(g_child_pid, cfg.cleanup.force_kill_ms);
         return 1;
     }
 
-    int sock = network::connect_target(cfg.network);
-    if (sock < 0) {
-        std::cerr << "proxy: failed to connect to target.\n";
+    auto conn = network::connect_target(cfg.network);
+    if (std::holds_alternative<network::ConnectError>(conn)) {
+        std::cerr << "proxy: failed to connect to " << cfg.network.host << ":" << cfg.network.port << ": "
+                  << std::get<network::ConnectError>(conn).to_string() << "\n";
         timed_kill_pgid(g_child_pid, cfg.cleanup.force_kill_ms);
         return 1;
     }
+    utils::FdGuard sock = std::get<utils::FdGuard>(std::move(conn));
 
-    // TODO(claude): return values of send_all()/wait_response() are ignored, so the "connection status" the
-    //   spec asks to print in test mode (6.2 step 5) is never printed, and the response body is never shown
-    //   (wait_response only prints "buf len = N"). The success message below is printed unconditionally.
-    network::send_all(sock, payload.data(), payload.size(), cfg.network.timeout_ms);
-    network::wait_response(sock, cfg.network.timeout_ms);
-    close(sock);
+    bool io_ok = true;
+    if (auto send_res = network::send_all(sock.get(), payload.data(), payload.size(), cfg.network.timeout_ms);
+        std::holds_alternative<network::SendError>(send_res)) {
+        std::cerr << "proxy: send failed: "
+                  << std::get<network::SendError>(send_res).to_string() << "\n";
+        io_ok = false;
+    }
 
-    std::cout << "proxy: Pass 2 (Single Iteration) completed successfully.\n";
+    // Spec 6.2: print the target's response in test mode.
+    auto wait_res = network::wait_response(sock.get(), cfg.network.timeout_ms);
+    if (std::holds_alternative<std::vector<uint8_t>>(wait_res)) {
+        const auto& data = std::get<std::vector<uint8_t>>(wait_res);
+        std::cout.write(reinterpret_cast<const char*>(data.data()), static_cast<std::streamsize>(data.size()));
+        if (!data.empty() && data.back() != '\n') std::cout << "\n";
+    } else {
+        std::cerr << "proxy: waiting for response failed: "
+                  << std::get<network::WaitError>(wait_res).to_string() << "\n";
+        io_ok = false;
+    }
+
+    if (io_ok) {
+        std::cout << "proxy: Pass 2 (Single Iteration) completed successfully.\n";
+    } else {
+        std::cerr << "proxy: Pass 2 (Single Iteration) failed.\n";
+    }
     
     // Clean exit
     timed_kill_pgid(g_child_pid, cfg.cleanup.force_kill_ms);
@@ -468,10 +442,6 @@ int main(int argc, char* argv[]) {
     }
     
     Config cfg = std::get<Config>(config_res);
-    g_force_kill_ms = cfg.cleanup.force_kill_ms;
-
-    // Setup signal handlers
-    setup_signal_handlers();
 
     // TODO(claude): spec 6.2 says test mode validates --input BEFORE running cleanup; here cleanup (which
     //   SIGTERM/SIGKILLs other processes and sleeps force_kill_ms) runs first and only then run_test_mode()

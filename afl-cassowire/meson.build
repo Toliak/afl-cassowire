@@ -21,9 +21,10 @@ int main() { return 0; }
 result = compiler.run(code, name : 'check that is afl++ compiler', required: true)
 
 # Dependencies
-thread_dep = dependency('threads')
+thread_dep = dependency('threads') # TODO: do we really need this?
 yaml_cpp_dep = dependency('yaml-cpp', required : true)
 argparse_dep = dependency('argparse', required : true)
+spdlog_dep = dependency('spdlog', required : true)
 
 
 # ---------------------------
@@ -41,6 +42,6 @@ executable(
     'afl-cassowire',
     sources,
     include_directories : include_dirs,
-    dependencies : [thread_dep, yaml_cpp_dep, argparse_dep],
+    dependencies : [thread_dep, yaml_cpp_dep, argparse_dep, spdlog_dep],
     install : true,
 )
