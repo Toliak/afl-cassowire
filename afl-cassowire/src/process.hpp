@@ -61,19 +61,27 @@ namespace process {
 
     /**
      * @brief Fork the child process, set up its file descriptors and process group, then arm ptrace/seccomp.
-     * 
+     *
      * The child never returns; on success it execve()s the target binary.
-     * 
+     *
+     * Stdin is always redirected to /dev/null. The child's stdout/stderr are
+     * forwarded to the proxy's descriptors when @p forward_output is true,
+     * and sent to /dev/null otherwise. MapSizePass ignores @p forward_output:
+     * its stdout is a pipe carrying the map size and its stderr goes to
+     * /dev/null.
+     *
      * @param cfg global configuration
      * @param prep output from prepare_target()
      * @param mode selects redirection rules and other mode-specific behavior
+     * @param forward_output forward the child's stdout/stderr to the proxy's
+     *                       descriptors (--child-output flag) instead of /dev/null
      * @param publish_pid if non-null, written with the child's PID before any blocking operation
      *                    (intended for g_child_pid in main.cpp to make signal handlers safe)
      * @return SpawnedTarget containing the child PID and, for MapSizePass, the pipe file descriptor
      *         (caller must close map_size_fd after use). On failure, pid == -1.
      */
     SpawnedTarget fork_target(const Config& cfg, const TargetPrepared& prep, SpawnMode mode,
-                              volatile sig_atomic_t* publish_pid);
+                              bool forward_output, volatile sig_atomic_t* publish_pid);
 
     /**
      * @brief Parent-side tracer handshake after fork_target().
@@ -88,10 +96,10 @@ namespace process {
 
     /**
      * @brief Read and parse the map size from the pipe created for MapSizePass.
-     * 
-     * Consumes exactly one line of output, expects a decimal integer, prints it to stdout.
-     * On failure prints an error to stderr but does not return an error code (matches legacy behavior).
-     * 
+     *
+     * Consumes exactly one line of output, expects a decimal integer, logs it.
+     * On failure logs an error but does not return an error code (matches legacy behavior).
+     *
      * @param pipe_read_fd read end of the pipe (will be closed by this function)
      */
     void collect_map_size(int pipe_read_fd);

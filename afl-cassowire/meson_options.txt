@@ -1,0 +1,2 @@
+option('strip_low_logs', type: 'boolean', value: false,
+       description: 'Compile out trace and debug log statements (sets SPDLOG_ACTIVE_LEVEL=INFO instead of TRACE)')

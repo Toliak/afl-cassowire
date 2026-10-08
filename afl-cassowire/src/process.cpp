@@ -1,9 +1,9 @@
 // src/process.cpp
 
 #include "process.hpp"
+#include "log.hpp"
 #include "utils.hpp"
 
-#include <iostream>
 #include <fstream>
 #include <sstream>
 #include <string>
@@ -179,7 +179,9 @@ std::optional<TargetPrepared> prepare_target(const Config& cfg, SpawnMode mode) 
             const char* path = getenv("PATH");
             c_env_strings.push_back("PATH=" + std::string(path ? path : ""));
             const char* afl_shm_id = getenv("__AFL_SHM_ID");
-            c_env_strings.push_back("__AFL_SHM_ID=" + std::string(afl_shm_id ? afl_shm_id : ""));
+            if (afl_shm_id != nullptr) {
+                c_env_strings.push_back("__AFL_SHM_ID=" + std::string(afl_shm_id ? afl_shm_id : ""));
+            }
             // Propagated when present (main.cpp requires it whenever afl.enable_cmplog is set)
             const char* afl_cmplog_shm_id = getenv("__AFL_CMPLOG_SHM_ID");
             if (afl_cmplog_shm_id) {
@@ -217,21 +219,23 @@ std::optional<TargetPrepared> prepare_target(const Config& cfg, SpawnMode mode) 
     }
     c_env.push_back(nullptr);
 
-    // Log the execution plan (binary, args, env) - done in parent before fork
-    dprintf(STDERR_FILENO, "Begin\n");
-    dprintf(STDERR_FILENO, "execve binary=%s\n", cfg.target.binary.c_str());
-    dprintf(STDERR_FILENO, "args:\n");
-    for (const auto& arg : cfg.target.args) {
-        dprintf(STDERR_FILENO, "  - %s\n", arg.c_str());
+    // Log the execution plan (binary, args, env) - parent-side, before fork(),
+    // so it is safe to use spdlog here (unlike the child side of fork_target()).
+    // Index-based loops: with -Dstrip_low_logs=true the PROXY_LOG_DEBUG bodies
+    // compile out and a loop-variable binding would be flagged as unused.
+    PROXY_LOG_DEBUG("execve binary={}", cfg.target.binary.c_str());
+    PROXY_LOG_DEBUG("args:");
+    for (size_t i = 0; i < cfg.target.args.size(); ++i) {
+        PROXY_LOG_DEBUG("  - {}", cfg.target.args[i]);
     }
-    dprintf(STDERR_FILENO, "env:\n");
-    for (const auto& env : c_env_strings) {
-        const size_t separator = env.find('=');
+    PROXY_LOG_DEBUG("env:");
+    for (size_t i = 0; i < c_env_strings.size(); ++i) {
+        const size_t separator = c_env_strings[i].find('=');
         if (separator == std::string::npos) {
-            dprintf(STDERR_FILENO, "  %s\n", env.c_str());
+            PROXY_LOG_DEBUG("  {}", c_env_strings[i]);
         } else {
-            dprintf(STDERR_FILENO, "  %.*s:%s\n",
-                static_cast<int>(separator), env.c_str(), env.c_str() + separator + 1);
+            PROXY_LOG_DEBUG("  {}:{}",
+                c_env_strings[i].substr(0, separator), c_env_strings[i].substr(separator + 1));
         }
     }
 
@@ -239,7 +243,7 @@ std::optional<TargetPrepared> prepare_target(const Config& cfg, SpawnMode mode) 
     int pipefd[2] = {-1, -1};
     if (mode == SpawnMode::MapSizePass) {
         if (pipe(pipefd) < 0) {
-            std::cerr << "proxy: failed to create pipe for map size extraction\n";
+            PROXY_LOG_ERROR("failed to create pipe for map size extraction");
             return std::nullopt;
         }
     }
@@ -252,7 +256,7 @@ std::optional<TargetPrepared> prepare_target(const Config& cfg, SpawnMode mode) 
 }
 
 // Helper to redirect file descriptors in the child according to the mode
-static void redirect_child_fds(SpawnMode mode, const TargetLog& log, int pipe_write_fd) {
+static void redirect_child_fds(SpawnMode mode, bool forward_output, int pipe_write_fd) {
     if (mode == SpawnMode::MapSizePass) {
         // Map size pass: child stdout -> pipe, stderr and stdin -> /dev/null
         dup2(pipe_write_fd, STDOUT_FILENO);
@@ -264,39 +268,27 @@ static void redirect_child_fds(SpawnMode mode, const TargetLog& log, int pipe_wr
             dup2(devnull, STDIN_FILENO);
             close(devnull);
         }
-    } else if (mode == SpawnMode::ProxyMode) {
-        // Proxy mode: stdin -> /dev/null, stdout/stderr to log files
+    } else {
+        // ProxyMode and PlainTest: stdin -> /dev/null; stdout/stderr either
+        // forwarded to the proxy's descriptors (--child-output) or discarded.
         int devnull = open("/dev/null", O_RDONLY);
         if (devnull >= 0) {
             dup2(devnull, STDIN_FILENO);
             close(devnull);
         }
-        if (!log.stdout_path.empty()) {
-            int fd = open(log.stdout_path.c_str(), O_WRONLY | O_CREAT | O_TRUNC, 0644);
-            if (fd >= 0) {
-                dup2(fd, STDOUT_FILENO);
-                close(fd);
+        if (!forward_output) {
+            devnull = open("/dev/null", O_WRONLY);
+            if (devnull >= 0) {
+                dup2(devnull, STDOUT_FILENO);
+                dup2(devnull, STDERR_FILENO);
+                close(devnull);
             }
-        }
-        if (!log.stderr_path.empty()) {
-            int fd = open(log.stderr_path.c_str(), O_WRONLY | O_CREAT | O_TRUNC, 0644);
-            if (fd >= 0) {
-                dup2(fd, STDERR_FILENO);
-                close(fd);
-            }
-        }
-    } else { // PlainTest
-        // Test mode pass 2: stdin -> /dev/null, stdout/stderr inherit
-        int devnull = open("/dev/null", O_RDONLY);
-        if (devnull >= 0) {
-            dup2(devnull, STDIN_FILENO);
-            close(devnull);
         }
     }
 }
 
 SpawnedTarget fork_target(const Config& cfg, const TargetPrepared& prep, SpawnMode mode,
-                          volatile sig_atomic_t* publish_pid) {
+                          bool forward_output, volatile sig_atomic_t* publish_pid) {
     // Block SIGINT and SIGTERM in the parent to avoid the race where the handler
     // runs before g_child_pid is set. The child will unblock these signals as its
     // first action (after fork) so that the target receives them normally.
@@ -312,7 +304,7 @@ SpawnedTarget fork_target(const Config& cfg, const TargetPrepared& prep, SpawnMo
     int pipefd[2] = {-1, -1};
     if (mode == SpawnMode::MapSizePass) {
         if (pipe(pipefd) < 0) {
-            std::cerr << "proxy: failed to create pipe for map size extraction\n";
+            PROXY_LOG_ERROR("failed to create pipe for map size extraction");
             sigprocmask(SIG_SETMASK, &old_mask, nullptr);
             return SpawnedTarget{-1, -1};
         }
@@ -324,7 +316,7 @@ SpawnedTarget fork_target(const Config& cfg, const TargetPrepared& prep, SpawnMo
             close(pipefd[0]);
             close(pipefd[1]);
         }
-        std::cerr << "proxy: fork() failed\n";
+        PROXY_LOG_ERROR("fork() failed: {}", strerror(errno));
         sigprocmask(SIG_SETMASK, &old_mask, nullptr);
         return SpawnedTarget{-1, -1};
     }
@@ -343,9 +335,12 @@ SpawnedTarget fork_target(const Config& cfg, const TargetPrepared& prep, SpawnMo
         }
 
         // Keep the original stderr around: after the redirection below it may
-        // point at /dev/null or a log file, so execve() failures are reported
-        // through this saved descriptor. Nothing else is logged by the child
-        // between the redirection and execve().
+        // point at /dev/null or the proxy's terminal, so execve() failures are
+        // reported through this saved descriptor. Nothing else is logged by
+        // the child between the redirection and execve().
+        // WARNING: never use spdlog (or any malloc/stdio-based logging) here:
+        // this code runs between fork() and execve() and must remain
+        // async-signal-safe. Raw write()/dprintf() to a descriptor only.
         int original_stderr = dup(STDERR_FILENO);
         if (original_stderr == -1) {
             perror("child: dup stderr failed");
@@ -354,7 +349,7 @@ SpawnedTarget fork_target(const Config& cfg, const TargetPrepared& prep, SpawnMo
         fcntl(original_stderr, F_SETFD, FD_CLOEXEC);
 
         // Redirect file descriptors according to the mode
-        redirect_child_fds(mode, cfg.target.log, 
+        redirect_child_fds(mode, forward_output,
                            (mode == SpawnMode::MapSizePass) ? pipefd[1] : -1);
 
         // Put child in a new process group, making it the leader
@@ -435,7 +430,7 @@ void collect_map_size(int pipe_read_fd) {
     char buffer[1024] = {0};
     ssize_t bytes_read = read(pipe_read_fd, buffer, sizeof(buffer) - 1);
     close(pipe_read_fd);
-    std::cerr << "Bytes read: " << bytes_read << "\n";
+    PROXY_LOG_DEBUG("bytes read: {}", bytes_read);
 
     if (bytes_read > 0) {
         std::string output(buffer, bytes_read);
@@ -446,24 +441,24 @@ void collect_map_size(int pipe_read_fd) {
             size_t end = line.find_last_not_of(" \t\r\n");
             if (start != std::string::npos) {
                 std::string trimmed = line.substr(start, end - start + 1);
-                bool is_digit = !trimmed.empty() && std::all_of(trimmed.begin(), trimmed.end(), 
+                bool is_digit = !trimmed.empty() && std::all_of(trimmed.begin(), trimmed.end(),
                     [](unsigned char c){ return std::isdigit(c); });
-                
+
                 if (is_digit) {
-                    std::cout << "Map size: " << trimmed << std::endl;
+                    PROXY_LOG_INFO("map size: {}", trimmed);
                 } else {
                     // TODO(claude): spec 6.2 requires this to be a hard error ("assuming the target lacks
-                    //   proper AFL++ instrumentation" -> return an error). Here only a message is printed
+                    //   proper AFL++ instrumentation" -> return an error). Here only a message is logged
                     //   and spawn_target() still returns a pid, so main.cpp continues as if all was well.
                     //   Also the spec says the integer must be on the first line with no extra text; the
                     //   code silently takes the first line and ignores everything after it (e.g. a target
                     //   that prints "MAP_SIZE: 65536" fails, but one that prints "65536\ngarbage" passes).
-                    std::cerr << "proxy: failed to parse map size from target output. Output: '" << trimmed << "'\n";
+                    PROXY_LOG_ERROR("failed to parse map size from target output. Output: '{}'", trimmed);
                 }
             }
         }
     } else {
-        std::cerr << "proxy: target produced no output for map size.\n";
+        PROXY_LOG_ERROR("target produced no output for map size.");
     }
 }
 

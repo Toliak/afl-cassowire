@@ -1,10 +1,10 @@
 // src/network.cpp
 
 #include "network.hpp"
+#include "log.hpp"
 #include "utils.hpp"
 
 #include <chrono>
-#include <iostream>
 #include <fstream>
 #include <sstream>
 #include <string>
@@ -202,7 +202,7 @@ static DetectResult trace_port(pid_t pid, int target_port, uint64_t timeout_ms, 
                                 }
                                 
                                 if (port == 0) {
-                                    std::cerr << "proxy: target requested ephemeral port (0), skipping...\n";
+                                    PROXY_LOG_WARN("target requested ephemeral port (0), skipping...");
                                 } else if (port == target_port) {
                                     // TODO(claude): two problems. (1) We are at bind() ENTRY: the target is
                                     //   declared "ready" before bind() succeeded and before listen() ran, so
