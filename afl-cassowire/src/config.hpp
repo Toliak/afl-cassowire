@@ -18,15 +18,9 @@ struct ConfigError {
     std::string to_string() const;
 };
 
-struct TargetLog {
-    std::string stdout_path;
-    std::string stderr_path;
-};
-
 struct TargetConfig {
     std::string binary;
     std::vector<std::string> args;
-    TargetLog log;
     // Environment variable handling for the target process.
     enum class EnvPreserveLevel {
         nothing,   // Inherit no environment variables
@@ -73,6 +67,7 @@ struct PayloadConfig {
     std::vector<uint8_t> suffix;  // Appended to each payload (empty if unset)
 
     // Builds the final payload from the fuzz input buffer.
+    // TODO: move that function out of the `PayloadConfig` structure
     std::vector<uint8_t> wrap(const uint8_t* data, size_t len) const;
 };
 

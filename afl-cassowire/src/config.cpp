@@ -61,7 +61,7 @@ std::variant<Config, ConfigError> load_config(const std::string& path) {
 
         // --- Check for unknown keys at root ---
         {
-            static const std::unordered_set<std::string> root_allowed = {"target", "network", "afl", "port_detection", "cleanup"};
+            static const std::unordered_set<std::string> root_allowed = {"target", "network", "afl", "port_detection", "cleanup", "payload"};
             ConfigError err = check_unknown_keys(root, root_allowed, "");
             if (!err.message.empty()) {
                 return err;
@@ -76,7 +76,7 @@ std::variant<Config, ConfigError> load_config(const std::string& path) {
         YAML::Node target_node = root["target"];
         // --- Check for unknown keys in target ---
         {
-            static const std::unordered_set<std::string> target_allowed = {"binary", "args", "env", "env_preserve", "log"};
+            static const std::unordered_set<std::string> target_allowed = {"binary", "args", "env", "env_preserve"};
             ConfigError err = check_unknown_keys(target_node, target_allowed, "target");
             if (!err.message.empty()) {
                 return err;
@@ -134,30 +134,6 @@ std::variant<Config, ConfigError> load_config(const std::string& path) {
                 cfg.target.env_preserve = TargetConfig::EnvPreserveLevel::all;
             } else {
                 return ConfigError{"target.env_preserve", "Invalid enum value", "nothing, afl_only, or all", env_preserve};
-            }
-        }
-
-        if (target_node["log"]) {
-            if (!target_node["log"].IsMap()) {
-                return ConfigError{"target.log", "Invalid 'log' section", "map", "not a map"};
-            }
-            YAML::Node log_node = target_node["log"];
-        // --- Check for unknown keys in target.log ---
-        {
-            static const std::unordered_set<std::string> log_allowed = {"stdout", "stderr"};
-            ConfigError err = check_unknown_keys(log_node, log_allowed, "target.log");
-            if (!err.message.empty()) {
-                return err;
-            }
-        }
-
-            if (log_node["stdout"]) {
-                if (!log_node["stdout"].IsScalar()) return ConfigError{"target.log.stdout", "Invalid type", "string", "not a string"};
-                cfg.target.log.stdout_path = log_node["stdout"].as<std::string>();
-            }
-            if (log_node["stderr"]) {
-                if (!log_node["stderr"].IsScalar()) return ConfigError{"target.log.stderr", "Invalid type", "string", "not a string"};
-                cfg.target.log.stderr_path = log_node["stderr"].as<std::string>();
             }
         }
 
@@ -297,79 +273,126 @@ std::variant<Config, ConfigError> load_config(const std::string& path) {
                     if (cfg.cleanup.force_kill_ms <= 0) {
                         return ConfigError{"cleanup.force_kill_ms", "Must be > 0", "integer > 0", std::to_string(cfg.cleanup.force_kill_ms)};
                     }
-                } catch (const YAML::BadConversion&) {
-                    return ConfigError{"cleanup.force_kill_ms", "Invalid type", "integer > 0", clean_node["force_kill_ms"].Scalar()};
-                }
-            }
+         } catch (const YAML::BadConversion&) {
+             return ConfigError{"cleanup.force_kill_ms", "Invalid type", "integer > 0", clean_node["force_kill_ms"].Scalar()};
+         }
+     }
 
-            if (clean_node["kill_pattern"]) {
-                YAML::Node kp_node = clean_node["kill_pattern"];
-                KillPattern kp;
-                if (kp_node.IsScalar()) {
-                    kp.type = "comm";
-                    // WARN: /proc/<pid>/comm is truncated by the kernel to 15 chars (TASK_COMM_LEN-1). A comm
-                    //   value longer than 15 chars can never match; this is intentional when the user selects "comm"
-                    kp.value = kp_node.as<std::string>();
-                    kp.target = "comm";
-                } else if (kp_node.IsMap()) {
+     if (clean_node["kill_pattern"]) {
+         YAML::Node kp_node = clean_node["kill_pattern"];
+         KillPattern kp;
+         if (kp_node.IsScalar()) {
+             kp.type = "comm";
+             // WARN: /proc/<pid>/comm is truncated by the kernel to 15 chars (TASK_COMM_LEN-1). A comm
+             //   value longer than 15 chars can never match; this is intentional when the user selects "comm"
+             kp.value = kp_node.as<std::string>();
+             kp.target = "comm";
+         } else if (kp_node.IsMap()) {
 
+              // --- Check for unknown keys in cleanup.kill_pattern (if it's a map) ---
+              {
+                  std::unordered_set<std::string> kp_allowed = {"type", "value"};
+                  if (kp.type == "regexp") {
+                      kp_allowed.insert("target");
+                  }
+                  ConfigError err = check_unknown_keys(kp_node, kp_allowed, "cleanup.kill_pattern");
+                  if (!err.message.empty()) {
+                      return err;
+                  }
+              }
 
-                     // --- Check for unknown keys in cleanup.kill_pattern (if it's a map) ---
-                     {
-                         std::unordered_set<std::string> kp_allowed = {"type", "value"};
-                         if (kp.type == "regexp") {
-                             kp_allowed.insert("target");
-                         }
-                         ConfigError err = check_unknown_keys(kp_node, kp_allowed, "cleanup.kill_pattern");
-                         if (!err.message.empty()) {
-                             return err;
-                         }
+             if (!kp_node["type"] || !kp_node["value"]) {
+                 return ConfigError{"cleanup.kill_pattern", "Missing 'type' or 'value'", "object with type and value", "missing fields"};
+             }
+             if (!kp_node["type"].IsScalar() || !kp_node["value"].IsScalar()) {
+                  return ConfigError{"cleanup.kill_pattern", "Invalid type for 'type' or 'value'", "strings", "not strings"};
+             }
+             kp.type = kp_node["type"].as<std::string>();
+             kp.value = kp_node["value"].as<std::string>();
+             
+             if (kp.type == "comm") {
+                 kp.target = "comm";
+             } else if (kp.type == "regexp") {
+                 if (!kp_node["target"]) {
+                     return ConfigError{"cleanup.kill_pattern.target", "Missing 'target' for regexp", "comm, argv0, or argv", "missing"};
+                 }
+                 if (!kp_node["target"].IsScalar()) {
+                     return ConfigError{"cleanup.kill_pattern.target", "Invalid type for 'target'", "string", "not a string"};
+                 }
+                 kp.target = kp_node["target"].as<std::string>();
+                 if (kp.target != "comm" && kp.target != "argv0" && kp.target != "argv") {
+                     return ConfigError{"cleanup.kill_pattern.target", "Invalid target for regexp", "comm, argv0, or argv", kp.target};
+                 }
+                 // Validate regex syntax
+                 try {
+                     // WARN: `type: comm` objects silently ignore an extra `target` key, and the regex is
+                     //   compiled with the default ECMAScript flavour (spec only says "standard C++ regex").
+                     //   Note: we do not validate against empty or over-broad patterns (e.g. `.*` with target argv)
+                     //   as that is the user's responsibility; see the self/parent-protection TODO in process.cpp.
+                     if (kp.value.empty()) {
+                         return ConfigError{"cleanup.kill_pattern.value", "Pattern must not be empty", "non-empty string", ""};
                      }
+                     std::regex r(kp.value);
+                 } catch (const std::regex_error&) {
+                     return ConfigError{"cleanup.kill_pattern.value", "Invalid regular expression", "valid regex", kp.value};
+                 }
+             } else {
+                 return ConfigError{"cleanup.kill_pattern.type", "Invalid type", "comm or regexp", kp.type};
+             }
+         } else {
+             return ConfigError{"cleanup.kill_pattern", "Invalid type", "string or object", "other"};
+         }
+         cfg.cleanup.kill_pattern = kp;
+      }
+ 
+          }
+          // --- Parse payload ---
+           if (root["payload"]) {
+               if (root["payload"].IsNull()) {
+                   // null payload section is treated as empty (same as omitting the section)
+               } else if (!root["payload"].IsMap()) {
+                   return ConfigError{"payload", "Invalid 'payload' section", "map", "not a map"};
+               } else {
+                   YAML::Node payload_node = root["payload"];
+                   // --- Check for unknown keys in payload ---
+                   {
+                       static const std::unordered_set<std::string> payload_allowed = {"prefix", "suffix"};
+                       ConfigError err = check_unknown_keys(payload_node, payload_allowed, "payload");
+                       if (!err.message.empty()) {
+                           return err;
+                       }
+                   }
 
-                    if (!kp_node["type"] || !kp_node["value"]) {
-                        return ConfigError{"cleanup.kill_pattern", "Missing 'type' or 'value'", "object with type and value", "missing fields"};
-                    }
-                    if (!kp_node["type"].IsScalar() || !kp_node["value"].IsScalar()) {
-                         return ConfigError{"cleanup.kill_pattern", "Invalid type for 'type' or 'value'", "strings", "not strings"};
-                    }
-                    kp.type = kp_node["type"].as<std::string>();
-                    kp.value = kp_node["value"].as<std::string>();
-                    
-                    if (kp.type == "comm") {
-                        kp.target = "comm";
-                    } else if (kp.type == "regexp") {
-                        if (!kp_node["target"]) {
-                            return ConfigError{"cleanup.kill_pattern.target", "Missing 'target' for regexp", "comm, argv0, or argv", "missing"};
-                        }
-                        if (!kp_node["target"].IsScalar()) {
-                            return ConfigError{"cleanup.kill_pattern.target", "Invalid type for 'target'", "string", "not a string"};
-                        }
-                        kp.target = kp_node["target"].as<std::string>();
-                        if (kp.target != "comm" && kp.target != "argv0" && kp.target != "argv") {
-                            return ConfigError{"cleanup.kill_pattern.target", "Invalid target for regexp", "comm, argv0, or argv", kp.target};
-                        }
-                        // Validate regex syntax
-                        try {
-                            // WARN: `type: comm` objects silently ignore an extra `target` key, and the regex is
-                            //   compiled with the default ECMAScript flavour (spec only says "standard C++ regex").
-                            //   Note: we do not validate against empty or over-broad patterns (e.g. `.*` with target argv)
-                            //   as that is the user's responsibility; see the self/parent-protection TODO in process.cpp.
-                            if (kp.value.empty()) {
-                                return ConfigError{"cleanup.kill_pattern.value", "Pattern must not be empty", "non-empty string", ""};
-                            }
-                            std::regex r(kp.value);
-                        } catch (const std::regex_error&) {
-                            return ConfigError{"cleanup.kill_pattern.value", "Invalid regular expression", "valid regex", kp.value};
-                        }
-                    } else {
-                        return ConfigError{"cleanup.kill_pattern.type", "Invalid type", "comm or regexp", kp.type};
-                    }
-                } else {
-                    return ConfigError{"cleanup.kill_pattern", "Invalid type", "string or object", "other"};
-                }
-                cfg.cleanup.kill_pattern = kp;
-            }
-        }
+                   if (payload_node["prefix"]) {
+                       if (!payload_node["prefix"].IsScalar() && !payload_node["prefix"].IsNull()) {
+                           return ConfigError{"payload.prefix", "Invalid type", "string or binary", "not a string or binary"};
+                       }
+                       // Handle both string and binary YAML types
+                       if (payload_node["prefix"].IsScalar()) {
+                           std::string prefix_str = payload_node["prefix"].as<std::string>();
+                           cfg.payload.prefix = std::vector<uint8_t>(prefix_str.begin(), prefix_str.end());
+                       } else {
+                           // This handles !!binary and other binary formats
+                           cfg.payload.prefix = payload_node["prefix"].as<std::vector<uint8_t>>();
+                       }
+                   }
+
+                   if (payload_node["suffix"]) {
+                       if (!payload_node["suffix"].IsScalar() && !payload_node["suffix"].IsNull()) {
+                           return ConfigError{"payload.suffix", "Invalid type", "string or binary", "not a string or binary"};
+                       }
+                       // Handle both string and binary YAML types
+                       if (payload_node["suffix"].IsScalar()) {
+                           std::string suffix_str = payload_node["suffix"].as<std::string>();
+                           cfg.payload.suffix = std::vector<uint8_t>(suffix_str.begin(), suffix_str.end());
+                       } else {
+                           // This handles !!binary and other binary formats
+                           cfg.payload.suffix = payload_node["suffix"].as<std::vector<uint8_t>>();
+                       }
+                   }
+               }
+           }
+ 
 
     } catch (const YAML::BadFile& e) {
         return ConfigError{"", "Failed to load YAML file: " + std::string(e.what()), "valid file", path};
