@@ -18,7 +18,7 @@ network:
   initial_ms: 200              # Port detection timeout in milliseconds
 
 afl:
-  loop_count: 10            # Number of __AFL_LOOP iterations
+  loop_count: 100000            # Number of __AFL_LOOP iterations
   enable_cmplog: false         # Enable AFL compare log (requires __AFL_CMPLOG_SHM_ID)
 
 port_detection:
@@ -34,3 +34,6 @@ cleanup:
     # type: comm                   # or "regexp"
     # value: "nginx"
     # target: "comm"              # or "argv0", "argv"
+
+payload:
+  suffix: "\r\n\r\n\r\n"

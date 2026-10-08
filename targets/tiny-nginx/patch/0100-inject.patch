@@ -15,7 +15,7 @@
      if (strncmp(method, "GET", 3) != 0)
          return set_http_error_headers(client, "501 Not Implemented");
  
-+    if (strncmp(version, "HEHE2", 10) == 0) {
++    if (strncmp(version, "HEHE2", 10) == 0) { // THIS IS the injection for fuzzing. DO NOT DO THAT ON PRODUCTION
 +        *ptr = 0x0uL;  // Point to nothing
 +        *ptr = 42;        // CRASH: Trying to write to address 0
 +    }

@@ -134,7 +134,8 @@ RUN --mount=type=cache,sharing=locked,target=/var/cache/apt \
         meson \
         llvm-dev \
         clang-tools \
-        clangd
+        clangd \
+        gdb
 
 # gcc-14-plugin-dev \
 

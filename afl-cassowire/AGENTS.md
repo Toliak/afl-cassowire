@@ -45,9 +45,12 @@ Config reference: `default.yaml` (copy to `config.yaml`).
 - `src/config.{hpp,cpp}` — structs + `load_config()` returning
   `std::variant<Config, ConfigError>`; **no exceptions**, strict type/range validation
   with a structured `ConfigError` (path/message/expected/actual).
+- `src/log.{hpp,cpp}` — namespace `log`: spdlog setup (single-threaded stdout logger,
+  flush on warn+), `PROXY_LOG_*` macros gated by `SPDLOG_ACTIVE_LEVEL`
+  (`-Dstrip_low_logs=true` compiles trace/debug out), `parse_level()`, `escape_bytes()`.
 - `src/process.{hpp,cpp}` — namespace `process`: stale-process cleanup, `prepare_target()` →
   `fork_target()` → `handshake_tracer()` split (prepare env/argv before `fork()`, no heap
-  allocs between `fork()` and `execve()`), ptrace/seccomp arming, log/pipe redirection.
+  allocs between `fork()` and `execve()`), ptrace/seccomp arming, stdio/pipe redirection.
 - `src/network.{hpp,cpp}` — namespace `network`: port detection (`procfs` | `ptrace` |
   `seccomp`, all in `wait_for_port()`) plus TCP client (`connect_target`, `send_all`,
   `wait_response`).
@@ -59,9 +62,14 @@ Config reference: `default.yaml` (copy to `config.yaml`).
 - Port detection must confirm the *configured* port, not just any `bind()`; a bound port
   of 0 (ephemeral) logs a warning and is skipped. `bind` is syscall 49 on x86_64; read the
   `sockaddr` via `PTRACE_GETREGS` + `process_vm_readv()` (not `PTRACE_PEEKDATA`).
-- Stdio redirection differs per mode (see spec §5.1): proxy redirects to
-  `target.log.*` (files created up front, failure is fatal); test pass 1 pipes stdout and
-  sends stderr to `/dev/null`; test pass 2 inherits the proxy's fds.
+- Stdio redirection differs per mode: stdin always → `/dev/null`; the target's
+  stdout/stderr go to `/dev/null` by default and are forwarded to the proxy's fds with
+  `--child-output` (both proxy and test pass 2). MapSizePass always pipes stdout (map
+  size protocol) and sends stderr to `/dev/null`; the flag does not affect it.
+- Logging is spdlog → stdout (logger `proxy`, `flush_on(warn)` so messages survive the
+  proxy's own `raise(SIGSEGV)`), runtime level via `--log-level`. Never log via spdlog
+  between `fork()` and `execve()` — the pre-exec child reports failures with raw
+  `dprintf()` to a saved, CLOEXEC stderr fd (async-signal-safety).
 - Target crash detection: `waitpid(WNOHANG)` + `WIFSIGNALED` → proxy raises `SIGSEGV` so
   AFL registers the finding. Target is cleaned up SIGTERM → wait `cleanup.force_kill_ms`
   → SIGKILL, on the whole process group.
@@ -74,6 +82,13 @@ Config reference: `default.yaml` (copy to `config.yaml`).
   probe. Don't add an `#error` guard to the header.
 - Extra config keys not in the spec: `target.env`, `target.env_preserve`, `payload.*`,
   and the required `PROXY_AFL_FORCE_FINAL_LOC` env var.
+- Logging/target-stdio behavior intentionally diverges from the spec (spec is deprecated
+  on these points): proxy logs go through spdlog to stdout with `--log-level` (not
+  `std::cout`/`std::cerr`); the spec's `target.log.*` config keys were removed — target
+  output defaults to `/dev/null` and is only forwarded with `--child-output` (spec said
+  test pass 2 always inherits); the test-mode response is logged as escaped text at info
+  level (spec said raw bytes on stdout). DEV_SPECIFICATION.md is NOT updated — trust
+  this file for logging/stdio behavior.
 
 ## Review markers
 Existing review notes are tagged `TODO(claude): ...` (≈40 across `src/`). Preserve the
