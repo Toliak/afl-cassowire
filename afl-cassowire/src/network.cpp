@@ -3,12 +3,14 @@
 #include "network.hpp"
 #include "log.hpp"
 #include "utils.hpp"
+#include "process.hpp"
 
 #include <chrono>
 #include <fstream>
 #include <sstream>
 #include <string>
 #include <vector>
+#include <unordered_map>
 #include <cstring>
 #include <cstdint>
 #include <cerrno>
@@ -31,7 +33,7 @@ std::string DetectError::to_string() const {
     std::ostringstream ss;
     switch (kind) {
         case Kind::TimedOut:
-            ss << "timed out waiting for the target to bind the port";
+            ss << "timed out waiting for the target to bind and listen on the port";
             break;
         case Kind::TargetDied:
             if (WIFEXITED(wait_status)) {
@@ -127,10 +129,23 @@ static DetectResult check_procfs(int target_port, uint64_t timeout_ms) {
     return DetectError{DetectError::Kind::TimedOut, 0, 0};
 }
 
-static DetectResult trace_port(pid_t pid, int target_port, uint64_t timeout_ms, bool use_seccomp) {
+static DetectResult trace_port(pid_t pid, int target_port, uint64_t timeout_ms, bool use_seccomp,
+                               bool* tracer_attached) {
+    // fd -> port, committed only when a bind() syscall EXITS successfully (listen() carries no
+    // address argument, so readiness can only be tied to the fd bound to the configured port).
+    std::unordered_map<int, int> bound_ports;
+
+    // bind()/listen() whose exit stop is still pending. In seccomp mode the exit is fetched by
+    // resuming the trapped entry stop with PTRACE_SYSCALL exactly once.
+    struct Pending {
+        bool active = false;
+        unsigned long long nr = 0;
+        int fd = -1;
+        int port = -1; // bind only: port read from the sockaddr at entry
+    } pending;
+
     uint64_t start = utils::get_time_ms();
     int status;
-    bool in_syscall = false;
     
     while (utils::get_time_ms() - start < timeout_ms) {
         // TODO(claude): BUG: blocking waitpid (no WNOHANG). The timeout is only evaluated between events, so
@@ -141,39 +156,38 @@ static DetectResult trace_port(pid_t pid, int target_port, uint64_t timeout_ms, 
             if (errno == EINTR) continue;
             return DetectError{DetectError::Kind::WaitpidFailed, errno, 0};
         }
-        
+
         if (WIFEXITED(status) || WIFSIGNALED(status)) {
             // TODO(claude): silent failure - the target died during startup but nothing says so (exit code /
             //   signal is lost, and it is already reaped here so main.cpp's later waitpid will not see it).
             //   The status is now captured in the returned DetectError before the reap below.
             return DetectError{DetectError::Kind::TargetDied, 0, status};
         }
-        
-        // TODO(claude): confusing condition `WIFSTOPPED(res == pid ? status : 0)`; res is always pid here
-        //   (waitpid(pid, ...)). Just use WIFSTOPPED(status).
-        if (WIFSTOPPED(res == pid ? status : 0)) { // waitpid returns pid on success
+
+        // TODO(claude): RESOLVED (was: confusing condition `WIFSTOPPED(res == pid ? status : 0)`) - the
+        //   stop check now uses WIFSTOPPED(status) directly; res is always pid here (waitpid(pid, ...)).
+        if (WIFSTOPPED(status)) { // waitpid returns pid on success
             int sig = WSTOPSIG(status);
             int event = (status >> 16);
-            
-            bool check_bind = false;
-            
-            if (use_seccomp) {
-                if (event == PTRACE_EVENT_SECCOMP) {
-                    check_bind = true;
-                }
-            } else {
-                if (sig == (SIGTRAP | 0x80)) {
-                    if (!in_syscall) {
-                        check_bind = true;
-                    }
-                    in_syscall = !in_syscall;
-                }
-            }
-            
-            if (check_bind) {
+
+            // Syscall stops only: with TRACESYSGOOD they report SIGTRAP|0x80; a seccomp stop
+            // reports SIGTRAP with PTRACE_EVENT_SECCOMP in the event field.
+            const bool syscall_stop = sig == (SIGTRAP | 0x80) || event == PTRACE_EVENT_SECCOMP;
+
+            if (syscall_stop) {
                 struct user_regs_struct regs;
+                // TODO(claude): x86_64-only, like the rest of this function: a syscall-entry
+                //   stop always reports rax == -ENOSYS (an exit stop carries the return value
+                //   in rax instead). The old `in_syscall` toggle misclassified stops here: once
+                //   the exec stop is resumed with PTRACE_SYSCALL, the next stop is execve's
+                //   *exit*, which flips the parity, so bind() was only ever evaluated at exit
+                //   stops where rsi/rdx no longer hold the sockaddr/length arguments.
                 if (ptrace(PTRACE_GETREGS, pid, 0, &regs) == 0) {
-                    if (regs.orig_rax == __NR_bind) {
+                    const bool entry = use_seccomp
+                        ? (event == PTRACE_EVENT_SECCOMP)
+                        : ((long)regs.rax == -ENOSYS);
+            
+                    if (entry && regs.orig_rax == __NR_bind) {
                         uintptr_t addr_ptr = regs.rsi;
                         socklen_t addrlen = regs.rdx;
                         
@@ -200,41 +214,74 @@ static DetectResult trace_port(pid_t pid, int target_port, uint64_t timeout_ms, 
                                     struct sockaddr_in6* in6 = (struct sockaddr_in6*)&addr;
                                     port = ntohs(in6->sin6_port);
                                 }
-                                
+
+                                PROXY_LOG_INFO("Detected bind on port {}", port);
                                 if (port == 0) {
                                     PROXY_LOG_WARN("target requested ephemeral port (0), skipping...");
-                                } else if (port == target_port) {
-                                    // TODO(claude): two problems. (1) We are at bind() ENTRY: the target is
-                                    //   declared "ready" before bind() succeeded and before listen() ran, so
-                                    //   the first connect_target() can get ECONNREFUSED (race). Bind may
-                                    //   even fail (EADDRINUSE). Consider also confirming via procfs/retrying
-                                    //   connect within initial_ms.
-                                    //   (2) In seccomp mode the BPF filter stays installed after DETACH (it
-                                    //   cannot be removed) and is inherited by forked workers. With
-                                    //   SECCOMP_RET_TRACE and NO tracer the kernel fails the syscall with
-                                    //   ENOSYS, so any later bind() in the target (or its children, e.g.
-                                    //   nginx workers/reload) will break. Also ptrace() return value is
-                                    //   unchecked.
-                                    ptrace(PTRACE_DETACH, pid, 0, 0);
-                                    return std::monostate{};
                                 }
+                                pending = {true, __NR_bind, static_cast<int>(regs.rdi), port};
+                            }
+                        }
+                    } else if (entry && regs.orig_rax == __NR_listen) {
+                        pending = {true, __NR_listen, static_cast<int>(regs.rdi), -1};
+                    } else if (!entry && pending.active && regs.orig_rax == pending.nr) {
+                        // Exit stop of a pending bind()/listen(): the return value decides.
+                        pending.active = false;
+                        const long retval = static_cast<long>(regs.rax);
+
+                        if (pending.nr == __NR_bind) {
+                            if (retval == 0) {
+                                bound_ports[pending.fd] = pending.port;
+                            } else if (pending.port == target_port) {
+                                PROXY_LOG_WARN("bind on port {} failed ({}), continuing to wait",
+                                               pending.port, strerror(static_cast<int>(-retval)));
+                            }
+                        } else if (pending.nr == __NR_listen && retval == 0) {
+                            auto it = bound_ports.find(pending.fd);
+                            if (it != bound_ports.end() && it->second == target_port) {
+                                PROXY_LOG_INFO("target is listening on port {}", target_port);
+                                // TODO(claude): (1) RESOLVED (was: readiness was declared at bind() ENTRY,
+                                //   before bind() succeeded and before listen() ran, so the first
+                                //   connect_target() could hit ECONNREFUSED, and a failed (EADDRINUSE)
+                                //   bind still counted as ready): readiness is now the successful
+                                //   listen() EXIT on the fd bound to the configured port.
+                                //   (2) In seccomp mode the BPF filter (trapping bind+listen) stays
+                                //   installed (it cannot be removed), so the tracer STAYS ATTACHED and
+                                //   resumes every seccomp stop with PTRACE_CONT ("transparent tracer",
+                                //   see process::set_transparent_tracer / pump_transparent_tracer) -
+                                //   otherwise SECCOMP_RET_TRACE with no tracer fails the syscall with
+                                //   ENOSYS. Children of the target inherit the filter UNTRACED, so
+                                //   their bind()/listen() still fail with ENOSYS (documented
+                                //   limitation). Also ptrace() return value is unchecked.
+                                if (use_seccomp) {
+                                    // The tracee is in a ptrace-stop right now; PTRACE_CONT (not
+                                    // DETACH) is the resume, and it lets listen() complete normally.
+                                    ptrace(PTRACE_CONT, pid, 0, 0);
+                                    if (tracer_attached) *tracer_attached = true;
+                                    PROXY_LOG_INFO("tracer stays attached (transparent mode)");
+                                } else {
+                                    ptrace(PTRACE_DETACH, pid, 0, 0);
+                                }
+                                return std::monostate{};
                             }
                         }
                     }
                 }
             }
             
-            // TODO(claude): CRITICAL BUG for `primary: ptrace`: syscall-stops are only produced if the
-            //   tracee is resumed with PTRACE_SYSCALL (spec 5.2 says so). Here (and in process.cpp after
-            //   PTRACE_SETOPTIONS) PTRACE_CONT is always used, so in ptrace mode no bind() is ever seen and
-            //   the loop just hangs in waitpid. Use PTRACE_SYSCALL when !use_seccomp.
-            //   Also: group-stop / SIGSTOP signal-delivery-stops are re-injected with `sig` which can leave
+            // TODO(claude): RESOLVED (was CRITICAL BUG for `primary: ptrace`): syscall-stops are only
+            //   produced if the tracee is resumed with PTRACE_SYSCALL (spec 5.2 says so); the old
+            //   unconditional PTRACE_CONT meant no bind() was ever seen and the loop hung in waitpid.
+            //   Seccomp mode keeps PTRACE_CONT, except after a trapped bind()/listen() entry whose
+            //   exit stop is fetched with a one-shot PTRACE_SYSCALL resume (pending.active).
+            //   Still open: group-stop / SIGSTOP signal-delivery-stops are re-injected with `sig` which can leave
             //   the tracee stopped; and the tracer sees only `pid` (no PTRACE_O_TRACEFORK), so forked
             //   children are not traced (fine for the master, but should be documented).
+            const auto resume = (!use_seccomp || pending.active) ? PTRACE_SYSCALL : PTRACE_CONT;
             if (sig != SIGTRAP && sig != (SIGTRAP | 0x80) && event == 0) {
-                ptrace(PTRACE_CONT, pid, 0, sig);
+                ptrace(resume, pid, 0, sig);
             } else {
-                ptrace(PTRACE_CONT, pid, 0, 0);
+                ptrace(resume, pid, 0, 0);
             }
         }
     }
@@ -247,13 +294,14 @@ static DetectResult trace_port(pid_t pid, int target_port, uint64_t timeout_ms, 
     return DetectError{DetectError::Kind::TimedOut, 0, 0};
 }
 
-DetectResult wait_for_port(pid_t target_pid, const Config& cfg) {
+DetectResult wait_for_port(pid_t target_pid, const Config& cfg, bool* tracer_attached) {
+    if (tracer_attached) *tracer_attached = false;
     if (cfg.port_detection.primary == "procfs") {
         return check_procfs(cfg.network.port, cfg.network.initial_ms);
     } else if (cfg.port_detection.primary == "ptrace") {
-        return trace_port(target_pid, cfg.network.port, cfg.network.initial_ms, false);
+        return trace_port(target_pid, cfg.network.port, cfg.network.initial_ms, false, tracer_attached);
     } else if (cfg.port_detection.primary == "seccomp") {
-        return trace_port(target_pid, cfg.network.port, cfg.network.initial_ms, true);
+        return trace_port(target_pid, cfg.network.port, cfg.network.initial_ms, true, tracer_attached);
     }
     return DetectError{DetectError::Kind::UnknownMethod, 0, 0};
 }
@@ -277,7 +325,7 @@ ConnectResult connect_target(const NetworkConfig& net_cfg) {
     if (flags < 0) return ConnectError{ConnectError::Kind::FcntlSetup, errno};
     fcntl(guard.get(), F_SETFL, flags | O_NONBLOCK);
 
-    struct sockaddr_in addr;  // TODO(claude): not zero-initialised (sin_zero garbage); use `= {}`.
+    struct sockaddr_in addr = {};
     addr.sin_family = AF_INET;
     addr.sin_port = htons(net_cfg.port);
     if (inet_pton(AF_INET, net_cfg.host.c_str(), &addr.sin_addr) <= 0) {
@@ -343,7 +391,10 @@ SendResult send_all(int sock, const uint8_t* buf, size_t len, int timeout_ms) {
                     if (errno == EINTR) continue;
                     return SendError{SendError::Kind::PollFailed, errno};
                 }
-                if (poll_res == 0) return SendError{SendError::Kind::TimedOut, 0};
+                if (poll_res == 0) {
+                    process::pump_transparent_tracer();
+                    return SendError{SendError::Kind::TimedOut, 0};
+                }
                 continue;
             }
             return SendError{SendError::Kind::SendFailed, errno};
@@ -382,7 +433,12 @@ WaitResult wait_response(int sock, int timeout_ms) {
             if (errno == EINTR) continue;
             return WaitError{WaitError::Kind::PollFailed, errno};
         }
-        if (poll_res == 0) continue; // poll timeout; the loop top re-checks the overall deadline
+        if (poll_res == 0) {
+            // Release a pending ptrace stop (transparent tracer): a stopped target
+            // cannot service the connection, so poll would just time out.
+            process::pump_transparent_tracer();
+            continue; // poll timeout; the loop top re-checks the overall deadline
+        }
 
         ssize_t n = recv(sock, buf, sizeof(buf), 0);
         if (n > 0) {
@@ -456,7 +512,12 @@ ProbeOutcome probe_target(const NetworkConfig& net_cfg) {
             if (errno == EINTR) continue;
             return ProbeOutcome::Failed;
         }
-        if (poll_res == 0) continue; // poll timeout; the loop top re-checks the overall deadline
+        if (poll_res == 0) {
+            // Release a pending ptrace stop (transparent tracer): a stopped target
+            // cannot service the connection, so poll would just time out.
+            process::pump_transparent_tracer();
+            continue; // poll timeout; the loop top re-checks the overall deadline
+        }
         return ProbeOutcome::Serviced;
     }
 }

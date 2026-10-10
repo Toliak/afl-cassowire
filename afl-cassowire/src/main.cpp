@@ -17,6 +17,7 @@
 #include <unistd.h>
 #include <fcntl.h>
 #include <sys/wait.h>
+#include <sys/ptrace.h>
 #include <sys/types.h>
 #include <sys/stat.h>
 #include <time.h>
@@ -55,6 +56,20 @@ void timed_kill_pgid(pid_t pgid, int ms) {
         // Check if the process group leader has exited
         pid_t res = waitpid(pgid, &status, WNOHANG);
         if (res == pgid) {
+            if (WIFSTOPPED(status)) {
+                // A traced target (transparent tracer, seccomp mode) takes the
+                // SIGTERM in a signal-delivery stop; resume it (SIGTRAP-family /
+                // SIGSTOP dropped, real signals re-injected) so a graceful
+                // shutdown remains possible before the SIGKILL fallback below.
+                // Only AS-safe syscalls here (this runs in signal handlers too).
+                int inject = 0;
+                int sig = WSTOPSIG(status);
+                if (sig != SIGTRAP && sig != (SIGTRAP | 0x80) && sig != SIGSTOP) {
+                    inject = sig;
+                }
+                ptrace(PTRACE_CONT, pgid, 0, inject);
+                continue;
+            }
             break; // Process exited
         } else if (res == -1) {
             if (errno == ECHILD) {
@@ -124,6 +139,7 @@ struct ExchangeOutcome {
 ExchangeOutcome exchange_once(const Config& cfg, const uint8_t* input, size_t input_len,
                               std::vector<uint8_t>& payload_buf) {
     ExchangeOutcome out;
+    process::pump_transparent_tracer();
 
     auto conn = network::connect_target(cfg.network);
     if (std::holds_alternative<network::ConnectError>(conn)) {
@@ -132,6 +148,7 @@ ExchangeOutcome exchange_once(const Config& cfg, const uint8_t* input, size_t in
     }
     utils::FdGuard sock = std::get<utils::FdGuard>(std::move(conn));
     // The socket is closed when `sock` goes out of scope at the end.
+    process::pump_transparent_tracer();
 
     // Final payload = configured prefix + input data + configured suffix
     payload_buf.clear();
@@ -153,6 +170,7 @@ ExchangeOutcome exchange_once(const Config& cfg, const uint8_t* input, size_t in
     } else {
         out.response = std::get<std::vector<uint8_t>>(std::move(wait_res));
     }
+    process::pump_transparent_tracer();
     return out;
 }
 
@@ -235,11 +253,19 @@ void run_fuzz_iteration(const Config& cfg, pid_t child_pid, int target_pidfd,
     // done by check_target_state() below.
     if (cfg.network.probe) {
         auto pr = network::probe_target(cfg.network);
-        if (pr == network::ProbeOutcome::Refused) {
-            PROXY_LOG_WARN("probe connection refused - target listener is gone (crashed or rate-limited?)");
-        } else {
-            PROXY_LOG_TRACE("probe: {}", network::probe_outcome_to_string(pr));
+        switch (pr) {
+            case network::ProbeOutcome::Refused:
+            case network::ProbeOutcome::Timeout:
+            case network::ProbeOutcome::Failed:
+                PROXY_LOG_WARN("probe connection {} - target listener is gone", network::probe_outcome_to_string(pr));
+                utils::abort_proxy();
+                break;
+            case network::ProbeOutcome::Serviced:
+                // ok just continue
+                break;
         }
+
+        PROXY_LOG_TRACE("probe: {}", network::probe_outcome_to_string(pr));
     }
 
     // Health check (race-free). Replaces the old sleep_ms()+waitpid(WNOHANG)
@@ -276,7 +302,7 @@ void run_fuzz_iteration(const Config& cfg, pid_t child_pid, int target_pidfd,
     //   spec only says to crash.
 }
 
-int run_proxy_mode(const Config& cfg, bool forward_output) {
+int run_proxy_mode(Config cfg, bool forward_output) {
     if (prctl(PR_SET_DUMPABLE, 0) != 0) {
         PROXY_LOG_WARN("prctl(PR_SET_DUMPABLE, 0) failed: {} (continuing)", std::strerror(errno));
     }
@@ -288,9 +314,17 @@ int run_proxy_mode(const Config& cfg, bool forward_output) {
         PROXY_LOG_ERROR("__AFL_SHM_ID not found in environment. Run with afl-fuzz.");
         return 1;
     }
-    if (cfg.afl.enable_cmplog && !getenv("__AFL_CMPLOG_SHM_ID")) {
-        PROXY_LOG_ERROR("enable_cmplog is true, but __AFL_CMPLOG_SHM_ID not found in environment.");
-        return 1;
+    // __AFL_CMPLOG_SHM_ID presence indicates AFL compare-log mode; its absence
+    // means normal mode. The config validation already ensures target_cmplog is
+    // set when enable_cmplog is true, so we don't need to check it here.
+    if (!getenv("__AFL_CMPLOG_SHM_ID")) {
+        // Normal mode: use `target`
+        // cfg is already configured correctly
+    } else {
+        // CMPLOG MODE: use `target_cmplog` instead of `target`
+        Config cfg_cmplog = cfg;
+        cfg_cmplog.target = cfg.target_cmplog;
+        cfg = cfg_cmplog;
     }
 
     // AFL_CASSOWIRE_FORCE_FINAL_LOC is consumed by the target's AFL++ runtime to
@@ -346,7 +380,9 @@ int run_proxy_mode(const Config& cfg, bool forward_output) {
     }
 
     // Wait for port readiness
-    auto port_res = network::wait_for_port(g_child_pid, cfg);
+    PROXY_LOG_DEBUG("Waiting for port");
+    bool tracer_attached = false;
+    auto port_res = network::wait_for_port(g_child_pid, cfg, &tracer_attached);
     if (std::holds_alternative<network::DetectError>(port_res)) {
         PROXY_LOG_ERROR("failed to detect port {}: {}",
                         cfg.network.port, std::get<network::DetectError>(port_res).to_string());
@@ -354,6 +390,12 @@ int run_proxy_mode(const Config& cfg, bool forward_output) {
         // TODO: make a health check here maybe?
         timed_kill_pgid(g_child_pid, cfg.cleanup.force_kill_ms);
         return 1;
+    }
+    if (tracer_attached) {
+        // Seccomp mode: the tracer stayed attached after detection. Register the
+        // target with the pump so later bind()/listen() (whose seccomp stops are
+        // resumed with PTRACE_CONT) do not stall it.
+        process::set_transparent_tracer(g_child_pid);
     }
 
     // Main AFL Loop
@@ -401,16 +443,32 @@ int run_test_mode(const Config& cfg, const std::string& input_path, bool forward
         return 1;
     }
     process::handshake_tracer(spawned1.pid, cfg);
+    g_child_pid = spawned1.pid;
 
-    int status;
-    // TODO(claude): BUG/spec: (1) blocking waitpid() with no timeout: a long-running target (nginx stays up
-    //   forever) never exits by itself - with AFL_DUMP_MAP_SIZE the AFL runtime exits right after printing,
-    //   but a target that is not instrumented will run (and hang the proxy) here. Spec says "Clean up the
-    //   Pass 1 target process": it must be killed (SIGTERM->SIGKILL via timed_kill_pgid), not waited for.
-    //   (2) g_child_pid is not set during Pass 1, so Ctrl+C during Pass 1 kills nothing. (3) The exit status
-    //   is ignored.
-    waitpid(spawned1.pid, &status, 0);
-    
+    // TODO(claude): the exit status is only logged, not acted on, and Pass 1 still proceeds to Pass 2
+    //   even when the map size was missing/invalid (see the TODO below; spec 6.2 wants a hard error).
+    //   RESOLVED (was): (1) bare blocking waitpid() with no timeout - a traced child reports an
+    //   unconditional SIGTRAP ptrace stop at execve, so the old waitpid() returned at that stop while
+    //   the child sat frozen before its first instruction, the AFL runtime never ran, and the
+    //   map-size pipe read below hung forever; wait_target_exit() now drains ptrace stops, bounds the
+    //   wait with network.initial_ms and kills the target (SIGTERM->SIGKILL via timed_kill_pgid) on
+    //   timeout, as the spec requires. (2) g_child_pid is set during Pass 1, so Ctrl+C kills the
+    //   target. (3) The exit status is logged.
+    PROXY_LOG_DEBUG("before waitpid");
+    auto pass1 = process::wait_target_exit(spawned1.pid, cfg.network.initial_ms);
+    PROXY_LOG_DEBUG("after waitpid");
+    if (!pass1.exited) {
+        PROXY_LOG_ERROR("Pass 1 target did not exit within {} ms; killing it.", cfg.network.initial_ms);
+        timed_kill_pgid(g_child_pid, cfg.cleanup.force_kill_ms);
+        if (spawned1.map_size_fd >= 0) {
+            close(spawned1.map_size_fd);
+        }
+        unsetenv("AFL_DUMP_MAP_SIZE");
+        return 1;
+    }
+    PROXY_LOG_DEBUG("Pass 1 target status {:x} (exited={}, signaled={})",
+                    pass1.status, WIFEXITED(pass1.status), WIFSIGNALED(pass1.status));
+
     // Collect map size from the pipe
     if (spawned1.map_size_fd >= 0) {
         process::collect_map_size(spawned1.map_size_fd);
@@ -457,24 +515,32 @@ int run_test_mode(const Config& cfg, const std::string& input_path, bool forward
         PROXY_LOG_ERROR("failed to prepare target for test iteration.");
         return 1;
     }
+    PROXY_LOG_DEBUG("fork_target 2");
     process::SpawnedTarget spawned2 = process::fork_target(cfg, *prep_opt2, process::SpawnMode::PlainTest,
                                                            forward_output, &g_child_pid);
     if (spawned2.pid <= 0) {
         PROXY_LOG_ERROR("failed to spawn target for test iteration.");
         return 1;
     }
+    PROXY_LOG_DEBUG("handshake_tracer 2");
     process::handshake_tracer(spawned2.pid, cfg);
     g_child_pid = spawned2.pid;
 
-    auto port_res2 = network::wait_for_port(g_child_pid, cfg);
+    PROXY_LOG_DEBUG("wait_for_port");
+    bool tracer_attached = false;
+    auto port_res2 = network::wait_for_port(g_child_pid, cfg, &tracer_attached);
     if (std::holds_alternative<network::DetectError>(port_res2)) {
         PROXY_LOG_ERROR("failed to detect port {}: {}",
                         cfg.network.port, std::get<network::DetectError>(port_res2).to_string());
         timed_kill_pgid(g_child_pid, cfg.cleanup.force_kill_ms);
         return 1;
     }
+    if (tracer_attached) {
+        process::set_transparent_tracer(g_child_pid);
+    }
 
     // One-shot of the same connect -> send -> wait cycle the AFL loop runs.
+    PROXY_LOG_DEBUG("exchange_once");
     ExchangeOutcome ex = exchange_once(cfg, input_data.data(), input_data.size(), payload_buf);
     if (ex.connect_error) {
         PROXY_LOG_ERROR("failed to connect to {}:{}: {}",
@@ -506,6 +572,7 @@ int run_test_mode(const Config& cfg, const std::string& input_path, bool forward
     // TODO: wip, maybe remove that later
     // utils::sleep_ms(500);
 
+    int status;
     pid_t res = waitpid(g_child_pid, &status, WNOHANG);
     PROXY_LOG_INFO("waitpid res {} status {:x}, signaled={}", res, status, WIFSIGNALED(status));
     
@@ -564,6 +631,6 @@ int main(int argc, char* argv[]) {
     if (parsed.is_test_mode) {
         return run_test_mode(cfg, parsed.input_path, parsed.forward_output);
     } else {
-        return run_proxy_mode(cfg, parsed.forward_output);
+        return run_proxy_mode(std::move(cfg), parsed.forward_output);
     }
 }

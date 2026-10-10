@@ -17,7 +17,7 @@ namespace network {
      */
     struct DetectError {
         enum class Kind {
-            TimedOut,      ///< initial_ms elapsed without seeing the configured port bound
+            TimedOut,      ///< initial_ms elapsed without seeing the configured port bound and listened
             TargetDied,    ///< target exited or was signalled during startup (wait_status holds the waitpid status)
             WaitpidFailed, ///< waitpid() failed (sys_errno holds errno)
             UnknownMethod, ///< port_detection.primary is not a known method
@@ -37,15 +37,25 @@ namespace network {
     using DetectResult = std::variant<std::monostate, DetectError>;
 
     /**
-     * @brief Waits for the target process to bind to the configured port.
+     * @brief Waits for the target process to bind and listen on the configured port.
      * Uses the method specified in port_detection.primary (procfs, ptrace, seccomp).
+     * The ptrace/seccomp methods declare readiness on a successful listen() exit on
+     * the fd bound to the configured port (fd tracked from bind stops). In seccomp
+     * mode the tracer does NOT detach on success (the seccomp filter is
+     * unremovable): it stays attached and resumes every seccomp stop with
+     * PTRACE_CONT so later bind()/listen() in the target execute normally
+     * ("transparent tracer"; enable the pump with process::set_transparent_tracer()).
      *
      * @param target_pid The PID of the target process.
      * @param cfg The global configuration.
+     * @param tracer_attached Optional out-param; set to true when the tracer was
+     *        left attached to the target after successful detection (seccomp mode
+     *        only). The caller should then enable process::set_transparent_tracer().
      * @return DetectResult Success if the port was successfully detected within
      *         initial_ms, otherwise a DetectError explaining what happened.
      */
-    [[nodiscard]] DetectResult wait_for_port(pid_t target_pid, const Config& cfg);
+    [[nodiscard]] DetectResult wait_for_port(pid_t target_pid, const Config& cfg,
+                                             bool* tracer_attached = nullptr);
 
     /**
      * @brief Reason why connect_target() could not establish a connection.

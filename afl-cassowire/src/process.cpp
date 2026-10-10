@@ -33,14 +33,16 @@ extern char** environ;
 
 namespace process {
 
-// Seccomp BPF filter that traces bind() (arch-agnostic, as in the original code)
+// Seccomp BPF filter that traces bind() and listen() (arch-agnostic, as in the original code)
 // Note: The spec requires arch-awareness, but we keep the original implementation
 // for now; a TODO is carried in the function that builds it.
-static struct sock_filter bind_filter[] = {
+static struct sock_filter bind_listen_filter[] = {
     // Load syscall number
     BPF_STMT(BPF_LD | BPF_W | BPF_ABS, offsetof(struct seccomp_data, nr)),
     // Jump if equal to __NR_bind (49 on x86_64)
-    BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, __NR_bind, 0, 1),
+    BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, __NR_bind, 1, 0),
+    // Jump if equal to __NR_listen (50 on x86_64)
+    BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, __NR_listen, 0, 1),
     // Return TRACE
     BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_TRACE),
     // Return ALLOW
@@ -48,8 +50,8 @@ static struct sock_filter bind_filter[] = {
 };
 
 static const struct sock_fprog seccomp_prog = {
-    .len = sizeof(bind_filter) / sizeof(bind_filter[0]),
-    .filter = bind_filter,
+    .len = sizeof(bind_listen_filter) / sizeof(bind_listen_filter[0]),
+    .filter = bind_listen_filter,
 };
 
 void cleanup_stale_processes(const CleanupConfig& cleanup_cfg) {
@@ -370,7 +372,9 @@ SpawnedTarget fork_target(const Config& cfg, const TargetPrepared& prep, SpawnMo
                 prctl(PR_SET_SECCOMP, SECCOMP_MODE_FILTER, &seccomp_prog);
             }
 
+            dprintf(original_stderr, "proxy: raise(SIGSTOP)\n");
             raise(SIGSTOP);
+            dprintf(original_stderr, "after SIGSTOP\n");
         }
 
         execve(cfg.target.binary.c_str(), prep.argv.data(), prep.envp.data());
@@ -408,10 +412,14 @@ void handshake_tracer(pid_t pid, const Config& cfg) {
 
     int status;
     // Wait for SIGSTOP from child
+    PROXY_LOG_DEBUG("Waiting handshake");
     if (waitpid(pid, &status, 0) == -1) {
+        PROXY_LOG_DEBUG("No handshake");
         // TODO(claude): handle error? In the original code, this was ignored.
         return;
     }
+    PROXY_LOG_DEBUG("Yes handshake");
+
     if (WIFSTOPPED(status) && WSTOPSIG(status) == SIGSTOP) {
         long opts = 0;
         if (use_ptrace) {
@@ -419,12 +427,94 @@ void handshake_tracer(pid_t pid, const Config& cfg) {
         } else if (use_seccomp) {
             opts = PTRACE_O_TRACESECCOMP | PTRACE_O_TRACESYSGOOD;
         }
+        // If the tracer (proxy) exits while the target is still traced - including
+        // SIGKILL, which bypasses every cleanup handler - the kernel kills the
+        // tracee. Otherwise a half-started target would survive holding the port,
+        // and in seccomp mode it would keep a SECCOMP_RET_TRACE filter with no
+        // tracer (later bind()/listen() fail with ENOSYS). After PTRACE_DETACH the
+        // option no longer applies (the tracee is not traced anymore).
+        opts |= PTRACE_O_EXITKILL;
         ptrace(PTRACE_SETOPTIONS, pid, 0, opts);
         ptrace(PTRACE_CONT, pid, 0, 0);
+        PROXY_LOG_DEBUG("Continued");
     }
     // If we didn't get a SIGSTOP, something went wrong; we just continue and let
     // the child run (or die) without tracing. This matches the original behavior
     // where the parent would proceed anyway.
+}
+
+TargetExit wait_target_exit(pid_t pid, uint64_t timeout_ms) {
+    const uint64_t start = utils::get_time_ms();
+    int status = 0;
+    while (true) {
+        pid_t res = waitpid(pid, &status, WNOHANG);
+        if (res == pid) {
+            if (WIFSTOPPED(status)) {
+                // A traced child stops on every ptrace event (exec SIGTRAP, syscall
+                // stops, delivered signals). Resume it; SIGTRAP-family stops and
+                // group-stops are consumed with signal 0, real signals are
+                // re-injected so fatal signals still kill the target.
+                int inject = 0;
+                int sig = WSTOPSIG(status);
+                if (sig != SIGTRAP && sig != (SIGTRAP | 0x80) && sig != SIGSTOP) {
+                    inject = sig;
+                }
+                ptrace(PTRACE_CONT, pid, 0, inject);  // ESRCH (child died racing us) is reaped below
+                continue;
+            }
+            return TargetExit{.exited = true, .status = status};
+        }
+        if (res == -1) {
+            if (errno == EINTR) continue;
+            return TargetExit{.exited = false, .status = 0};  // e.g. ECHILD
+        }
+        if (utils::get_time_ms() - start >= timeout_ms) {
+            // Detach so the caller's SIGTERM/SIGKILL cleanup is not swallowed by
+            // ptrace (the tracee may sit in a ptrace stop). Errors ignored, as in
+            // network.cpp's timeout path.
+            ptrace(PTRACE_DETACH, pid, 0, 0);
+            return TargetExit{.exited = false, .status = 0};
+        }
+        utils::sleep_ms(10);
+    }
+}
+
+// pid of the target that stays traced after startup ("transparent tracer", seccomp
+// port detection); 0 disables pump_transparent_tracer().
+static pid_t g_transparent_tracer_pid = 0;
+
+void set_transparent_tracer(pid_t pid) {
+    g_transparent_tracer_pid = pid;
+}
+
+void pump_transparent_tracer() {
+    const pid_t pid = g_transparent_tracer_pid;
+    if (pid <= 0) return;
+
+    int status;
+    while (true) {
+        pid_t res = waitpid(pid, &status, WNOHANG);
+        if (res != pid) return; // running (0), error or already reaped elsewhere (-1)
+
+        if (WIFEXITED(status) || WIFSIGNALED(status)) {
+            // Death consumed silently: the health check classifies via pidfd and
+            // /proc flags; cleanup paths tolerate ECHILD afterwards.
+            return;
+        }
+        if (WIFSTOPPED(status)) {
+            // Same resume policy as wait_target_exit(): seccomp stops (SIGTRAP +
+            // event), syscall stops (SIGTRAP|0x80) and group-stops/SIGSTOP are
+            // dropped with signal 0 (a seccomp stop resumed with PTRACE_CONT
+            // executes the syscall normally); real signals are re-injected so
+            // fatal signals still kill the target.
+            int inject = 0;
+            int sig = WSTOPSIG(status);
+            if (sig != SIGTRAP && sig != (SIGTRAP | 0x80) && sig != SIGSTOP) {
+                inject = sig;
+            }
+            ptrace(PTRACE_CONT, pid, 0, inject); // ESRCH (racing death) is handled by the next round
+        }
+    }
 }
 
 void collect_map_size(int pipe_read_fd) {

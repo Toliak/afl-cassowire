@@ -95,6 +95,70 @@ namespace process {
     void handshake_tracer(pid_t pid, const Config& cfg);
 
     /**
+     * @brief Remember the target that stays traced after startup ("transparent tracer").
+     *
+     * In seccomp port-detection mode the tracer does not detach once readiness is
+     * detected: the installed BPF filter is unremovable, and a SECCOMP_RET_TRACE
+     * notification with no attached tracer fails the syscall with ENOSYS. Keeping
+     * the tracer attached and resuming every seccomp stop with PTRACE_CONT lets any
+     * later bind()/listen() in the target execute normally.
+     *
+     * The remembered pid also makes the pump callable from poll loops in other
+     * translation units (network.cpp) without threading target pids through them.
+     *
+     * @param pid The traced target pid, or 0 to disable the pump.
+     */
+    void set_transparent_tracer(pid_t pid);
+
+    /**
+     * @brief Drain pending ptrace stops of the transparent-traced target.
+     *
+     * No-op unless a pid was registered with set_transparent_tracer(). Consumes
+     * waitpid(WNOHANG) events until none remain. The resume policy matches
+     * wait_target_exit(): seccomp stops (SIGTRAP + event), syscall stops
+     * (SIGTRAP|0x80) and group-stops/SIGSTOP are dropped with signal 0, any other
+     * stop signal is re-injected so fatal signals still kill the target. Death
+     * events are consumed silently: the health check classifies via pidfd and
+     * /proc flags, and cleanup paths tolerate ECHILD afterwards.
+     *
+     * Call at bounded intervals (e.g. in poll-timeout re-checks) - a pending
+     * ptrace stop blocks the target inside the kernel, so every network
+     * operation against it stalls until the pump resumes it.
+     */
+    void pump_transparent_tracer();
+
+    /**
+     * @brief Result of wait_target_exit().
+     */
+    struct TargetExit {
+        bool exited = false; ///< true when the child was reaped; status is then valid
+        int status = 0;      ///< raw waitpid() status, valid only when exited == true
+    };
+
+    /**
+     * @brief Wait for the target to exit, resuming it through any ptrace stops.
+     *
+     * After handshake_tracer() resumes the child, a traced target stops again on
+     * every ptrace event - most importantly the unconditional SIGTRAP exec stop -
+     * and on delivered signals. A bare blocking waitpid() therefore returns while
+     * the child is still alive (frozen at execve, before the AFL runtime has run),
+     * which deadlocks callers that then block on the child's output.
+     *
+     * Polls waitpid(WNOHANG) with a short sleep so @p timeout_ms is always
+     * enforced. Ptrace stops are resumed with PTRACE_CONT: SIGTRAP, SIGTRAP|0x80
+     * and SIGSTOP are dropped (resume with signal 0), any other signal is
+     * re-injected so fatal signals still kill the target. On timeout the tracee
+     * is detached (PTRACE_DETACH, errors ignored) so the caller's SIGTERM/SIGKILL
+     * cleanup is not swallowed by ptrace.
+     *
+     * @param pid Target pid (must be our direct child).
+     * @param timeout_ms Upper bound on the total wait; the target is NOT killed here.
+     * @return TargetExit with exited == true and the raw status when the child died;
+     *         exited == false on timeout, waitpid failure, or a non-child pid (ECHILD).
+     */
+    [[nodiscard]] TargetExit wait_target_exit(pid_t pid, uint64_t timeout_ms);
+
+    /**
      * @brief Read and parse the map size from the pipe created for MapSizePass.
      *
      * Consumes exactly one line of output, expects a decimal integer, logs it.

@@ -78,6 +78,7 @@ struct PayloadConfig {
 
 struct Config {
     TargetConfig target;
+    TargetConfig target_cmplog;  // compare-mode target, used instead of `target` when __AFL_CMPLOG_SHM_ID is set
     NetworkConfig network;
     AflConfig afl;
     PortDetectionConfig port_detection;

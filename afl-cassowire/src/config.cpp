@@ -61,7 +61,7 @@ std::variant<Config, ConfigError> load_config(const std::string& path) {
 
         // --- Check for unknown keys at root ---
         {
-            static const std::unordered_set<std::string> root_allowed = {"target", "network", "afl", "port_detection", "cleanup", "payload"};
+            static const std::unordered_set<std::string> root_allowed = {"target", "target_cmplog", "network", "afl", "port_detection", "cleanup", "payload"};
             ConfigError err = check_unknown_keys(root, root_allowed, "");
             if (!err.message.empty()) {
                 return err;
@@ -137,6 +137,110 @@ std::variant<Config, ConfigError> load_config(const std::string& path) {
             }
         }
 
+        // --- Parse afl (must come before target_cmplog so target_cmplog is
+        //   only required when enable_cmplog is true) ---
+        if (root["afl"]) {
+            if (!root["afl"].IsMap()) {
+                return ConfigError{"afl", "Invalid 'afl' section", "map", "not a map"};
+            }
+            YAML::Node afl_node = root["afl"];
+            // --- Check for unknown keys in afl ---
+            {
+                static const std::unordered_set<std::string> afl_allowed = {"loop_count", "enable_cmplog"};
+                ConfigError err = check_unknown_keys(afl_node, afl_allowed, "afl");
+                if (!err.message.empty()) {
+                    return err;
+                }
+            }
+
+            if (afl_node["loop_count"]) {
+                try {
+                    cfg.afl.loop_count = afl_node["loop_count"].as<int>();
+                    if (cfg.afl.loop_count <= 0) {
+                        return ConfigError{"afl.loop_count", "Must be > 0", "integer > 0", std::to_string(cfg.afl.loop_count)};
+                    }
+                } catch (const YAML::BadConversion&) {
+                    return ConfigError{"afl.loop_count", "Invalid type", "integer", afl_node["loop_count"].Scalar()};
+                }
+            }
+            if (afl_node["enable_cmplog"]) {
+                try {
+                    cfg.afl.enable_cmplog = afl_node["enable_cmplog"].as<bool>();
+                } catch (const YAML::BadConversion&) {
+                    return ConfigError{"afl.enable_cmplog", "Invalid type", "boolean", afl_node["enable_cmplog"].Scalar()};
+                }
+            }
+        }
+
+        // --- Parse target_cmplog (only when enable_cmplog is true) ---
+        if (cfg.afl.enable_cmplog) {
+            if (!root["target_cmplog"] || !root["target_cmplog"].IsMap()) {
+                return ConfigError{"target_cmplog", "Missing or invalid 'target_cmplog' section", "map", "missing/invalid"};
+            }
+            YAML::Node target_cmplog_node = root["target_cmplog"];
+        // --- Check for unknown keys in target_cmplog ---
+        {
+            static const std::unordered_set<std::string> target_cmplog_allowed = {"binary", "args", "env", "env_preserve"};
+            ConfigError err = check_unknown_keys(target_cmplog_node, target_cmplog_allowed, "target_cmplog");
+            if (!err.message.empty()) {
+                return err;
+            }
+        }
+
+        if (!target_cmplog_node["binary"] || !target_cmplog_node["binary"].IsScalar()) {
+            return ConfigError{"target_cmplog.binary", "Missing or invalid 'binary'", "string", "missing/invalid"};
+        }
+        cfg.target_cmplog.binary = target_cmplog_node["binary"].as<std::string>();
+
+        if (target_cmplog_node["args"]) {
+            if (!target_cmplog_node["args"].IsSequence()) {
+                return ConfigError{"target_cmplog.args", "Invalid 'args'", "list of strings", "not a list"};
+            }
+            if (target_cmplog_node["args"].size() == 0) {
+                return ConfigError{"target_cmplog.args", "Must have at least one element", "list of strings with at least one element", "empty list"};
+            }
+            for (const auto& arg : target_cmplog_node["args"]) {
+                if (!arg.IsScalar()) {
+                    return ConfigError{"target_cmplog.args", "Invalid element in 'args'", "string", "not a string"};
+                }
+                cfg.target_cmplog.args.push_back(arg.as<std::string>());
+            }
+        } else {
+            // Default to [binary] if args is omitted
+            cfg.target_cmplog.args.push_back(cfg.target_cmplog.binary);
+        }
+
+        // --- Parse target_cmplog.env ---
+        if (target_cmplog_node["env"]) {
+            if (!target_cmplog_node["env"].IsMap()) {
+                return ConfigError{"target_cmplog.env", "Invalid 'env' section", "map of strings", "not a map"};
+            }
+            YAML::Node env_node = target_cmplog_node["env"];
+            for (YAML::Node::iterator it = env_node.begin(); it != env_node.end(); ++it) {
+                if (!it->first.IsScalar() || !it->second.IsScalar()) {
+                    return ConfigError{"target_cmplog.env", "Invalid key-value pair", "string key -> string value", "invalid type"};
+                }
+                cfg.target_cmplog.env[it->first.as<std::string>()] = it->second.as<std::string>();
+            }
+        }
+        // --- Parse target_cmplog.env_preserve ---
+        if (target_cmplog_node["env_preserve"]) {
+            if (!target_cmplog_node["env_preserve"].IsScalar()) {
+                return ConfigError{"target_cmplog.env_preserve", "Invalid type", "string", "not a string"};
+            }
+            std::string env_preserve = target_cmplog_node["env_preserve"].as<std::string>();
+            if (env_preserve == "nothing") {
+                cfg.target_cmplog.env_preserve = TargetConfig::EnvPreserveLevel::nothing;
+            } else if (env_preserve == "afl_only") {
+                cfg.target_cmplog.env_preserve = TargetConfig::EnvPreserveLevel::afl_only;
+            } else if (env_preserve == "all") {
+                cfg.target_cmplog.env_preserve = TargetConfig::EnvPreserveLevel::all;
+            } else {
+                return ConfigError{"target_cmplog.env_preserve", "Invalid enum value", "nothing, afl_only, or all", env_preserve};
+            }
+        }
+        }
+
         // --- Parse network ---
         if (!root["network"] || !root["network"].IsMap()) {
             return ConfigError{"network", "Missing or invalid 'network' section", "map", "missing/invalid"};
@@ -201,39 +305,8 @@ std::variant<Config, ConfigError> load_config(const std::string& path) {
             }
         }
 
-        // --- Parse afl ---
-        if (root["afl"]) {
-            if (!root["afl"].IsMap()) {
-                return ConfigError{"afl", "Invalid 'afl' section", "map", "not a map"};
-            }
-            YAML::Node afl_node = root["afl"];
-        // --- Check for unknown keys in afl ---
-        {
-            static const std::unordered_set<std::string> afl_allowed = {"loop_count", "enable_cmplog"};
-            ConfigError err = check_unknown_keys(afl_node, afl_allowed, "afl");
-            if (!err.message.empty()) {
-                return err;
-            }
-        }
-
-            if (afl_node["loop_count"]) {
-                try {
-                    cfg.afl.loop_count = afl_node["loop_count"].as<int>();
-                    if (cfg.afl.loop_count <= 0) {
-                        return ConfigError{"afl.loop_count", "Must be > 0", "integer > 0", std::to_string(cfg.afl.loop_count)};
-                    }
-                } catch (const YAML::BadConversion&) {
-                    return ConfigError{"afl.loop_count", "Invalid type", "integer", afl_node["loop_count"].Scalar()};
-                }
-            }
-            if (afl_node["enable_cmplog"]) {
-                try {
-                    cfg.afl.enable_cmplog = afl_node["enable_cmplog"].as<bool>();
-                } catch (const YAML::BadConversion&) {
-                    return ConfigError{"afl.enable_cmplog", "Invalid type", "boolean", afl_node["enable_cmplog"].Scalar()};
-                }
-            }
-        }
+        // afl parsing moved earlier (before target_cmplog) so that target_cmplog
+        // is only required/validated when afl.enable_cmplog is true
 
         // --- Parse port_detection ---
         if (root["port_detection"]) {
