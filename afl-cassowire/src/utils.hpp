@@ -84,6 +84,12 @@ namespace utils {
     [[noreturn]] void crash_proxy();
 
     /**
+     * @brief Aborts the proxy intentionally (e.g., when the target exited
+     *        normally or its state is unknown). Raises SIGABRT.
+     */
+    [[noreturn]] void abort_proxy();
+
+    /**
      * @brief Detail carried by ParseError: characters left unconsumed after a
      *        successful numeric conversion (e.g. "12abc").
      */

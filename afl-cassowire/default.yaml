@@ -8,16 +8,18 @@ target:
   args: []                     # Additional arguments (binary is added automatically)
   # env_preserve: afl_only     # Parent env inheritance: "nothing", "afl_only"
                                # (PATH, __AFL_SHM_ID, __AFL_CMPLOG_SHM_ID), or "all"
-  # TODO: remove that and replace with logging library.
-  log:
-    stdout: ""                 # Redirect target stdout to this file (optional)
-    stderr: ""                 # Redirect target stderr to this file (optional)
 
 network:
   host: "127.0.0.1"            # TCP host to connect to
   port: 8080                   # Port to connect to (1-65535, required)
   timeout_ms: 200              # Network send/recv timeout in milliseconds
   initial_ms: 200              # Port detection timeout in milliseconds
+  probe: true                  # Post-response quiescence probe: after each response,
+                               # open a throwaway connection and wait until the target
+                               # services it (data/EOF/RST). Catches crashes in
+                               # post-response cleanup within the same iteration.
+                               # Disable for targets that rate-limit connections or
+                               # cannot tolerate an extra short-lived connection.
 
 afl:
   loop_count: 50000            # Number of __AFL_LOOP iterations

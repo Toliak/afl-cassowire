@@ -31,13 +31,21 @@ void sleep_ms(int ms) {
     }
 }
 
-// TODO(claude): crash_proxy() is never used: main.cpp calls raise(SIGSEGV) directly (and then falls through
-//   if the signal is blocked/ignored). Use this helper there. Also `_exit(139)` below is unreachable after abort().
+// TODO(claude): RESOLVED: main.cpp now calls crash_proxy() (and abort_proxy()) instead of a bare
+//   raise(SIGSEGV). Note the trailing `_exit()` is unreachable after abort() (abort never returns);
+//   kept as belt-and-suspenders.
 [[noreturn]] void crash_proxy() {
     raise(SIGSEGV);
     // Fallback in case SIGSEGV is somehow blocked, ignored, or caught
     abort();
     _exit(139); // 139 is the standard exit code for segmentation fault
+}
+
+[[noreturn]] void abort_proxy() {
+    raise(SIGABRT);
+    // Fallback in case SIGABRT is somehow blocked, ignored, or caught
+    abort();
+    _exit(134); // 134 is the standard exit code for SIGABRT (128 + 6)
 }
 
 

@@ -398,4 +398,67 @@ WaitResult wait_response(int sock, int timeout_ms) {
     return data;
 }
 
+std::string probe_outcome_to_string(ProbeOutcome outcome) {
+    switch (outcome) {
+        case ProbeOutcome::Serviced: return "Serviced";
+        case ProbeOutcome::Refused: return "Refused";
+        case ProbeOutcome::Timeout: return "Timeout";
+        case ProbeOutcome::Failed: return "Failed";
+    }
+    return "Unknown";
+}
+
+ProbeOutcome probe_target(const NetworkConfig& net_cfg) {
+    auto conn = connect_target(net_cfg);
+    if (std::holds_alternative<ConnectError>(conn)) {
+        const ConnectError& err = std::get<ConnectError>(conn);
+        // ECONNREFUSED means no listening socket: the target process died, or
+        // its listener is gone for other reasons (rate limit, one-shot server).
+        // Classification is the caller's job (check_target_state()).
+        if (err.kind == ConnectError::Kind::ConnectFailed && err.sys_errno == ECONNREFUSED) {
+            return ProbeOutcome::Refused;
+        }
+        return ProbeOutcome::Failed;
+    }
+    utils::FdGuard sock = std::get<utils::FdGuard>(std::move(conn));
+
+    // Provoke the target: a healthy keep-alive server (nginx) sends nothing on
+    // an accepted-but-unserved connection, so without a stimulus the poll()
+    // below would never see readability and the probe would always end in
+    // Timeout. Half-closing (the same pattern exchange_once uses on the main
+    // connection) delivers EOF; the target reacts by responding or closing,
+    // which is exactly what poll() waits for. Errors are ignored: ENOTCONN
+    // means the peer already reset (still a serviced connection), and anything
+    // else surfaces at poll() time.
+    (void)shutdown(sock.get(), SHUT_WR);
+
+    // Wait until the target services the probe connection. connect() alone
+    // proves nothing (the kernel backlog accepts it), but nothing makes an
+    // established, unaccepted socket readable by itself: readability means the
+    // target app sent data, closed (EOF), or died (RST). poll() reports
+    // POLLERR/POLLHUP even when not requested, so EOF/RST are covered.
+    // TODO(claude): residual gaps - deferred timers/async work after servicing,
+    //   multi-acceptor/threaded targets, banner servers (see the header contract).
+    uint64_t start = utils::get_time_ms();
+    PROXY_LOG_TRACE("probe_target start={}", start);
+    while (true) {
+        int remaining = net_cfg.timeout_ms - (int)(utils::get_time_ms() - start);
+        PROXY_LOG_TRACE("probe_target remaining={}", remaining);
+        if (remaining <= 0) return ProbeOutcome::Timeout;
+
+        struct pollfd pfd;
+        pfd.fd = sock.get();
+        pfd.events = POLLIN;
+        pfd.revents = 0;
+        int poll_res = poll(&pfd, 1, remaining);
+        PROXY_LOG_TRACE("probe_target poll_res={}", poll_res);
+        if (poll_res < 0) {
+            if (errno == EINTR) continue;
+            return ProbeOutcome::Failed;
+        }
+        if (poll_res == 0) continue; // poll timeout; the loop top re-checks the overall deadline
+        return ProbeOutcome::Serviced;
+    }
+}
+
 } // namespace network

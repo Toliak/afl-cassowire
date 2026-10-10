@@ -156,4 +156,54 @@ namespace network {
      */
     [[nodiscard]] WaitResult wait_response(int sock, int timeout_ms);
 
+    /**
+     * @brief Outcome of probe_target().
+     */
+    enum class ProbeOutcome {
+        Serviced, ///< the target touched the probe connection (data, EOF, or RST)
+        Refused,  ///< connect() got ECONNREFUSED: no listening socket on the target
+        Timeout,  ///< the target did not service the probe connection within timeout_ms
+        Failed,   ///< connect() or poll() failed for another reason (non-fatal)
+    };
+
+    /**
+     * @brief Post-response quiescence probe: checks that the target has finished
+     *        handling the previous request.
+     *
+     * Opens a throwaway TCP connection to the target, half-closes it (EOF to
+     * the target) and waits until the target actually services it (the socket
+     * becomes readable due to data, EOF, or RST). The half-close is required:
+     * a bare connect() proves nothing by itself (the kernel completes the
+     * handshake from the listen backlog without waking the application), and a
+     * healthy keep-alive server that merely accepted the connection sends
+     * nothing back, which would make every probe end in Timeout:
+     *
+     * - Serial (blocking-accept) servers cannot service the probe before the
+     *   previous connection is completely handled, so Serviced means the
+     *   previous request was fully processed (post-response cleanup included).
+     * - Event-loop servers get at least one more loop pass after closing the
+     *   main connection.
+     * - If the target dies before servicing the probe, the kernel RSTs the
+     *   established probe connection, which also reports as Serviced; the
+     *   caller is expected to classify the death with
+     *   process::check_target_state() afterwards (this function never decides
+     *   by itself).
+     *
+     * Known gaps (TODO(claude)): deferred work that runs only after the probe
+     * is serviced (timers, async logging) is not covered; on multi-acceptor /
+     * threaded targets the probe may be serviced while main-connection cleanup
+     * still runs elsewhere; banner-sending servers report Serviced as soon as
+     * they send their greeting, before reading EOF.
+     *
+     * @param net_cfg The network configuration (host, port, timeout_ms).
+     * @return ProbeOutcome Serviced, Refused, Timeout, or Failed. All outcomes
+     *         are non-fatal; interpretation is up to the caller.
+     */
+    [[nodiscard]] ProbeOutcome probe_target(const NetworkConfig& net_cfg);
+
+    /**
+     * @brief Convert a ProbeOutcome to its string representation.
+     */
+    [[nodiscard]] std::string probe_outcome_to_string(ProbeOutcome outcome);
+
 } // namespace network

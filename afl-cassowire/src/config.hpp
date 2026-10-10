@@ -36,6 +36,11 @@ struct NetworkConfig {
     int port = 0;
     int timeout_ms = 200;
     int initial_ms = 200;
+    // Post-response quiescence probe (see network::probe_target): after each
+    // exchange, a throwaway connection is opened and the proxy waits until the
+    // target services it. Disabled for targets that rate-limit connections or
+    // cannot tolerate an extra short-lived connection per iteration.
+    bool probe = true;
 };
 
 struct AflConfig {

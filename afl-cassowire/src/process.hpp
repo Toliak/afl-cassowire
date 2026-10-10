@@ -104,4 +104,69 @@ namespace process {
      */
     void collect_map_size(int pipe_read_fd);
 
+    /**
+     * @brief Open a pollable PID file descriptor for an existing process.
+     *
+     * Wraps pidfd_open(2) (there is no glibc wrapper). The returned descriptor
+     * becomes readable (POLLIN) once the task terminates and turns into a
+     * zombie, and reports hang-up (POLLHUP) once it is reaped. This lets the
+     * caller block on process death with poll() instead of sleeping or busy
+     * polling, and also pins the pid against PID reuse.
+     *
+     * @param pid The process to obtain a pidfd for.
+     * @return >=0 The pidfd on success (caller owns it, close when done),
+     *         -1 on failure with errno set (e.g. ESRCH, ENOSYS on < 5.3).
+     */
+    [[nodiscard]] int open_pidfd(pid_t pid);
+
+    /**
+     * @brief Observed state of the target process at a point in time.
+     */
+    struct TargetState {
+        enum class Kind {
+            Alive,    ///< still running (the normal case; nothing to report)
+            Crashed,  ///< terminated by a signal (status holds the waitpid status)
+            Exited,   ///< terminated normally via exit() (status holds the waitpid status)
+            Unknown,  ///< not our child / already reaped elsewhere (ECHILD)
+        };
+
+        Kind kind = Kind::Alive;
+        int status = 0;  ///< raw waitpid() status for Crashed/Exited, 0 otherwise
+
+        /// @brief Human-readable description of the state.
+        std::string to_string() const;
+    };
+
+    /**
+     * @brief Determine whether the target is alive, crashed, or exited.
+     *
+     * Race-free replacement for a bare waitpid(WNOHANG) health check. The
+     * problem it solves: do_exit() closes the process's file descriptors
+     * before it makes the task a waitable zombie, so a crash-triggered socket
+     * EOF/RST can be observed a moment before waitpid(WNOHANG) would succeed.
+     * A single WNOHANG poll right after the response therefore misses the
+     * crash and attributes it to the wrong (next) input.
+     *
+     * Sequence:
+     *   1. waitpid(WNOHANG): if the target is already a zombie, classify it.
+     *   2. Otherwise read the `flags` field of /proc/<pid>/stat (and, for a
+     *      threaded target, each /proc/<pid>/task/tid/stat). PF_EXITING or PF_SIGNALED
+     *      is set at the start of fatal-signal/exit handling, i.e. BEFORE file
+     *      descriptors are torn down, so it tells us the target is dying even
+     *      while waitpid(WNOHANG) still reports it alive.
+     *   3. If dying flags are seen, block on the pidfd until the task becomes
+     *      a zombie (bounded by grace_ms, so a hung coredump cannot wedge the
+     *      proxy), then reap and classify.
+     *   4. Otherwise the target is alive.
+     *
+     * @param pid       Target pid (the direct child; fork-less targets only).
+     * @param pidfd     Pollable pidfd from open_pidfd(), or -1 to disable the
+     *                  bounded wait (then a dying-but-not-yet-zombie target is
+     *                  reported Alive and retried on the next call).
+     * @param grace_ms  Upper bound on how long to wait for the death to
+     *                  materialise after dying flags are observed.
+     * @return TargetState The observed state.
+     */
+    [[nodiscard]] TargetState check_target_state(pid_t pid, int pidfd, int grace_ms);
+
 } // namespace process

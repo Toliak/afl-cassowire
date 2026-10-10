@@ -144,7 +144,7 @@ std::variant<Config, ConfigError> load_config(const std::string& path) {
         YAML::Node net_node = root["network"];
         // --- Check for unknown keys in network ---
         {
-            static const std::unordered_set<std::string> network_allowed = {"host", "port", "timeout_ms", "initial_ms"};
+            static const std::unordered_set<std::string> network_allowed = {"host", "port", "timeout_ms", "initial_ms", "probe"};
             ConfigError err = check_unknown_keys(net_node, network_allowed, "network");
             if (!err.message.empty()) {
                 return err;
@@ -190,6 +190,14 @@ std::variant<Config, ConfigError> load_config(const std::string& path) {
                 }
             } catch (const YAML::BadConversion&) {
                 return ConfigError{"network.initial_ms", "Invalid type", "integer > 0", net_node["initial_ms"].Scalar()};
+            }
+        }
+
+        if (net_node["probe"]) {
+            try {
+                cfg.network.probe = net_node["probe"].as<bool>();
+            } catch (const YAML::BadConversion&) {
+                return ConfigError{"network.probe", "Invalid type", "boolean", net_node["probe"].Scalar()};
             }
         }
 

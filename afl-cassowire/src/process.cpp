@@ -14,6 +14,7 @@
 #include <dirent.h>
 #include <unistd.h>
 #include <fcntl.h>
+#include <poll.h>
 #include <sys/types.h>
 #include <sys/wait.h>
 #include <sys/ptrace.h>
@@ -460,6 +461,149 @@ void collect_map_size(int pipe_read_fd) {
     } else {
         PROXY_LOG_ERROR("target produced no output for map size.");
     }
+}
+
+// PF_EXITING / PF_SIGNALED: task->flags bits visible as field 9 of
+// /proc/<pid>/stat. PF_EXITING is set in exit_signals() for any exiting task;
+// PF_SIGNALED is set in complete_signal/do_coredump path for a task killed by
+// a signal. Both are set before do_exit() tears down the file descriptors, so
+// they let us know the target is dying before it is waitable.
+static constexpr unsigned long PF_EXITING_LOCAL  = 0x00000004UL;
+static constexpr unsigned long PF_SIGNALISED_LOCAL = 0x00000400UL;
+
+// Parse the `flags` field (whitespace field 9) out of a /proc stat buffer.
+// Returns false if the buffer cannot be parsed. comm (field 2) may contain
+// spaces and parentheses, so the field numbering restarts after the LAST ')'.
+static bool parse_proc_flags(const char* buf, size_t len, unsigned long* out) {
+    // Find the LAST ')' without relying on memrchr/_GNU_SOURCE: comm may
+    // itself contain ')' characters, so field numbering restarts after it.
+    size_t rparen = 0;
+    bool found = false;
+    for (size_t i = 0; i < len; i++) {
+        if (buf[i] == ')') { rparen = i; found = true; }
+    }
+    if (!found) return false;
+    const char* p = buf + rparen + 1;
+    // Fields after ')': 0=state 1=ppid 2=pgrp 3=session 4=tty_nr 5=tpgid 6=flags
+    int idx = -1;
+    while (true) {
+        while (*p == ' ' || *p == '\t') p++;
+        if (*p == '\0' || *p == '\n') break;
+        idx++;
+        if (idx == 6) {
+            unsigned long v = 0;
+            while (*p >= '0' && *p <= '9') { v = v * 10UL + static_cast<unsigned long>(*p - '0'); p++; }
+            *out = v;
+            return true;
+        }
+        while (*p && *p != ' ' && *p != '\t' && *p != '\n' && *p != '\0') p++;
+    }
+    return false;
+}
+
+// Read the flags field of a single /proc stat file (pid, or tid under task/).
+static bool proc_flags_of(const char* path, unsigned long* out) {
+    int fd = ::open(path, O_RDONLY | O_CLOEXEC);
+    if (fd < 0) return false;
+    char buf[512];
+    ssize_t n = ::read(fd, buf, sizeof(buf) - 1);
+    ::close(fd);
+    if (n <= 0) return false;
+    buf[n] = '\0';
+    return parse_proc_flags(buf, static_cast<size_t>(n), out);
+}
+
+// True if the process (or any of its threads) carries dying flags. The leader
+// check is the cheap fast path for single-threaded targets; the task/ scan
+// covers a fatal signal delivered on a non-leader thread of a threaded target.
+static bool pid_is_dying(pid_t pid) {
+    char path[64];
+    unsigned long flags = 0;
+
+    snprintf(path, sizeof(path), "/proc/%d/stat", pid);
+    if (proc_flags_of(path, &flags) &&
+        (flags & (PF_EXITING_LOCAL | PF_SIGNALISED_LOCAL))) {
+        return true;
+    }
+
+    snprintf(path, sizeof(path), "/proc/%d/task", pid);
+    DIR* d = opendir(path);
+    if (!d) return false;  // gone (already a zombie/reaped): caller's waitpid handles it
+    struct dirent* e;
+    bool dying = false;
+    while ((e = readdir(d)) != nullptr) {
+        if (e->d_name[0] < '0' || e->d_name[0] > '9') continue;
+        char tpath[96];
+        snprintf(tpath, sizeof(tpath), "/proc/%d/task/%s/stat", pid, e->d_name);
+        if (proc_flags_of(tpath, &flags) &&
+            (flags & (PF_EXITING_LOCAL | PF_SIGNALISED_LOCAL))) {
+            dying = true;
+            break;
+        }
+    }
+    closedir(d);
+    return dying;
+}
+
+static TargetState classify(int status) {
+    if (WIFSIGNALED(status)) return {TargetState::Kind::Crashed, status};
+    if (WIFEXITED(status))   return {TargetState::Kind::Exited, status};
+    return {TargetState::Kind::Alive, status};
+}
+
+int open_pidfd(pid_t pid) {
+#ifdef __NR_pidfd_open
+    return static_cast<int>(syscall(__NR_pidfd_open, pid, 0));
+#else
+    (void)pid;
+    errno = ENOSYS;
+    return -1;
+#endif
+}
+
+TargetState check_target_state(pid_t pid, int pidfd, int grace_ms) {
+    // 1. Fast reap: the target is already a zombie we can collect.
+    int status = 0;
+    pid_t r = waitpid(pid, &status, WNOHANG);
+    if (r == pid) return classify(status);
+    if (r == -1 && errno == ECHILD) return {TargetState::Kind::Unknown, 0};
+
+    // 2. Not waitable yet: peek at the kernel's exit flags to detect a target
+    //    that is mid-exit (fds already closed for a crashed peer, or wedged in
+    //    a coredump) but not a zombie, which is the race WNOHANG misses.
+    if (!pid_is_dying(pid)) return {TargetState::Kind::Alive, 0};
+
+    // 3. Dying: wait for it to become a zombie, bounded so a hung core_pattern
+    //    pipe cannot wedge the fuzzing loop. poll() returns the instant death
+    //    materialises, so this is not a delay in the normal case.
+    if (pidfd >= 0) {
+        struct pollfd pfd;
+        pfd.fd = pidfd;
+        pfd.events = POLLIN;
+        pfd.revents = 0;
+        int pr;
+        do {
+            pr = poll(&pfd, 1, grace_ms);
+        } while (pr == -1 && errno == EINTR);
+    } else {
+        utils::sleep_ms(grace_ms);  // fallback if no pidfd was available
+    }
+
+    // 4. Reap if the death landed; otherwise the target is wedged (still alive
+    //    after grace) and will be re-checked on the next call.
+    r = waitpid(pid, &status, WNOHANG);
+    if (r == pid) return classify(status);
+    return {TargetState::Kind::Alive, 0};
+}
+
+std::string TargetState::to_string() const {
+    switch (kind) {
+    case Kind::Alive:   return "alive";
+    case Kind::Crashed: return "crashed (signal " + std::to_string(WTERMSIG(status)) + ")";
+    case Kind::Exited:  return "exited (code " + std::to_string(WEXITSTATUS(status)) + ")";
+    case Kind::Unknown: return "unknown (not our child / already reaped)";
+    }
+    return "unknown";
 }
 
 } // namespace process

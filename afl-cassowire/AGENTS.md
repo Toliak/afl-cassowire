@@ -15,7 +15,7 @@ check in `meson.build` (`__AFL_LOOP` / `__AFL_INIT` probe).
 ```sh
 make prepare    # meson subprojects download (yaml-cpp, argparse wraps)
 make prepare2   # meson setup build with CXX=<aflpp>/src/distrib/bin/afl-clang-fast++
-make build      # meson compile -C build (sets AFL_PROXY_LLVM_ONLY_FSRV=1)
+make build      # meson compile -C build (sets AFL_CASSOWIRE_LLVM_ONLY_FSRV=1)
 ```
 
 `AFLPP_DISTRIB_DIR` defaults to `../aflpp/src/distrib`; override if AFL++ lives elsewhere.
@@ -37,7 +37,7 @@ The only default verification is the documented build sequence above.
 ./build/afl-cassowire [-c config.yaml] [proxy]        # default mode, needs __AFL_SHM_ID
 ./build/afl-cassowire [-c config.yaml] test --input f # or '-' for stdin
 ```
-`proxy` also requires `PROXY_AFL_FORCE_FINAL_LOC=<uint64>` in the environment.
+`proxy` also requires `AFL_CASSOWIRE_FORCE_FINAL_LOC=<uint64>` in the environment.
 Config reference: `default.yaml` (copy to `config.yaml`).
 
 ## Layout & conventions
@@ -81,7 +81,7 @@ Config reference: `default.yaml` (copy to `config.yaml`).
   the "must use an AFL++ compiler" enforcement was moved to the `meson.build` compiler
   probe. Don't add an `#error` guard to the header.
 - Extra config keys not in the spec: `target.env`, `target.env_preserve`, `payload.*`,
-  and the required `PROXY_AFL_FORCE_FINAL_LOC` env var.
+  and the required `AFL_CASSOWIRE_FORCE_FINAL_LOC` env var.
 - Logging/target-stdio behavior intentionally diverges from the spec (spec is deprecated
   on these points): proxy logs go through spdlog to stdout with `--log-level` (not
   `std::cout`/`std::cerr`); the spec's `target.log.*` config keys were removed — target

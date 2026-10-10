@@ -9,10 +9,13 @@ prepare2:
 	CXX="$(AFLPP_DISTRIB_DIR)/bin/afl-clang-fast++" meson setup build
 
 build:
-	export AFL_PROXY_LLVM_ONLY_FSRV=1 && \
+	export AFL_CASSOWIRE_LLVM_ONLY_FSRV=1 && \
 	meson compile -C build
 
 clean:
 	rm -rf build
+
+e2e-test-simple:
+	AFL_CASSOWIRE_FORCE_FINAL_LOC=2048 make -C "$$PWD/../targets/tiny-nginx" fuzz FUZZ_DEBUG=1 2>&1 | head -n100
 
 .PHONY: prepare prepare2 build clean

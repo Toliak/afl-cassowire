@@ -3,6 +3,8 @@
 #include <iostream>
 #include <string>
 #include <string_view>
+#include <sys/prctl.h>
+#include <linux/prctl.h>
 #include <sys/socket.h>
 #include <vector>
 #include <variant>
@@ -11,7 +13,7 @@
 #include <csignal>
 #include <cerrno>
 #include <cstdint>
-#include <filesystem>
+#include <cstring>
 #include <unistd.h>
 #include <fcntl.h>
 #include <sys/wait.h>
@@ -93,9 +95,194 @@ void timed_kill_pgid(pid_t pgid, int ms) {
 // target's stdout/stderr are not "logs": they are redirected per mode in
 // process.cpp (/dev/null by default, forwarded to our fds with --child-output).
 
+/**
+ * @brief Result of one exchange_once() cycle. Error details are kept so each
+ *        caller can log and react according to its mode (proxy vs test).
+ */
+struct ExchangeOutcome {
+    std::optional<network::ConnectError> connect_error;  ///< fatal: no socket was established
+    std::optional<network::SendError> send_error;        ///< send failed, cycle still continued
+    std::optional<network::WaitError> wait_error;        ///< response failed/timed out
+    std::vector<uint8_t> response;                       ///< received bytes, valid when wait_error is empty
+    size_t request_size = 0;                             ///< bytes queued for sending (prefix + input + suffix)
+};
+
+/**
+ * @brief Performs one request/response cycle against the target: connect,
+ *        send prefix + input + suffix, half-close (SHUT_WR), read the
+ *        response. Does not touch target health or log; each caller does
+ *        that per its mode. The socket is closed before returning.
+ *
+ * @param cfg The global configuration (network + payload sections).
+ * @param input The raw input bytes (fuzz testcase or test file contents).
+ * @param input_len Number of bytes in @p input.
+ * @param payload_buf Scratch buffer reused to build the final payload
+ *        (clear() keeps capacity, so the hot loop does not reallocate).
+ * @return ExchangeOutcome The per-stage result; on connect failure the send,
+ *         wait, response and request_size fields stay empty/zero.
+ */
+ExchangeOutcome exchange_once(const Config& cfg, const uint8_t* input, size_t input_len,
+                              std::vector<uint8_t>& payload_buf) {
+    ExchangeOutcome out;
+
+    auto conn = network::connect_target(cfg.network);
+    if (std::holds_alternative<network::ConnectError>(conn)) {
+        out.connect_error = std::get<network::ConnectError>(conn);
+        return out;
+    }
+    utils::FdGuard sock = std::get<utils::FdGuard>(std::move(conn));
+    // The socket is closed when `sock` goes out of scope at the end.
+
+    // Final payload = configured prefix + input data + configured suffix
+    payload_buf.clear();
+    payload_buf.insert(payload_buf.end(), cfg.payload.prefix.begin(), cfg.payload.prefix.end());
+    payload_buf.insert(payload_buf.end(), input, input + input_len);
+    payload_buf.insert(payload_buf.end(), cfg.payload.suffix.begin(), cfg.payload.suffix.end());
+    out.request_size = payload_buf.size();
+
+    if (auto send_res = network::send_all(sock.get(), payload_buf.data(), payload_buf.size(), cfg.network.timeout_ms);
+        std::holds_alternative<network::SendError>(send_res)) {
+        out.send_error = std::get<network::SendError>(send_res);
+    }
+
+    shutdown(sock.get(), SHUT_WR);
+
+    if (auto wait_res = network::wait_response(sock.get(), cfg.network.timeout_ms);
+        std::holds_alternative<network::WaitError>(wait_res)) {
+        out.wait_error = std::get<network::WaitError>(wait_res);
+    } else {
+        out.response = std::get<std::vector<uint8_t>>(std::move(wait_res));
+    }
+    return out;
+}
+
+/**
+ * @brief One iteration of the __AFL_LOOP body: exchange the current testcase
+ *        with the target, then health-check the target (race-free).
+ */
+void run_fuzz_iteration(const Config& cfg, pid_t child_pid, int target_pidfd,
+                        std::vector<uint8_t>& payload_buf) {
+    PROXY_LOG_TRACE("loop beginning");
+    // TODO(claude): __AFL_FUZZ_TESTCASE_BUF/LEN only work if the shmem testcase feature is enabled by the AFL
+    //   toolchain; `buf` is used without a null check, and len == 0 still opens a connection and sends nothing.
+    //   (The former per-iteration std::cout debug lines are now PROXY_LOG_TRACE, compiled out with
+    //   -Dstrip_low_logs=true and filtered by --log-level otherwise.)
+    int len = __AFL_FUZZ_TESTCASE_LEN;
+    uint8_t* buf = __AFL_FUZZ_TESTCASE_BUF;
+
+    ExchangeOutcome ex = exchange_once(cfg, buf, static_cast<size_t>(len), payload_buf);
+
+    if (ex.connect_error) {
+        PROXY_LOG_ERROR("failed to connect to {}:{}: {}",
+                        cfg.network.host, cfg.network.port, ex.connect_error->to_string());
+        // Connection failed, target might be dead.
+        // Check health immediately.
+        // TODO(claude): BUGS. (1) A connect failure when the target is alive falls through to the next
+        //   loop iteration, which keeps retrying (and logging) forever - AFL sees a hang instead of a
+        //   clean failure. PARTIALLY RESOLVED: an exited/unknown target is now detected via
+        //   check_target_state and aborts the proxy below; a live-but-unconnectable target still just
+        //   retries on the next iteration.
+        //   (2) RESOLVED: right after a crash waitpid(WNOHANG) used to return 0 and miss it; check_target_state
+        //       now reads /proc exit flags and waits on the pidfd, so the crash is seen in this iteration.
+        //   (3) RESOLVED: use utils::crash_proxy() ([noreturn], abort() fallback) instead of relying on a bare
+        //       raise(SIGSEGV) to kill the process.
+        //   (4) The dead target is never respawned; spec only says to crash.
+        auto st = process::check_target_state(child_pid, target_pidfd, cfg.cleanup.force_kill_ms);
+        switch (st.kind) {
+        case process::TargetState::Kind::Crashed:
+            PROXY_LOG_WARN("target {} after connect failure, crashing the proxy so AFL respawns it",
+                           st.to_string());
+            utils::crash_proxy();
+            break;
+        case process::TargetState::Kind::Exited:
+        case process::TargetState::Kind::Unknown:
+            PROXY_LOG_WARN("target {} after connect failure, aborting the proxy so AFL respawns it",
+                           st.to_string());
+            utils::abort_proxy();
+            break;
+        case process::TargetState::Kind::Alive:
+            // Transient connect failure against a live target; retry next iteration.
+            break;
+        }
+        return;
+    }
+    PROXY_LOG_TRACE("successfully connected");
+
+    if (ex.send_error) {
+        PROXY_LOG_ERROR("send failed: {}", ex.send_error->to_string());
+    }
+
+    PROXY_LOG_TRACE("Request (size={}): '{}'",
+                        ex.request_size,
+                        log::escape_bytes(payload_buf, 256));
+    if (ex.wait_error) {
+        PROXY_LOG_ERROR("waiting for response failed: {}", ex.wait_error->to_string());
+    } else {
+        PROXY_LOG_TRACE("Response (size={}): '{}'",
+                        ex.response.size(),
+                        log::escape_bytes(ex.response, 256));
+    }
+
+    PROXY_LOG_TRACE("one iteration done");
+
+    // Post-response quiescence probe (network.probe). The target must service
+    // a throwaway connection before this iteration ends; a serial server can
+    // only do that once the previous connection is fully handled (post-response
+    // cleanup included). If the target died during that cleanup, the probe
+    // socket gets RST (also "readable"), and the health check below sees the
+    // dying flags in the same iteration, so the crash stays attributed to the
+    // input that caused it. The probe itself never decides: classification is
+    // done by check_target_state() below.
+    if (cfg.network.probe) {
+        auto pr = network::probe_target(cfg.network);
+        if (pr == network::ProbeOutcome::Refused) {
+            PROXY_LOG_WARN("probe connection refused - target listener is gone (crashed or rate-limited?)");
+        } else {
+            PROXY_LOG_TRACE("probe: {}", network::probe_outcome_to_string(pr));
+        }
+    }
+
+    // Health check (race-free). Replaces the old sleep_ms()+waitpid(WNOHANG)
+    // heuristic: do_exit() closes the target's socket fds before it becomes a
+    // waitable zombie, so a bare WNOHANG right after wait_response() could miss
+    // a crash and attribute it to the NEXT input. check_target_state reads the
+    // kernel's PF_EXITING/PF_SIGNALED flags from /proc and blocks on the pidfd
+    // until the death materialises, so the crash is seen in THIS iteration.
+    // TODO(claude): (1) still racy for a crash that happens AFTER this check
+    //   returns Alive and after the probe was serviced (deferred timers / async
+    //   work) - that needs idle detection (procfs syscall whitelist) or ptrace
+    //   checkpoints, not a sleep. (2) crashes in worker children of the target
+    //   (nginx workers, not the direct child) are still not detected here - only
+    //   the direct child pid is watched (procfs/PF check is per-pid).
+    auto st = process::check_target_state(child_pid, target_pidfd, cfg.cleanup.force_kill_ms);
+    PROXY_LOG_TRACE("target state: {}", st.to_string());
+    switch (st.kind) {
+    case process::TargetState::Kind::Crashed:
+        PROXY_LOG_WARN("target {}, crashing the proxy so AFL records the finding", st.to_string());
+        utils::crash_proxy();
+        break;
+    case process::TargetState::Kind::Exited:
+    case process::TargetState::Kind::Unknown:
+        PROXY_LOG_WARN("target {}, aborting the proxy so AFL records the finding", st.to_string());
+        utils::abort_proxy();
+        break;
+    case process::TargetState::Kind::Alive:
+        break; // normal case, keep fuzzing
+    }
+    // TODO(claude): spec only covers WIFSIGNALED. RESOLVED: a target that exited (WIFEXITED, e.g. abort
+    //   handled by its own exit(1), OOM watchdog, ASan exit code) now aborts the proxy via
+    //   utils::abort_proxy() so AFL records the finding instead of spinning on ECONNREFUSED in later
+    //   iterations; an Unknown (already reaped / not our child) target does the same. No respawn:
+    //   spec only says to crash.
+}
+
 int run_proxy_mode(const Config& cfg, bool forward_output) {
+    if (prctl(PR_SET_DUMPABLE, 0) != 0) {
+        PROXY_LOG_WARN("prctl(PR_SET_DUMPABLE, 0) failed: {} (continuing)", std::strerror(errno));
+    }
+
     // TODO(claude): spec 6.1 order: cleanup -> check __AFL_SHM_ID -> __AFL_INIT -> spawn. Here cleanup runs in
-    //   main() before the env checks (ok), but see the next TODO on PROXY_AFL_FORCE_FINAL_LOC.
+    //   main() before the env checks (ok), but see the next TODO on AFL_CASSOWIRE_FORCE_FINAL_LOC.
     // Check AFL SHM IDs
     if (!getenv("__AFL_SHM_ID")) {
         PROXY_LOG_ERROR("__AFL_SHM_ID not found in environment. Run with afl-fuzz.");
@@ -106,15 +293,15 @@ int run_proxy_mode(const Config& cfg, bool forward_output) {
         return 1;
     }
 
-    // PROXY_AFL_FORCE_FINAL_LOC is consumed by the target's AFL++ runtime to
+    // AFL_CASSOWIRE_FORCE_FINAL_LOC is consumed by the target's AFL++ runtime to
     // force __afl_final_loc. In proxy mode it must be set and be a valid
     // uint64 integer.
-    // TODO(claude): NOT IN SPEC. PROXY_AFL_FORCE_FINAL_LOC is a mandatory env var here (proxy refuses to start
+    // TODO(claude): NOT IN SPEC. AFL_CASSOWIRE_FORCE_FINAL_LOC is a mandatory env var here (proxy refuses to start
     //   without it) but spec 3/6.1 only requires __AFL_SHM_ID (+ __AFL_CMPLOG_SHM_ID). It is also never
     //   forwarded to the target (see process.cpp), and value is only printed. Document in the spec or drop.
-    const char* final_loc_str = getenv("PROXY_AFL_FORCE_FINAL_LOC");
+    const char* final_loc_str = getenv("AFL_CASSOWIRE_FORCE_FINAL_LOC");
     if (!final_loc_str) {
-        PROXY_LOG_ERROR("PROXY_AFL_FORCE_FINAL_LOC not found in environment. Run with PROXY_AFL_FORCE_FINAL_LOC=<uint64>.");
+        PROXY_LOG_ERROR("AFL_CASSOWIRE_FORCE_FINAL_LOC not found in environment. Run with AFL_CASSOWIRE_FORCE_FINAL_LOC=<uint64>.");
         return 1;
     }
 
@@ -123,11 +310,11 @@ int run_proxy_mode(const Config& cfg, bool forward_output) {
         std::holds_alternative<uint64_t>(parsed)) {
         force_final_loc = std::get<uint64_t>(parsed);
     } else {
-        PROXY_LOG_ERROR("PROXY_AFL_FORCE_FINAL_LOC must be an integer (uint64), got: '{}'", final_loc_str);
+        PROXY_LOG_ERROR("AFL_CASSOWIRE_FORCE_FINAL_LOC must be an integer (uint64), got: '{}'", final_loc_str);
         return 1;
     }
 
-    PROXY_LOG_INFO("PROXY_AFL_FORCE_FINAL_LOC = {}", force_final_loc);
+    PROXY_LOG_INFO("AFL_CASSOWIRE_FORCE_FINAL_LOC = {}", force_final_loc);
 
     // Initialize AFL persistent mode
     __AFL_INIT();
@@ -147,6 +334,17 @@ int run_proxy_mode(const Config& cfg, bool forward_output) {
     process::handshake_tracer(spawned.pid, cfg);
     g_child_pid = spawned.pid;
 
+    // Pollable pidfd for the target, used by the race-free health check
+    // (process::check_target_state). Declared at function scope so it lives
+    // for the whole AFL loop; closed when run_proxy_mode returns.
+    utils::FdGuard target_pidfd{process::open_pidfd(spawned.pid)};
+    if (target_pidfd.get() < 0) {
+        PROXY_LOG_ERROR("pidfd_open failed for target pid {}: {} (requires kernel >= 5.3)",
+                        static_cast<int>(spawned.pid), std::strerror(errno));
+        timed_kill_pgid(g_child_pid, cfg.cleanup.force_kill_ms);
+        return 1;
+    }
+
     // Wait for port readiness
     auto port_res = network::wait_for_port(g_child_pid, cfg);
     if (std::holds_alternative<network::DetectError>(port_res)) {
@@ -159,100 +357,13 @@ int run_proxy_mode(const Config& cfg, bool forward_output) {
     }
 
     // Main AFL Loop
-    // TODO(claude): __AFL_FUZZ_TESTCASE_BUF/LEN only work if the shmem testcase feature is enabled by the AFL
-    //   toolchain; `buf` is used without a null check, and len == 0 still opens a connection and sends nothing.
-    //   (The former per-iteration std::cout debug lines are now PROXY_LOG_TRACE, compiled out with
-    //   -Dstrip_low_logs=true and filtered by --log-level otherwise.)
     // Scratch buffer reused every iteration to send prefix + fuzz data + suffix
     // (clear() keeps its capacity, so the hot loop does not reallocate).
     std::vector<uint8_t> payload_buf;
     payload_buf.reserve(cfg.payload.prefix.size() + cfg.payload.suffix.size() + 4096);
 
     while (__AFL_LOOP(cfg.afl.loop_count)) {
-        PROXY_LOG_TRACE("loop beginning");
-        int len = __AFL_FUZZ_TESTCASE_LEN;
-        uint8_t* buf = __AFL_FUZZ_TESTCASE_BUF;
-
-        auto conn = network::connect_target(cfg.network);
-        if (std::holds_alternative<network::ConnectError>(conn)) {
-            PROXY_LOG_ERROR("failed to connect to {}:{}: {}",
-                            cfg.network.host, cfg.network.port,
-                            std::get<network::ConnectError>(conn).to_string());
-            // Connection failed, target might be dead.
-            // Check health immediately.
-            // TODO(claude): BUGS. (1) A connect failure when the target is alive (or exited normally, not
-            //   signalled) falls through to `break`, which ends the whole fuzzing loop and returns 0 with no
-            //   message - AFL then sees a clean exit instead of a hang/failure. (2) Right after a crash the
-            //   target may not be reaped yet, so waitpid(WNOHANG) can return 0 and the crash is missed.
-            //   (3) After raise(SIGSEGV) the code relies on the signal killing the process; use
-            //   utils::crash_proxy(). (4) The dead target is never respawned; spec only says to crash.
-            int status;
-            if (waitpid(g_child_pid, &status, WNOHANG) == g_child_pid && WIFSIGNALED(status)) {
-                PROXY_LOG_WARN("target crashed, crashing the proxy so AFL respawns it");
-                
-                // raise(SIGSEGV); // Crash proxy so AFL respawns
-                PROXY_LOG_WARN("wtf, raise failed?");
-            }
-            continue;
-        }
-        utils::FdGuard sock = std::get<utils::FdGuard>(std::move(conn));
-        PROXY_LOG_TRACE("sock {}", sock.get());
-        PROXY_LOG_TRACE("successfully connected");
-
-        // Final payload = configured prefix + fuzz data + configured suffix
-        payload_buf.clear();
-        payload_buf.insert(payload_buf.end(), cfg.payload.prefix.begin(), cfg.payload.prefix.end());
-        payload_buf.insert(payload_buf.end(), buf, buf + len);
-        payload_buf.insert(payload_buf.end(), cfg.payload.suffix.begin(), cfg.payload.suffix.end());
-
-        if (auto send_res = network::send_all(sock.get(), payload_buf.data(), payload_buf.size(), cfg.network.timeout_ms);
-            std::holds_alternative<network::SendError>(send_res)) {
-            PROXY_LOG_ERROR("send failed: {}", std::get<network::SendError>(send_res).to_string());
-        }
-
-        shutdown(sock.get(), SHUT_WR);
-
-        PROXY_LOG_DEBUG("Request (size={}): '{}'",
-                            payload_buf.size(),
-                            log::escape_bytes(payload_buf, 256));
-        if (auto wait_res = network::wait_response(sock.get(), cfg.network.timeout_ms);
-            std::holds_alternative<network::WaitError>(wait_res)) {
-            PROXY_LOG_ERROR("waiting for response failed: {}",
-                            std::get<network::WaitError>(wait_res).to_string());
-        } else {
-            // No local binding here: with -Dstrip_low_logs=true this
-            // PROXY_LOG_DEBUG compiles out and the binding would be unused.
-            PROXY_LOG_DEBUG("Response (size={}): '{}'",
-                            std::get<std::vector<uint8_t>>(wait_res).size(),
-                            log::escape_bytes(std::get<std::vector<uint8_t>>(wait_res), 256));
-        }
-        // The socket is closed when `sock` goes out of scope at the end of the iteration.
-
-        PROXY_LOG_TRACE("one iteration done");
-
-        // Health check
-        // TODO(claude): health check is racy: a crash triggered by the payload may happen a bit AFTER
-        //   wait_response() returns (timeout 200ms or recv EOF), so WNOHANG often returns 0 and the crash is
-        //   noticed one iteration late and attributed to the WRONG input. Consider a short wait or checking
-        //   again at the start of the next iteration. Also crashes in worker children of the target (nginx
-        //   workers, not the master) are never detected at all - only the direct child pid is watched.
-        int status;
-    
-        utils::sleep_ms(1);
-        pid_t res = waitpid(g_child_pid, &status, WNOHANG);
-        PROXY_LOG_TRACE("waitpid res={}, status={:x} signal={}", res, status, WIFSIGNALED(status));
-        // TODO: what if g_child_pid is not equal to res?
-        if (res == g_child_pid && WIFSIGNALED(status)) {
-            // Target crashed
-            PROXY_LOG_WARN("target crashed (signalled), crashing the proxy");
-            raise(SIGSEGV);
-        }
-        // TODO: what if the target exited but not crashed
-        // TODO(claude): spec only covers WIFSIGNALED. A target that exited (WIFEXITED, e.g. abort handled
-        //   by its own exit(1), OOM watchdog, ASan exit code) is reaped here (waitpid consumed the status),
-        //   `res == g_child_pid` is then never true again on later iterations, and subsequent iterations get
-        //   ECONNREFUSED -> `break` above. Decide: respawn, crash the proxy, or exit with an error.
-        PROXY_LOG_TRACE("waitpid res {}", res);
+        run_fuzz_iteration(cfg, g_child_pid, target_pidfd.get(), payload_buf);
     }
 
     // Clean exit of AFL loop
@@ -336,8 +447,10 @@ int run_test_mode(const Config& cfg, const std::string& input_path, bool forward
         return 1;
     }
 
-    // Final payload = configured prefix + input data + configured suffix
-    std::vector<uint8_t> payload = cfg.payload.wrap(input_data.data(), input_data.size());
+    // Scratch buffer for the final payload = configured prefix + input data
+    // + configured suffix (built by exchange_once()).
+    std::vector<uint8_t> payload_buf;
+    payload_buf.reserve(cfg.payload.prefix.size() + cfg.payload.suffix.size() + input_data.size() + 64);
 
     auto prep_opt2 = process::prepare_target(cfg, process::SpawnMode::PlainTest);
     if (!prep_opt2) {
@@ -361,32 +474,27 @@ int run_test_mode(const Config& cfg, const std::string& input_path, bool forward
         return 1;
     }
 
-    auto conn = network::connect_target(cfg.network);
-    if (std::holds_alternative<network::ConnectError>(conn)) {
+    // One-shot of the same connect -> send -> wait cycle the AFL loop runs.
+    ExchangeOutcome ex = exchange_once(cfg, input_data.data(), input_data.size(), payload_buf);
+    if (ex.connect_error) {
         PROXY_LOG_ERROR("failed to connect to {}:{}: {}",
-                        cfg.network.host, cfg.network.port,
-                        std::get<network::ConnectError>(conn).to_string());
+                        cfg.network.host, cfg.network.port, ex.connect_error->to_string());
         timed_kill_pgid(g_child_pid, cfg.cleanup.force_kill_ms);
         return 1;
     }
-    utils::FdGuard sock = std::get<utils::FdGuard>(std::move(conn));
 
     bool io_ok = true;
-    if (auto send_res = network::send_all(sock.get(), payload.data(), payload.size(), cfg.network.timeout_ms);
-        std::holds_alternative<network::SendError>(send_res)) {
-        PROXY_LOG_ERROR("send failed: {}", std::get<network::SendError>(send_res).to_string());
+    if (ex.send_error) {
+        PROXY_LOG_ERROR("send failed: {}", ex.send_error->to_string());
         io_ok = false;
     }
 
     // Log the target's response in test mode (escaped, any binary safe).
-    auto wait_res = network::wait_response(sock.get(), cfg.network.timeout_ms);
-    if (std::holds_alternative<std::vector<uint8_t>>(wait_res)) {
-        const auto& data = std::get<std::vector<uint8_t>>(wait_res);
-        PROXY_LOG_INFO("Response: '{}'", log::escape_bytes(data));
-    } else {
-        PROXY_LOG_ERROR("waiting for response failed: {}",
-                        std::get<network::WaitError>(wait_res).to_string());
+    if (ex.wait_error) {
+        PROXY_LOG_ERROR("waiting for response failed: {}", ex.wait_error->to_string());
         io_ok = false;
+    } else {
+        PROXY_LOG_INFO("Response: '{}'", log::escape_bytes(ex.response));
     }
 
     if (io_ok) {
@@ -396,7 +504,7 @@ int run_test_mode(const Config& cfg, const std::string& input_path, bool forward
     }
 
     // TODO: wip, maybe remove that later
-    utils::sleep_ms(500);
+    // utils::sleep_ms(500);
 
     pid_t res = waitpid(g_child_pid, &status, WNOHANG);
     PROXY_LOG_INFO("waitpid res {} status {:x}, signaled={}", res, status, WIFSIGNALED(status));
