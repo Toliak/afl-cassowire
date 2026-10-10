@@ -54,6 +54,64 @@ static const struct sock_fprog seccomp_prog = {
     .filter = bind_listen_filter,
 };
 
+// clone() flag bit identifying thread creation. Defined here (instead of
+// including <linux/sched.h>) to avoid header conflicts with <sched.h>.
+static constexpr __u32 DEFORK_CLONE_THREAD = 0x00010000U;
+
+// Extended seccomp filter used when port_detection.defork is set (x86_64).
+// It keeps the bind()/listen()->TRACE rules of the plain filter for port
+// detection and additionally "de-forks" the target: process-creating syscalls
+// are cancelled in-kernel and made to return 0 to the caller, so only a single
+// process ever exists (the caller continues in the child code path).
+//
+// Rules:
+//   arch != AUDIT_ARCH_X86_64            -> KILL_PROCESS   (arch-aware)
+//   bind / listen                        -> TRACE          (port detection)
+//   fork / vfork                         -> ERRNO|0        (de-fork)
+//   clone with CLONE_THREAD (pthreads)   -> ALLOW          (threads keep working)
+//   clone without CLONE_THREAD           -> ERRNO|0        (de-fork; covers
+//                                                          CLONE_VM|CLONE_VFORK)
+//   everything else                      -> ALLOW
+//
+// SECCOMP_RET_ERRNO with data 0 makes the kernel return -(0 & 0xffff) == 0
+// without executing the syscall. The man page only sanctions data 1-4095,
+// but the kernel applies no lower-bound check (data & SECCOMP_RET_DATA), so
+// the syscall "succeeds" with 0 -- exactly the child's view of a real fork().
+//
+// clone3() is deliberately NOT trapped: its flags live in a userspace
+// struct clone_args that cBPF cannot dereference, and a blanket ERRNO|0 would
+// break clone3-based threads. (glibc on x86_64 creates pthreads via clone().)
+//
+// vfork caveat: a caller that vforks expecting to execve/_exit immediately
+// afterwards (classic child path) would execve *itself* -- accepted per the
+// project decision to de-fork all non-thread forks.
+//
+// No ptrace is involved in de-forking: the kernel cancels the syscall inline,
+// so the transparent tracer is not burdened by fork stops -- the filter is
+// installed before execve() and is irremovable, so protection lasts the
+// target's whole life and is inherited across the execve.
+static struct sock_filter bind_defork_filter[] = {
+    /* 0 */ BPF_STMT(BPF_LD | BPF_W | BPF_ABS, offsetof(struct seccomp_data, arch)),
+    /* 1 */ BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, AUDIT_ARCH_X86_64, 0, 11), // mismatch -> 13 KILL
+    /* 2 */ BPF_STMT(BPF_LD | BPF_W | BPF_ABS, offsetof(struct seccomp_data, nr)),
+    /* 3 */ BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, __NR_bind, 6, 0),   // bind   -> 10 TRACE
+    /* 4 */ BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, __NR_listen, 5, 0), // listen -> 10 TRACE
+    /* 5 */ BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, __NR_fork, 6, 0),   // fork   -> 12 DEFORK
+    /* 6 */ BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, __NR_vfork, 5, 0),  // vfork  -> 12 DEFORK
+    /* 7 */ BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, __NR_clone, 0, 3),  // clone -> 8; other -> 11 ALLOW
+    /* 8 */ BPF_STMT(BPF_LD | BPF_W | BPF_ABS, offsetof(struct seccomp_data, args)), // low dword of args[0] = clone flags (rdi)
+    /* 9 */ BPF_JUMP(BPF_JMP | BPF_JSET | BPF_K, DEFORK_CLONE_THREAD, 1, 2), // thread -> 11 ALLOW; else -> 12 DEFORK
+    /* 10*/ BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_TRACE),
+    /* 11*/ BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_ALLOW),
+    /* 12*/ BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_ERRNO | 0),
+    /* 13*/ BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_KILL_PROCESS),
+};
+
+static const struct sock_fprog seccomp_prog_defork = {
+    .len = sizeof(bind_defork_filter) / sizeof(bind_defork_filter[0]),
+    .filter = bind_defork_filter,
+};
+
 void cleanup_stale_processes(const CleanupConfig& cleanup_cfg) {
     // TODO(claude): DANGEROUS. (1) This is a global /proc scan with no protection against matching the proxy
     //   itself, its parent (afl-fuzz / shell) or the new target just about to be spawned. A broad pattern
@@ -369,7 +427,11 @@ SpawnedTarget fork_target(const Config& cfg, const TargetPrepared& prep, SpawnMo
 
             if (use_seccomp) {
                 prctl(PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0);
-                prctl(PR_SET_SECCOMP, SECCOMP_MODE_FILTER, &seccomp_prog);
+                // Pointer selection only: both progs are static const, so no
+                // allocation happens between fork() and execve().
+                const struct sock_fprog* prog = cfg.port_detection.defork ? &seccomp_prog_defork
+                                                                           : &seccomp_prog;
+                prctl(PR_SET_SECCOMP, SECCOMP_MODE_FILTER, prog);
             }
 
             dprintf(original_stderr, "proxy: raise(SIGSTOP)\n");

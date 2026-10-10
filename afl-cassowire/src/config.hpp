@@ -50,6 +50,13 @@ struct AflConfig {
 
 struct PortDetectionConfig {
     std::string primary = "procfs"; // "procfs", "ptrace", "seccomp"
+    // De-fork the target: every non-thread clone()/fork()/vfork() inside the
+    // execve'd binary returns 0 without creating a process (the "child" code
+    // path runs in the caller). Implemented purely in the seccomp BPF filter
+    // (SECCOMP_RET_ERRNO|0 for the syscall; clone() calls with CLONE_THREAD
+    // are allowed through so pthreads keep working). Only valid when
+    // primary == "seccomp".
+    bool defork = false;
 };
 
 struct KillPattern {
