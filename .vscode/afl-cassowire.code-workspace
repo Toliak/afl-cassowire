@@ -9,6 +9,10 @@
             "path": "../afl-cassowire",
         },
         {
+            "name": "◙ test-target",
+            "path": "../test/test-target",
+        },
+        {
             "name": "◙ http_throughput",
             "path": "../tools/http_throughput",
         },

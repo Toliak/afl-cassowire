@@ -135,7 +135,9 @@ RUN --mount=type=cache,sharing=locked,target=/var/cache/apt \
         llvm-dev \
         clang-tools \
         clangd \
-        gdb
+        gdb \
+        net-tools \
+        ffmpeg
 
 # gcc-14-plugin-dev \
 
