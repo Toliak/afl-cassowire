@@ -235,18 +235,19 @@ std::optional<TargetPrepared> prepare_target(const Config& cfg, SpawnMode mode) 
         }
         break;
     case TargetConfig::EnvPreserveLevel::afl_only:
-        // Inherit only the variables the target's AFL++ runtime needs
+        // Inherit only the variables the target's AFL++ runtime needs.
+        // PATH is always added; the rest are propagated when present.
         {
-            const char* path = getenv("PATH");
-            c_env_strings.push_back("PATH=" + std::string(path ? path : ""));
-            const char* afl_shm_id = getenv("__AFL_SHM_ID");
-            if (afl_shm_id != nullptr) {
-                c_env_strings.push_back("__AFL_SHM_ID=" + std::string(afl_shm_id ? afl_shm_id : ""));
-            }
-            // Propagated when present (main.cpp requires it whenever afl.enable_cmplog is set)
-            const char* afl_cmplog_shm_id = getenv("__AFL_CMPLOG_SHM_ID");
-            if (afl_cmplog_shm_id) {
-                c_env_strings.push_back("__AFL_CMPLOG_SHM_ID=" + std::string(afl_cmplog_shm_id));
+            const std::vector<std::string> conditional_vars = {
+                "PATH", "__AFL_SHM_ID", "__AFL_CMPLOG_SHM_ID", "___AFL_EINS_ZWEI_POLIZEI___",
+                "AFL_DEBUG", "AFL_DEBUG_CHILD", "AFL_NO_UI", "AFL_QEMU_COMPCOV_DEBUG",
+                "AFL_QEMU_CMPLOG_DEBUG", "AFL_QEMU_MAP_SIZE",
+            };
+            for (const auto& var : conditional_vars) {
+                const char* value = getenv(var.c_str());
+                if (value != nullptr) {
+                    c_env_strings.push_back(var + "=" + std::string(value));
+                }
             }
         }
         break;

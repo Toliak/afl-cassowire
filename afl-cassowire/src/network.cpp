@@ -126,6 +126,9 @@ static DetectResult check_procfs(int target_port, uint64_t timeout_ms) {
         if (found) return std::monostate{};
         utils::sleep_ms(10);
     }
+    PROXY_LOG_WARN("port {} not seen listening after {} ms via procfs "
+                   "(procfs cannot tell whether the target died)",
+                   target_port, timeout_ms);
     return DetectError{DetectError::Kind::TimedOut, 0, 0};
 }
 
@@ -215,7 +218,7 @@ static DetectResult trace_port(pid_t pid, int target_port, uint64_t timeout_ms, 
                                     port = ntohs(in6->sin6_port);
                                 }
 
-                                PROXY_LOG_INFO("Detected bind on port {}", port);
+                                PROXY_LOG_DEBUG("Detected bind on port {}", port);
                                 if (port == 0) {
                                     PROXY_LOG_WARN("target requested ephemeral port (0), skipping...");
                                 }
@@ -290,12 +293,16 @@ static DetectResult trace_port(pid_t pid, int target_port, uint64_t timeout_ms, 
     //   fails with ESRCH and the child stays traced; the error is ignored. Also the timeout is only reached
     //   if waitpid above returned, see the blocking-waitpid TODO.
     // Timeout reached, detach before returning false
+    PROXY_LOG_WARN("configured port {} not bound+listened after {} ms via {}; detaching tracer",
+                   target_port, timeout_ms, use_seccomp ? "seccomp" : "ptrace");
     ptrace(PTRACE_DETACH, pid, 0, 0);
     return DetectError{DetectError::Kind::TimedOut, 0, 0};
 }
 
 DetectResult wait_for_port(pid_t target_pid, const Config& cfg, bool* tracer_attached) {
     if (tracer_attached) *tracer_attached = false;
+    PROXY_LOG_INFO("waiting for port {} via {} (initial_ms={})",
+                   cfg.network.port, cfg.port_detection.primary, cfg.network.initial_ms);
     if (cfg.port_detection.primary == "procfs") {
         return check_procfs(cfg.network.port, cfg.network.initial_ms);
     } else if (cfg.port_detection.primary == "ptrace") {

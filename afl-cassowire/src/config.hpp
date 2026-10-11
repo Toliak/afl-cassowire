@@ -24,7 +24,8 @@ struct TargetConfig {
     // Environment variable handling for the target process.
     enum class EnvPreserveLevel {
         nothing,   // Inherit no environment variables
-        afl_only,  // Inherit only PATH, __AFL_SHM_ID, and __AFL_CMPLOG_SHM_ID
+        afl_only,  // Inherit only PATH, __AFL_SHM_ID, __AFL_CMPLOG_SHM_ID, and
+                   // ___AFL_EINS_ZWEI_POLIZEI___ (QEMU CmpLog trigger) when set
         all        // Inherit the entire parent environment
     };
     std::unordered_map<std::string, std::string> env;  // Environment variables for target

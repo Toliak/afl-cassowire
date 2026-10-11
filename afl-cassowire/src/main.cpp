@@ -1,5 +1,6 @@
 // src/main.cpp
 
+#include <algorithm>
 #include <iostream>
 #include <string>
 #include <string_view>
@@ -120,7 +121,59 @@ struct ExchangeOutcome {
     std::optional<network::WaitError> wait_error;        ///< response failed/timed out
     std::vector<uint8_t> response;                       ///< received bytes, valid when wait_error is empty
     size_t request_size = 0;                             ///< bytes queued for sending (prefix + input + suffix)
+    // Wall-clock cost of each stage, for the slow/mostly-hanging cases. These
+    // are the observability hook that makes a stuck network stage visible at
+    // WARN level (the per-iteration detail itself stays at TRACE).
+    uint64_t connect_ms = 0;   ///< time spent in network::connect_target()
+    uint64_t send_ms = 0;      ///< time spent in network::send_all()
+    uint64_t shutdown_ms = 0;  ///< time spent in shutdown(SHUT_WR)
+    uint64_t wait_ms = 0;      ///< time spent in network::wait_response()
 };
+
+/**
+ * @brief Rolling per-proxy-loop statistics driving the INFO heartbeat and the
+ *        rate limiters for repeated per-iteration errors.
+ */
+struct IterationStats {
+    uint64_t iterations = 0;
+    uint64_t last_heartbeat_ms = 0;  ///< wall clock of the last heartbeat line
+    uint64_t slow_iters = 0;         ///< iterations that hit a stage budget
+    uint64_t max_connect_ms = 0;
+    uint64_t max_send_ms = 0;
+    uint64_t max_wait_ms = 0;
+    uint64_t max_probe_ms = 0;
+    log::Throttle connect_err{3, 5000};
+    log::Throttle send_err{3, 5000};
+    log::Throttle wait_err{3, 5000};
+};
+
+/// Emit at most one INFO iteration summary per this interval.
+constexpr uint64_t kHeartbeatMs = 5000;
+
+/// Fold one iteration's stage times into the rolling statistics and emit the
+/// periodic INFO heartbeat (flushed, so it survives AFL's output capture).
+static void update_iteration_stats(IterationStats& stats, uint64_t connect_ms,
+                                   uint64_t send_ms, uint64_t wait_ms,
+                                   uint64_t probe_ms, uint64_t budget_ms) {
+    ++stats.iterations;
+    stats.max_connect_ms = std::max(stats.max_connect_ms, connect_ms);
+    stats.max_send_ms = std::max(stats.max_send_ms, send_ms);
+    stats.max_wait_ms = std::max(stats.max_wait_ms, wait_ms);
+    stats.max_probe_ms = std::max(stats.max_probe_ms, probe_ms);
+    if (connect_ms >= budget_ms || send_ms >= budget_ms ||
+        wait_ms >= budget_ms || probe_ms >= budget_ms) {
+        ++stats.slow_iters;
+    }
+
+    const uint64_t now_ms = utils::get_time_ms();
+    if (now_ms - stats.last_heartbeat_ms >= kHeartbeatMs) {
+        PROXY_LOG_INFO("heartbeat: {} iterations, max connect/send/wait/probe = {}/{}/{}/{} ms, slow={}",
+                       stats.iterations, stats.max_connect_ms, stats.max_send_ms,
+                       stats.max_wait_ms, stats.max_probe_ms, stats.slow_iters);
+        spdlog::default_logger()->flush();
+        stats.last_heartbeat_ms = now_ms;
+    }
+}
 
 /**
  * @brief Performs one request/response cycle against the target: connect,
@@ -141,7 +194,18 @@ ExchangeOutcome exchange_once(const Config& cfg, const uint8_t* input, size_t in
     ExchangeOutcome out;
     process::pump_transparent_tracer();
 
+    // Final payload = configured prefix + input data + configured suffix.
+    // Built before connecting so payload_buf always reflects the current
+    // iteration (termination dumps read it even when connect fails).
+    payload_buf.clear();
+    payload_buf.insert(payload_buf.end(), cfg.payload.prefix.begin(), cfg.payload.prefix.end());
+    payload_buf.insert(payload_buf.end(), input, input + input_len);
+    payload_buf.insert(payload_buf.end(), cfg.payload.suffix.begin(), cfg.payload.suffix.end());
+    out.request_size = payload_buf.size();
+
+    uint64_t t_stage = utils::get_time_ms();
     auto conn = network::connect_target(cfg.network);
+    out.connect_ms = utils::get_time_ms() - t_stage;
     if (std::holds_alternative<network::ConnectError>(conn)) {
         out.connect_error = std::get<network::ConnectError>(conn);
         return out;
@@ -150,26 +214,25 @@ ExchangeOutcome exchange_once(const Config& cfg, const uint8_t* input, size_t in
     // The socket is closed when `sock` goes out of scope at the end.
     process::pump_transparent_tracer();
 
-    // Final payload = configured prefix + input data + configured suffix
-    payload_buf.clear();
-    payload_buf.insert(payload_buf.end(), cfg.payload.prefix.begin(), cfg.payload.prefix.end());
-    payload_buf.insert(payload_buf.end(), input, input + input_len);
-    payload_buf.insert(payload_buf.end(), cfg.payload.suffix.begin(), cfg.payload.suffix.end());
-    out.request_size = payload_buf.size();
-
+    t_stage = utils::get_time_ms();
     if (auto send_res = network::send_all(sock.get(), payload_buf.data(), payload_buf.size(), cfg.network.timeout_ms);
         std::holds_alternative<network::SendError>(send_res)) {
         out.send_error = std::get<network::SendError>(send_res);
     }
+    out.send_ms = utils::get_time_ms() - t_stage;
 
+    t_stage = utils::get_time_ms();
     shutdown(sock.get(), SHUT_WR);
+    out.shutdown_ms = utils::get_time_ms() - t_stage;
 
+    t_stage = utils::get_time_ms();
     if (auto wait_res = network::wait_response(sock.get(), cfg.network.timeout_ms);
         std::holds_alternative<network::WaitError>(wait_res)) {
         out.wait_error = std::get<network::WaitError>(wait_res);
     } else {
         out.response = std::get<std::vector<uint8_t>>(std::move(wait_res));
     }
+    out.wait_ms = utils::get_time_ms() - t_stage;
     process::pump_transparent_tracer();
     return out;
 }
@@ -179,7 +242,7 @@ ExchangeOutcome exchange_once(const Config& cfg, const uint8_t* input, size_t in
  *        with the target, then health-check the target (race-free).
  */
 void run_fuzz_iteration(const Config& cfg, pid_t child_pid, int target_pidfd,
-                        std::vector<uint8_t>& payload_buf) {
+                        std::vector<uint8_t>& payload_buf, IterationStats& stats) {
     PROXY_LOG_TRACE("loop beginning");
     // TODO(claude): __AFL_FUZZ_TESTCASE_BUF/LEN only work if the shmem testcase feature is enabled by the AFL
     //   toolchain; `buf` is used without a null check, and len == 0 still opens a connection and sends nothing.
@@ -187,12 +250,19 @@ void run_fuzz_iteration(const Config& cfg, pid_t child_pid, int target_pidfd,
     //   -Dstrip_low_logs=true and filtered by --log-level otherwise.)
     int len = __AFL_FUZZ_TESTCASE_LEN;
     uint8_t* buf = __AFL_FUZZ_TESTCASE_BUF;
+    const uint64_t budget_ms = static_cast<uint64_t>(cfg.network.timeout_ms);
 
     ExchangeOutcome ex = exchange_once(cfg, buf, static_cast<size_t>(len), payload_buf);
 
     if (ex.connect_error) {
-        PROXY_LOG_ERROR("failed to connect to {}:{}: {}",
-                        cfg.network.host, cfg.network.port, ex.connect_error->to_string());
+        // Rate-limited: a target that is alive but refuses connections would
+        // otherwise log this every iteration and drown the useful WARNs.
+        if (stats.connect_err.allow()) {
+            PROXY_LOG_ERROR("failed to connect to {}:{} after {} ms: {}{}",
+                            cfg.network.host, cfg.network.port, ex.connect_ms,
+                            ex.connect_error->to_string(),
+                            log::throttle_suffix(stats.connect_err));
+        }
         // Connection failed, target might be dead.
         // Check health immediately.
         // TODO(claude): BUGS. (1) A connect failure when the target is alive falls through to the next
@@ -210,35 +280,64 @@ void run_fuzz_iteration(const Config& cfg, pid_t child_pid, int target_pidfd,
         case process::TargetState::Kind::Crashed:
             PROXY_LOG_WARN("target {} after connect failure, crashing the proxy so AFL respawns it",
                            st.to_string());
-            utils::crash_proxy();
+            utils::crash_proxy("target crashed after connect failure: " + st.to_string(),
+                               payload_buf);
             break;
         case process::TargetState::Kind::Exited:
         case process::TargetState::Kind::Unknown:
             PROXY_LOG_WARN("target {} after connect failure, aborting the proxy so AFL respawns it",
                            st.to_string());
-            utils::abort_proxy();
+            utils::abort_proxy("target " + st.to_string() + " after connect failure",
+                               payload_buf);
             break;
         case process::TargetState::Kind::Alive:
             // Transient connect failure against a live target; retry next iteration.
             break;
         }
+        update_iteration_stats(stats, ex.connect_ms, 0, 0, 0, budget_ms);
         return;
     }
     PROXY_LOG_TRACE("successfully connected");
 
+    if (ex.connect_ms >= budget_ms) {
+        PROXY_LOG_WARN("connect to {}:{} took {} ms (>= timeout {} ms)",
+                       cfg.network.host, cfg.network.port, ex.connect_ms, budget_ms);
+    }
+
     if (ex.send_error) {
-        PROXY_LOG_ERROR("send failed: {}", ex.send_error->to_string());
+        if (stats.send_err.allow()) {
+            PROXY_LOG_ERROR("send failed after {} ms: {}{}",
+                            ex.send_ms, ex.send_error->to_string(),
+                            log::throttle_suffix(stats.send_err));
+        }
+    } else if (ex.send_ms >= budget_ms) {
+        PROXY_LOG_WARN("send_all of {} bytes took {} ms (>= timeout {} ms); target stopped draining the socket",
+                       ex.request_size, ex.send_ms, budget_ms);
     }
 
     PROXY_LOG_TRACE("Request (size={}): '{}'",
                         ex.request_size,
                         log::escape_bytes(payload_buf, 256));
     if (ex.wait_error) {
-        PROXY_LOG_ERROR("waiting for response failed: {}", ex.wait_error->to_string());
+        if (stats.wait_err.allow()) {
+            std::string hint;
+            if (ex.wait_error->kind == network::WaitError::Kind::TimedOut) {
+                hint = " (no response; if the request declared a Content-Length larger than the "
+                       "body sent, or the server is keep-alive, the target may withhold its "
+                       "response even after shutdown(SHUT_WR))";
+            }
+            PROXY_LOG_ERROR("waiting for response failed after {} ms: {}{}{}",
+                            ex.wait_ms, ex.wait_error->to_string(), hint,
+                            log::throttle_suffix(stats.wait_err));
+        }
     } else {
         PROXY_LOG_TRACE("Response (size={}): '{}'",
                         ex.response.size(),
                         log::escape_bytes(ex.response, 256));
+        if (ex.wait_ms >= budget_ms) {
+            PROXY_LOG_WARN("response took {} ms (>= timeout {} ms): {} bytes received; target kept the connection open",
+                           ex.wait_ms, budget_ms, ex.response.size());
+        }
     }
 
     PROXY_LOG_TRACE("one iteration done");
@@ -251,21 +350,30 @@ void run_fuzz_iteration(const Config& cfg, pid_t child_pid, int target_pidfd,
     // dying flags in the same iteration, so the crash stays attributed to the
     // input that caused it. The probe itself never decides: classification is
     // done by check_target_state() below.
+    uint64_t probe_ms = 0;
     if (cfg.network.probe) {
+        uint64_t t_probe = utils::get_time_ms();
         auto pr = network::probe_target(cfg.network);
+        probe_ms = utils::get_time_ms() - t_probe;
         switch (pr) {
             case network::ProbeOutcome::Refused:
             case network::ProbeOutcome::Timeout:
             case network::ProbeOutcome::Failed:
-                PROXY_LOG_WARN("probe connection {} - target listener is gone", network::probe_outcome_to_string(pr));
-                utils::abort_proxy();
+                PROXY_LOG_WARN("probe connection {} after {} ms (timeout {} ms) - target listener is gone",
+                               network::probe_outcome_to_string(pr), probe_ms, budget_ms);
+                utils::abort_proxy("probe connection " + network::probe_outcome_to_string(pr) +
+                                       " after " + std::to_string(probe_ms) + " ms - target listener is gone",
+                                   payload_buf);
                 break;
             case network::ProbeOutcome::Serviced:
                 // ok just continue
                 break;
         }
 
-        PROXY_LOG_TRACE("probe: {}", network::probe_outcome_to_string(pr));
+        PROXY_LOG_TRACE("probe: {} ({} ms)", network::probe_outcome_to_string(pr), probe_ms);
+        if (probe_ms >= budget_ms) {
+            PROXY_LOG_WARN("probe took {} ms (>= timeout {} ms)", probe_ms, budget_ms);
+        }
     }
 
     // Health check (race-free). Replaces the old sleep_ms()+waitpid(WNOHANG)
@@ -285,21 +393,18 @@ void run_fuzz_iteration(const Config& cfg, pid_t child_pid, int target_pidfd,
     switch (st.kind) {
     case process::TargetState::Kind::Crashed:
         PROXY_LOG_WARN("target {}, crashing the proxy so AFL records the finding", st.to_string());
-        utils::crash_proxy();
+        utils::crash_proxy("target " + st.to_string(), payload_buf);
         break;
     case process::TargetState::Kind::Exited:
     case process::TargetState::Kind::Unknown:
         PROXY_LOG_WARN("target {}, aborting the proxy so AFL records the finding", st.to_string());
-        utils::abort_proxy();
+        utils::abort_proxy("target " + st.to_string(), payload_buf);
         break;
     case process::TargetState::Kind::Alive:
         break; // normal case, keep fuzzing
     }
-    // TODO(claude): spec only covers WIFSIGNALED. RESOLVED: a target that exited (WIFEXITED, e.g. abort
-    //   handled by its own exit(1), OOM watchdog, ASan exit code) now aborts the proxy via
-    //   utils::abort_proxy() so AFL records the finding instead of spinning on ECONNREFUSED in later
-    //   iterations; an Unknown (already reaped / not our child) target does the same. No respawn:
-    //   spec only says to crash.
+
+    update_iteration_stats(stats, ex.connect_ms, ex.send_ms, ex.wait_ms, probe_ms, budget_ms);
 }
 
 int run_proxy_mode(Config cfg, bool forward_output) {
@@ -406,8 +511,11 @@ int run_proxy_mode(Config cfg, bool forward_output) {
     std::vector<uint8_t> payload_buf;
     payload_buf.reserve(cfg.payload.prefix.size() + cfg.payload.suffix.size() + 4096);
 
+    IterationStats stats;
+    stats.last_heartbeat_ms = utils::get_time_ms();
+
     while (__AFL_LOOP(cfg.afl.loop_count)) {
-        run_fuzz_iteration(cfg, g_child_pid, target_pidfd.get(), payload_buf);
+        run_fuzz_iteration(cfg, g_child_pid, target_pidfd.get(), payload_buf, stats);
     }
 
     // Clean exit of AFL loop
@@ -613,6 +721,9 @@ int main(int argc, char* argv[]) {
         return 1;
     }
     log::init(*log_level);
+
+    // Destination for crash/abort termination dumps (.msg/.data).
+    utils::set_data_dir(parsed.data_dir);
 
     // Load Configuration
     auto config_res = load_config(parsed.config_path);

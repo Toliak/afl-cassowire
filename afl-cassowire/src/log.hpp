@@ -67,4 +67,46 @@ namespace log {
     [[nodiscard]] std::string escape_bytes(const std::vector<uint8_t>& data,
                                            size_t limit = SIZE_MAX);
 
+    /**
+     * @brief Rate limiter for repeated per-iteration log messages.
+     *
+     * Call allow() once per occurrence. The first @p first_n occurrences are
+     * always allowed; after that, at most one occurrence per @p interval_ms is
+     * allowed. This keeps a hot loop's error logging (connect/send/wait
+     * failures against a slow or dead target) from flooding the log while the
+     * per-stage WARNs/heartbeat still describe what is happening. Not
+     * thread-safe (the proxy is single-threaded).
+     */
+    class Throttle {
+    public:
+        /**
+         * @param first_n Number of leading occurrences always allowed.
+         * @param interval_ms Minimum spacing between later allowed occurrences.
+         */
+        explicit Throttle(uint64_t first_n = 3, uint64_t interval_ms = 5000);
+
+        /// @brief Consume one occurrence; true if it should be logged.
+        [[nodiscard]] bool allow();
+
+        /// @brief Occurrences dropped since the previous allowed occurrence
+        ///        (the count belonging to the line just allowed).
+        [[nodiscard]] uint64_t suppressed() const { return reported_; }
+
+    private:
+        uint64_t first_n_;
+        uint64_t interval_ms_;
+        uint64_t count_ = 0;
+        uint64_t dropped_ = 0;
+        uint64_t reported_ = 0;
+        uint64_t last_allow_ms_ = 0;
+    };
+
+    /**
+     * @brief Suffix describing throttled occurrences, for the allowed log line.
+     *
+     * Empty when nothing was suppressed, otherwise e.g. " (suppressed 42
+     * similar)". Append it (including its leading space) to the message.
+     */
+    [[nodiscard]] std::string throttle_suffix(const Throttle& throttle);
+
 } // namespace log

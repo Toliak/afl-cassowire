@@ -5,6 +5,7 @@
 #include <spdlog/sinks/stdout_color_sinks.h>
 
 #include <algorithm>
+#include <chrono>
 #include <cstdio>
 #include <memory>
 #include <string>
@@ -56,6 +57,38 @@ namespace log {
             out += "...";
         }
         return out;
+    }
+
+    namespace {
+        uint64_t monotonic_ms() {
+            return static_cast<uint64_t>(
+                std::chrono::duration_cast<std::chrono::milliseconds>(
+                    std::chrono::steady_clock::now().time_since_epoch())
+                    .count());
+        }
+    } // namespace
+
+    Throttle::Throttle(uint64_t first_n, uint64_t interval_ms)
+        : first_n_(first_n), interval_ms_(interval_ms) {}
+
+    bool Throttle::allow() {
+        ++count_;
+        const uint64_t now = monotonic_ms();
+
+        if (count_ <= first_n_ || now - last_allow_ms_ >= interval_ms_) {
+            last_allow_ms_ = now;
+            reported_ = dropped_;
+            dropped_ = 0;
+            return true;
+        }
+        ++dropped_;
+        return false;
+    }
+
+    std::string throttle_suffix(const Throttle& throttle) {
+        const uint64_t n = throttle.suppressed();
+        if (n == 0) return {};
+        return " (suppressed " + std::to_string(n) + " similar)";
     }
 
 } // namespace log
