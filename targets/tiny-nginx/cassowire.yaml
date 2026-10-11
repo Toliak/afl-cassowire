@@ -11,18 +11,38 @@ target:
   #   stdout: ""                 # Redirect target stdout to this file (optional)
   #   stderr: ""                 # Redirect target stderr to this file (optional)
 
-network:
+target_cmplog:
+  binary: "./src/build/afl-clang-fast_cmplog/tinynginx"           # Path to the compare-mode target binary (required)
+  args: ["tinynginx", "-p", "8081"]                     # Additional arguments (binary is added automatically)
+  env:
+    WORKERS: 1
+
+network: &network
   host: "127.0.0.1"            # TCP host to connect to
   port: 8080                   # Port to connect to (1-65535, required)
   timeout_ms: 200              # Network send/recv timeout in milliseconds
   initial_ms: 200              # Port detection timeout in milliseconds
 
+  probe: true
+
+network_cmplog: 
+  # <<: *network
+  host: "127.0.0.1"            # TCP host to connect to
+  port: 8081                   # Port to connect to (1-65535, required)
+  timeout_ms: 200              # Network send/recv timeout in milliseconds
+  initial_ms: 200              # Port detection timeout in milliseconds
+
+  probe: true
+
 afl:
-  loop_count: 100000            # Number of __AFL_LOOP iterations
-  enable_cmplog: false         # Enable AFL compare log (requires __AFL_CMPLOG_SHM_ID)
+  loop_count: 20000            # Number of __AFL_LOOP iterations
+  enable_cmplog: true         # Enable AFL compare log (requires __AFL_CMPLOG_SHM_ID)
 
 port_detection:
   primary: "procfs"            # Method: "procfs", "ptrace", or "seccomp"
+  # primary: "ptrace"            # Method: "procfs", "ptrace", or "seccomp"
+  # primary: "seccomp"            # Method: "procfs", "ptrace", or "seccomp"
+  # defork: true
 
 cleanup:
   force_kill_ms: 150          # Wait time after SIGTERM before SIGKILL
@@ -36,4 +56,4 @@ cleanup:
     # target: "comm"              # or "argv0", "argv"
 
 payload:
-  suffix: "\r\n\r\n\r\n"
+  suffix: "\r\n\r\n"

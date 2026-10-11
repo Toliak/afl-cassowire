@@ -23,12 +23,25 @@ prepare: src
 
 ALL_BUILD_SUBTARGETS :=	build_clang \
 						build_afl-clang-lto \
-						build_afl-clang-fast
+						build_afl-clang-lto_cmplog \
+						build_afl-clang-fast \
+						build_afl-clang-fast_cmplog
+
+$(ALL_BUILD_SUBTARGETS): AFL_LLVM_CMPLOG=0
+
+build_clang: CC=clang
+build_afl-clang-lto \
+	build_afl-clang-lto_cmplog: CC=afl-clang-lto
+build_afl-clang-lto_cmplog: AFL_LLVM_CMPLOG=1
+build_afl-clang-fast \
+	build_afl-clang-fast_cmplog: CC=afl-clang-fast
+build_afl-clang-fast_cmplog: AFL_LLVM_CMPLOG=1
 
 $(ALL_BUILD_SUBTARGETS): build_%:
 	export PATH="$(AFLPP_BIN_DIR):$$PATH" && \
+		export AFL_LLVM_CMPLOG="$(AFL_LLVM_CMPLOG)" && \
 		make -C src clean && \
-		make $(BUILD_MAKE_ARGS) -C src CC="$*" BUILD_DIR="build/$*"
+		make $(BUILD_MAKE_ARGS) -C src CC="$(CC)" BUILD_DIR="build/$*"
 
 build: $(ALL_BUILD_SUBTARGETS)
 
@@ -38,8 +51,10 @@ fuzz:
 ifdef FUZZ_DEBUG
 	@echo "AFL++ debug mode"
 endif
-	$(AFL_FUZZ_ENV) afl-fuzz -i ./in -o ./out -x $(FUZZ_SHARED_DIR)/dict/http.dict -t 1500 -- \
- 		afl-cassowire --log-level trace --child-output --config cassowire.yaml proxy
-# 		afl-cassowire --log-level error --config cassowire.yaml proxy
+#  -x $(FUZZ_SHARED_DIR)/dict/http.dict
+	$(AFL_FUZZ_ENV) afl-fuzz -i ./in -o ./out -t 1500 -c 0 -- \
+		"$$(which afl-cassowire)" --log-level error --config cassowire.yaml proxy
+#  		"$$(which afl-cassowire)" --log-level trace --child-output --config cassowire.yaml proxy
+
 
 .PHONY: build prepare
