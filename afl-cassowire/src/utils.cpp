@@ -4,12 +4,18 @@
 #include "log.hpp"
 #include <ctime>
 #include <csignal>
+#include <cstdio>
 #include <cstdlib>
+#include <cstring>
+#include <filesystem>
+#include <string>
+#include <utility>
 #include <unistd.h>
 #include <errno.h>
 #include <charconv>
 #include <cerrno>
 #include <fcntl.h>
+#include <sys/stat.h>
 #include <sys/types.h>
 
 namespace utils {
@@ -32,23 +38,135 @@ void sleep_ms(int ms) {
     }
 }
 
-// TODO(claude): RESOLVED: main.cpp now calls crash_proxy() (and abort_proxy()) instead of a bare
-//   raise(SIGSEGV). Note the trailing `_exit()` is unreachable after abort() (abort never returns);
-//   kept as belt-and-suspenders.
-[[noreturn]] void crash_proxy() {
-    PROXY_LOG_ERROR("crash_proxy");
-    raise(SIGSEGV);
-    // Fallback in case SIGSEGV is somehow blocked, ignored, or caught
-    abort();
-    _exit(139); // 139 is the standard exit code for segmentation fault
+namespace {
+
+// Directory that receives the termination dump pair. Overridden by
+// set_data_dir() from the --data-dir CLI flag.
+std::string g_data_dir = "afl-cassowire-data";
+
+// Creates g_data_dir recursively. Best-effort: a failure is logged but never
+// aborts the dump attempt (or the process).
+void ensure_data_dir() {
+    std::error_code ec;
+    std::filesystem::create_directories(g_data_dir, ec);
+    if (ec) {
+        PROXY_LOG_ERROR("termination dump: cannot create data dir '{}': {}",
+                        g_data_dir, ec.message());
+    }
 }
 
-[[noreturn]] void abort_proxy() {
-    PROXY_LOG_ERROR("abort_proxy");
-    raise(SIGABRT);
-    // Fallback in case SIGABRT is somehow blocked, ignored, or caught
+// Builds a filesystem-safe, sortable wall-clock timestamp:
+//   YYYYmmdd-HHMMSS-mmm
+std::string make_timestamp() {
+    struct timespec ts;
+    clock_gettime(CLOCK_REALTIME, &ts);
+    struct tm tm_buf;
+    localtime_r(&ts.tv_sec, &tm_buf);
+
+    char buf[32];
+    size_t n = std::strftime(buf, sizeof(buf), "%Y%m%d-%H%M%S", &tm_buf);
+    std::snprintf(buf + n, sizeof(buf) - n, "-%03ld",
+                  static_cast<long>(ts.tv_nsec / 1000000L));
+    return std::string(buf);
+}
+
+// write(2) loop for an already-open fd. EINTR is retried; other failures are
+// logged and reported to the caller.
+bool write_all(int fd, const void* data, size_t len, const std::string& path) {
+    const uint8_t* p = static_cast<const uint8_t*>(data);
+    size_t off = 0;
+    while (off < len) {
+        ssize_t w = ::write(fd, p + off, len - off);
+        if (w < 0) {
+            if (errno == EINTR) continue;
+            PROXY_LOG_ERROR("termination dump: write '{}' failed: {}", path,
+                            std::strerror(errno));
+            return false;
+        }
+        off += static_cast<size_t>(w);
+    }
+    return true;
+}
+
+// Creates/truncates `path` and writes `len` bytes to it. Best-effort.
+void write_named_file(const std::string& path, const void* data, size_t len) {
+    int fd = ::open(path.c_str(), O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0644);
+    if (fd < 0) {
+        PROXY_LOG_ERROR("termination dump: cannot open '{}': {}", path,
+                        std::strerror(errno));
+        return;
+    }
+    FdGuard guard{fd};
+    write_all(fd, data, len, path);
+}
+
+// Writes the termination pair into g_data_dir. The `.data` file is created
+// first with O_EXCL to reserve a unique timestamp; on collision the stem gets
+// a numeric suffix so `.msg` and `.data` always share one stem. Best-effort:
+// no failure here prevents the subsequent signal.
+void dump_termination_data(std::string_view kind, std::string_view message,
+                           std::span<const uint8_t> data) {
+    ensure_data_dir();
+
+    std::string stem;
+    FdGuard data_fd;
+    for (int attempt = 0; attempt < 1000; ++attempt) {
+        stem = g_data_dir + "/" + make_timestamp();
+        if (attempt > 0) {
+            stem += "-" + std::to_string(attempt);
+        }
+        int fd = ::open((stem + ".data").c_str(),
+                        O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC, 0644);
+        if (fd >= 0) {
+            data_fd = FdGuard{fd};
+            break;
+        }
+        if (errno != EEXIST) {
+            PROXY_LOG_ERROR("termination dump: cannot create '{}.data': {}", stem,
+                            std::strerror(errno));
+            return;
+        }
+    }
+    if (data_fd.get() < 0) {
+        PROXY_LOG_ERROR("termination dump: could not allocate a unique name in '{}'",
+                        g_data_dir);
+        return;
+    }
+
+    write_all(data_fd.get(), data.data(), data.size(), stem + ".data");
+
+    std::string msg = std::string(kind) + ": " + std::string(message) + "\n";
+    write_named_file(stem + ".msg", msg.data(), msg.size());
+
+    PROXY_LOG_INFO("termination dump written: {}.msg / {}.data", stem, stem);
+}
+
+// Shared implementation of crash_proxy()/abort_proxy(): dump, log, then raise
+// `sig` (with abort()/_exit() fallbacks in case the signal is blocked/ignored).
+[[noreturn]] void terminate_proxy(int sig, int exit_code, std::string_view kind,
+                                  std::string_view message,
+                                  std::span<const uint8_t> input) {
+    dump_termination_data(kind, message, input);
+    PROXY_LOG_ERROR("{}: {}", kind, message);
+    raise(sig);
     abort();
-    _exit(134); // 134 is the standard exit code for SIGABRT (128 + 6)
+    _exit(exit_code);
+}
+
+} // namespace
+
+void set_data_dir(std::string dir) {
+    if (dir.empty()) return;
+    g_data_dir = std::move(dir);
+    ensure_data_dir();
+}
+
+[[noreturn]] void crash_proxy(std::string_view message, std::span<const uint8_t> input) {
+    terminate_proxy(SIGSEGV, 139, "crash_proxy", message, input);
+}
+
+[[noreturn]] void abort_proxy(std::string_view message, std::span<const uint8_t> input) {
+    terminate_proxy(SIGABRT, 134, "abort_proxy", message, input);
 }
 
 

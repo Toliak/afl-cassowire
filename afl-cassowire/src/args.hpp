@@ -14,6 +14,7 @@ namespace args {
         std::string config_path;  ///< -c/--config value (default: "config.yaml")
         std::string log_level;    ///< --log-level value (default: "info")
         bool forward_output;      ///< --child-output flag (default: false)
+        std::string data_dir;     ///< --data-dir value (default: "afl-cassowire-data")
         std::string input_path;   ///< --input value; accepted by the `test` subcommand only
         bool is_test_mode;        ///< true when the `test` subcommand was used
     };
@@ -36,9 +37,9 @@ namespace args {
     /**
      * @brief Builds the CLI parser and parses argc/argv.
      *
-     * Global options (-c/--config, --log-level, --child-output) live on the
-     * parent parser and must precede the subcommand; --input lives on the
-     * `test` subparser and is therefore only accepted as
+     * Global options (-c/--config, --log-level, --child-output, --data-dir)
+     * live on the parent parser and must precede the subcommand; --input
+     * lives on the `test` subparser and is therefore only accepted as
      * `afl-cassowire test --input <file>`. -h/--help and -v/--version are
      * handled internally by argparse (print and exit).
      *

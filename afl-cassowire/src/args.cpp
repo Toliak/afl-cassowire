@@ -30,6 +30,10 @@ namespace args {
             .default_value(false)
             .implicit_value(true);
 
+        program.add_argument("--data-dir")
+            .help("Directory for crash/abort termination dumps (.msg/.data); created if missing")
+            .default_value(std::string("afl-cassowire-data"));
+
         argparse::ArgumentParser proxy_cmd("proxy");
         proxy_cmd.add_description("Run in persistent AFL++ proxy mode (default).");
 
@@ -54,6 +58,7 @@ namespace args {
         parsed.config_path = program.get<std::string>("--config");
         parsed.log_level = program.get<std::string>("--log-level");
         parsed.forward_output = program.get<bool>("--child-output");
+        parsed.data_dir = program.get<std::string>("--data-dir");
         parsed.is_test_mode = program.is_subcommand_used("test");
         if (parsed.is_test_mode && test_cmd.is_used("--input")) {
             parsed.input_path = test_cmd.get<std::string>("--input");

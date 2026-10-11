@@ -4,6 +4,8 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <span>
+#include <string>
 #include <string_view>
 #include <system_error>
 #include <unistd.h>
@@ -78,16 +80,41 @@ namespace utils {
     void sleep_ms(int ms);
 
     /**
+     * @brief Sets the directory used for termination dumps.
+     *
+     * crash_proxy()/abort_proxy() write a `.msg` (reason) and a `.data` (the
+     * full payload built for the failing iteration) file into this directory.
+     * The path is used as-is (relative paths resolve against the process's
+     * cwd); the directory is created recursively if it does not exist.
+     * Creation failure is logged but not fatal.
+     *
+     * @param dir Destination directory (default: "afl-cassowire-data").
+     */
+    void set_data_dir(std::string dir);
+
+    /**
      * @brief Crashes the proxy intentionally (e.g., to trigger AFL respawn).
      * Raises SIGSEGV.
+     *
+     * Before raising the signal, the reason and the failing payload are dumped
+     * to the configured data directory (see set_data_dir()).
+     *
+     * @param message Human-readable reason for the crash.
+     * @param input The full payload built for the failing iteration.
      */
-    [[noreturn]] void crash_proxy();
+    [[noreturn]] void crash_proxy(std::string_view message, std::span<const uint8_t> input);
 
     /**
      * @brief Aborts the proxy intentionally (e.g., when the target exited
      *        normally or its state is unknown). Raises SIGABRT.
+     *
+     * Before raising the signal, the reason and the failing payload are dumped
+     * to the configured data directory (see set_data_dir()).
+     *
+     * @param message Human-readable reason for the abort.
+     * @param input The full payload built for the failing iteration.
      */
-    [[noreturn]] void abort_proxy();
+    [[noreturn]] void abort_proxy(std::string_view message, std::span<const uint8_t> input);
 
     /**
      * @brief Detail carried by ParseError: characters left unconsumed after a
