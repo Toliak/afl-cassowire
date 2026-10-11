@@ -1,0 +1,105 @@
+diff --git a/qemu_bridge/libaflqemubridge/afl_cmplog.c b/qemu_bridge/libaflqemubridge/afl_cmplog.c
+index 3499481..bda3bc9 100644
+--- a/qemu_bridge/libaflqemubridge/afl_cmplog.c
++++ b/qemu_bridge/libaflqemubridge/afl_cmplog.c
+@@ -17,6 +17,16 @@
+ 
+ struct cmp_map *__afl_cmp_map = NULL;
+ 
++static int __afl_cmplog_dbg = 0;
++
++static void afl_cmplog_dbg_init(void)
++{
++    char *e = getenv("AFL_QEMU_CMPLOG_DEBUG");
++    if (e && *e && strcmp(e, "0")) {
++        __afl_cmplog_dbg = 1;
++    }
++}
++
+ #if defined(TARGET_X86_64)
+ #define AFL_RTN_REG_ARG1 5
+ #define AFL_RTN_REG_ARG2 4
+@@ -54,6 +64,8 @@ static inline void afl_cmplog_ins(uint64_t id, uint8_t shape, uint64_t v0,
+         __afl_cmp_map->headers[k].hits = 0;
+     }
+ 
++    int first = (__afl_cmp_map->headers[k].hits == 0);
++
+     if (__afl_cmp_map->headers[k].hits == 0) {
+         __afl_cmp_map->headers[k].type = CMP_TYPE_INS;
+         __afl_cmp_map->headers[k].shape = shape;
+@@ -66,6 +78,13 @@ static inline void afl_cmplog_ins(uint64_t id, uint8_t shape, uint64_t v0,
+     hits &= CMP_MAP_H - 1;
+     __afl_cmp_map->log[k][hits].v0 = v0;
+     __afl_cmp_map->log[k][hits].v1 = v1;
++
++    if (__afl_cmplog_dbg && first) {
++        fprintf(stderr,
++                "[AFL] cmplog INS id=%lu shape=%u v0=0x%016lx v1=0x%016lx\n",
++                (unsigned long)id, (unsigned)shape, (unsigned long)v0,
++                (unsigned long)v1);
++    }
+ }
+ 
+ static void afl_cmplog_exec1(uint64_t data, uint64_t id, uint8_t v0,
+@@ -162,13 +181,16 @@ static void afl_cmplog_rtn_exec(uint64_t data, uint64_t id)
+     uintptr_t k = (uintptr_t)(afl_cmplog_hash(pcval) & (CMP_MAP_W - 1));
+ 
+     uint32_t hits = 0;
++    int first = 0;
+ 
+     if (__afl_cmp_map->headers[k].type != CMP_TYPE_RTN) {
+         __afl_cmp_map->headers[k].type = CMP_TYPE_RTN;
+         __afl_cmp_map->headers[k].hits = 0;
+         __afl_cmp_map->headers[k].shape = 30;
++        first = 1;
+     } else {
+         hits = __afl_cmp_map->headers[k].hits;
++        first = (hits == 0);
+     }
+ 
+     __afl_cmp_map->headers[k].hits = hits + 1;
+@@ -178,6 +200,11 @@ static void afl_cmplog_rtn_exec(uint64_t data, uint64_t id)
+     ((struct cmpfn_operands *)__afl_cmp_map->log[k])[hits].v1_len = 31;
+     memcpy(((struct cmpfn_operands *)__afl_cmp_map->log[k])[hits].v0, ptr1, 31);
+     memcpy(((struct cmpfn_operands *)__afl_cmp_map->log[k])[hits].v1, ptr2, 31);
++
++    if (__afl_cmplog_dbg && first) {
++        fprintf(stderr, "[AFL] cmplog RTN id=%lu '%.*s' | '%.*s'\n",
++                (unsigned long)k, 31, (char *)ptr1, 31, (char *)ptr2);
++    }
+ }
+ 
+ static uint64_t afl_cmplog_rtn_gen(uint64_t data, vaddr pc)
+@@ -206,6 +233,8 @@ void afl_cmplog_init(void)
+         return;
+     }
+ 
++    afl_cmplog_dbg_init();
++
+     int shm_id = atoi(id_str);
+     __afl_cmp_map = shmat(shm_id, NULL, 0);
+     if (__afl_cmp_map == (void *)-1) {
+@@ -214,12 +243,22 @@ void afl_cmplog_init(void)
+         _exit(1);
+     }
+ 
++    if (__afl_cmplog_dbg) {
++        fprintf(stderr, "[AFL] cmplog: attached map %p (shm id=%d)\n",
++                (void *)__afl_cmp_map, shm_id);
++    }
++
+     libafl_add_cmp_hook(afl_cmplog_gen, afl_cmplog_exec1, afl_cmplog_exec2,
+                         afl_cmplog_exec4, afl_cmplog_exec8, 0);
+ 
+ #if AFL_RTN_SUPPORTED
+     if (!getenv("AFL_QEMU_CMPLOG_NO_RTN")) {
+         libafl_add_block_hook(afl_cmplog_rtn_gen, NULL, afl_cmplog_rtn_exec, 0);
++        if (__afl_cmplog_dbg) {
++            fprintf(stderr, "[AFL] cmplog: RTN enabled\n");
++        }
++    } else if (__afl_cmplog_dbg) {
++        fprintf(stderr, "[AFL] cmplog: RTN disabled (AFL_QEMU_CMPLOG_NO_RTN)\n");
+     }
+ #endif
+ }
