@@ -39,6 +39,152 @@ std::vector<uint8_t> PayloadConfig::wrap(const uint8_t* data, size_t len) const 
 }
 
 
+namespace {
+
+// Returns a ConfigError with an empty message when every key is allowed.
+ConfigError check_unknown_keys(const YAML::Node& node, const std::unordered_set<std::string>& allowed,
+                               const std::string& prefix) {
+    for (YAML::const_iterator it = node.begin(); it != node.end(); ++it) {
+        std::string key = it->first.as<std::string>();
+        if (allowed.find(key) == allowed.end()) {
+            std::string full_key = prefix.empty() ? key : prefix + "." + key;
+            return ConfigError{full_key, "Unknown key: " + full_key, "", ""};
+        }
+    }
+    return ConfigError{"", "", "", ""}; // no error
+}
+
+// Parses a target-shaped section ("binary"/"args"/"env"/"env_preserve"). `prefix`
+// is the config path used in errors (e.g. "target", "target_cmplog"). Sections
+// are standalone: no values are inherited from any other section.
+// Returns a ConfigError with an empty message on success.
+ConfigError parse_target_section(const YAML::Node& node, const std::string& prefix, TargetConfig& out) {
+    static const std::unordered_set<std::string> target_allowed = {"binary", "args", "env", "env_preserve"};
+    ConfigError err = check_unknown_keys(node, target_allowed, prefix);
+    if (!err.message.empty()) {
+        return err;
+    }
+
+    if (!node["binary"] || !node["binary"].IsScalar()) {
+        return ConfigError{prefix + ".binary", "Missing or invalid 'binary'", "string", "missing/invalid"};
+    }
+    out.binary = node["binary"].as<std::string>();
+
+    if (node["args"]) {
+        if (!node["args"].IsSequence()) {
+            return ConfigError{prefix + ".args", "Invalid 'args'", "list of strings", "not a list"};
+        }
+        if (node["args"].size() == 0) {
+            return ConfigError{prefix + ".args", "Must have at least one element", "list of strings with at least one element", "empty list"};
+        }
+        for (const auto& arg : node["args"]) {
+            if (!arg.IsScalar()) {
+                return ConfigError{prefix + ".args", "Invalid element in 'args'", "string", "not a string"};
+            }
+            out.args.push_back(arg.as<std::string>());
+        }
+    } else {
+        // Default to [binary] if args is omitted
+        out.args.push_back(out.binary);
+    }
+
+    if (node["env"]) {
+        if (!node["env"].IsMap()) {
+            return ConfigError{prefix + ".env", "Invalid 'env' section", "map of strings", "not a map"};
+        }
+        YAML::Node env_node = node["env"];
+        for (YAML::Node::iterator it = env_node.begin(); it != env_node.end(); ++it) {
+            if (!it->first.IsScalar() || !it->second.IsScalar()) {
+                return ConfigError{prefix + ".env", "Invalid key-value pair", "string key -> string value", "invalid type"};
+            }
+            out.env[it->first.as<std::string>()] = it->second.as<std::string>();
+        }
+    }
+
+    if (node["env_preserve"]) {
+        if (!node["env_preserve"].IsScalar()) {
+            return ConfigError{prefix + ".env_preserve", "Invalid type", "string", "not a string"};
+        }
+        std::string env_preserve = node["env_preserve"].as<std::string>();
+        if (env_preserve == "nothing") {
+            out.env_preserve = TargetConfig::EnvPreserveLevel::nothing;
+        } else if (env_preserve == "afl_only") {
+            out.env_preserve = TargetConfig::EnvPreserveLevel::afl_only;
+        } else if (env_preserve == "all") {
+            out.env_preserve = TargetConfig::EnvPreserveLevel::all;
+        } else {
+            return ConfigError{prefix + ".env_preserve", "Invalid enum value", "nothing, afl_only, or all", env_preserve};
+        }
+    }
+
+    return ConfigError{"", "", "", ""}; // no error
+}
+
+// Parses a network-shaped section ("host"/"port"/"timeout_ms"/"initial_ms"/"probe").
+// `prefix` is the config path used in errors (e.g. "network", "network_cmplog").
+// Sections are standalone: no values are inherited from any other section.
+// Returns a ConfigError with an empty message on success.
+ConfigError parse_network_section(const YAML::Node& node, const std::string& prefix, NetworkConfig& out) {
+    static const std::unordered_set<std::string> network_allowed = {"host", "port", "timeout_ms", "initial_ms", "probe"};
+    ConfigError err = check_unknown_keys(node, network_allowed, prefix);
+    if (!err.message.empty()) {
+        return err;
+    }
+
+    if (node["host"]) {
+        if (!node["host"].IsScalar()) return ConfigError{prefix + ".host", "Invalid type", "string", "not a string"};
+        // WARN: host is not validated beyond being a string; network.cpp connect_target() uses inet_pton(AF_INET) only:
+        //   IPv4 literals work, but hostnames, IPv6 literals, and invalid strings are accepted here and may fail at connect time.
+        out.host = node["host"].as<std::string>();
+    }
+
+    if (!node["port"] || !node["port"].IsScalar()) {
+        return ConfigError{prefix + ".port", "Missing or invalid 'port'", "integer 1-65535", "missing/invalid"};
+    }
+    try {
+        out.port = node["port"].as<int>();
+        if (out.port < 1 || out.port > 65535) {
+            return ConfigError{prefix + ".port", "Port out of range", "integer 1-65535", std::to_string(out.port)};
+        }
+    } catch (const YAML::BadConversion&) {
+        return ConfigError{prefix + ".port", "Invalid port type", "integer 1-65535", node["port"].Scalar()};
+    }
+
+    if (node["timeout_ms"]) {
+        try {
+            out.timeout_ms = node["timeout_ms"].as<int>();
+            if (out.timeout_ms <= 0) {
+                return ConfigError{prefix + ".timeout_ms", "Must be > 0", "integer > 0", std::to_string(out.timeout_ms)};
+            }
+        } catch (const YAML::BadConversion&) {
+            return ConfigError{prefix + ".timeout_ms", "Invalid type", "integer > 0", node["timeout_ms"].Scalar()};
+        }
+    }
+
+    if (node["initial_ms"]) {
+        try {
+            out.initial_ms = node["initial_ms"].as<int>();
+            if (out.initial_ms <= 0) {
+                return ConfigError{prefix + ".initial_ms", "Must be > 0", "integer > 0", std::to_string(out.initial_ms)};
+            }
+        } catch (const YAML::BadConversion&) {
+            return ConfigError{prefix + ".initial_ms", "Invalid type", "integer > 0", node["initial_ms"].Scalar()};
+        }
+    }
+
+    if (node["probe"]) {
+        try {
+            out.probe = node["probe"].as<bool>();
+        } catch (const YAML::BadConversion&) {
+            return ConfigError{prefix + ".probe", "Invalid type", "boolean", node["probe"].Scalar()};
+        }
+    }
+
+    return ConfigError{"", "", "", ""}; // no error
+}
+
+} // namespace
+
 std::variant<Config, ConfigError> load_config(const std::string& path) {
     Config cfg;
     
@@ -47,21 +193,10 @@ std::variant<Config, ConfigError> load_config(const std::string& path) {
         if (!root.IsMap()) {
             return ConfigError{"", "Root node must be a map", "map", root.Type() == YAML::NodeType::Null ? "null" : "other"};
         }
-        // Helper function to check for unknown keys in a YAML map node
-        auto check_unknown_keys = [&](const YAML::Node& node, const std::unordered_set<std::string>& allowed, const std::string& prefix) -> ConfigError {
-            for (YAML::const_iterator it = node.begin(); it != node.end(); ++it) {
-                std::string key = it->first.as<std::string>();
-                if (allowed.find(key) == allowed.end()) {
-                    std::string full_key = prefix.empty() ? key : prefix + "." + key;
-                    return ConfigError{full_key, "Unknown key: " + full_key, "", ""};
-                }
-            }
-            return ConfigError{"", "", "", ""}; // no error
-        };
 
         // --- Check for unknown keys at root ---
         {
-            static const std::unordered_set<std::string> root_allowed = {"target", "target_cmplog", "network", "afl", "port_detection", "cleanup", "payload"};
+            static const std::unordered_set<std::string> root_allowed = {"target", "target_cmplog", "network", "network_cmplog", "afl", "port_detection", "cleanup", "payload"};
             ConfigError err = check_unknown_keys(root, root_allowed, "");
             if (!err.message.empty()) {
                 return err;
@@ -73,71 +208,14 @@ std::variant<Config, ConfigError> load_config(const std::string& path) {
         if (!root["target"] || !root["target"].IsMap()) {
             return ConfigError{"target", "Missing or invalid 'target' section", "map", "missing/invalid"};
         }
-        YAML::Node target_node = root["target"];
-        // --- Check for unknown keys in target ---
         {
-            static const std::unordered_set<std::string> target_allowed = {"binary", "args", "env", "env_preserve"};
-            ConfigError err = check_unknown_keys(target_node, target_allowed, "target");
+            ConfigError err = parse_target_section(root["target"], "target", cfg.target);
             if (!err.message.empty()) {
                 return err;
             }
         }
 
-        
-        if (!target_node["binary"] || !target_node["binary"].IsScalar()) {
-            return ConfigError{"target.binary", "Missing or invalid 'binary'", "string", "missing/invalid"};
-        }
-        cfg.target.binary = target_node["binary"].as<std::string>();
-        
-        if (target_node["args"]) {
-            if (!target_node["args"].IsSequence()) {
-                return ConfigError{"target.args", "Invalid 'args'", "list of strings", "not a list"};
-            }
-            if (target_node["args"].size() == 0) {
-                return ConfigError{"target.args", "Must have at least one element", "list of strings with at least one element", "empty list"};
-            }
-            for (const auto& arg : target_node["args"]) {
-                if (!arg.IsScalar()) {
-                    return ConfigError{"target.args", "Invalid element in 'args'", "string", "not a string"};
-                }
-                cfg.target.args.push_back(arg.as<std::string>());
-            }
-        } else {
-            // Default to [binary] if args is omitted
-            cfg.target.args.push_back(cfg.target.binary);
-        }
-
-        // --- Parse target.env ---
-        if (target_node["env"]) {
-            if (!target_node["env"].IsMap()) {
-                return ConfigError{"target.env", "Invalid 'env' section", "map of strings", "not a map"};
-            }
-            YAML::Node env_node = target_node["env"];
-            for (YAML::Node::iterator it = env_node.begin(); it != env_node.end(); ++it) {
-                if (!it->first.IsScalar() || !it->second.IsScalar()) {
-                    return ConfigError{"target.env", "Invalid key-value pair", "string key -> string value", "invalid type"};
-                }
-                cfg.target.env[it->first.as<std::string>()] = it->second.as<std::string>();
-            }
-        }
-        // --- Parse target.env_preserve ---
-        if (target_node["env_preserve"]) {
-            if (!target_node["env_preserve"].IsScalar()) {
-                return ConfigError{"target.env_preserve", "Invalid type", "string", "not a string"};
-            }
-            std::string env_preserve = target_node["env_preserve"].as<std::string>();
-            if (env_preserve == "nothing") {
-                cfg.target.env_preserve = TargetConfig::EnvPreserveLevel::nothing;
-            } else if (env_preserve == "afl_only") {
-                cfg.target.env_preserve = TargetConfig::EnvPreserveLevel::afl_only;
-            } else if (env_preserve == "all") {
-                cfg.target.env_preserve = TargetConfig::EnvPreserveLevel::all;
-            } else {
-                return ConfigError{"target.env_preserve", "Invalid enum value", "nothing, afl_only, or all", env_preserve};
-            }
-        }
-
-        // --- Parse afl (must come before target_cmplog so target_cmplog is
+        // --- Parse afl (must come before target_cmplog/network_cmplog so they are
         //   only required when enable_cmplog is true) ---
         if (root["afl"]) {
             if (!root["afl"].IsMap()) {
@@ -172,141 +250,43 @@ std::variant<Config, ConfigError> load_config(const std::string& path) {
             }
         }
 
-        // --- Parse target_cmplog (only when enable_cmplog is true) ---
+        // --- Parse target_cmplog and network_cmplog (only when enable_cmplog is true) ---
         if (cfg.afl.enable_cmplog) {
             if (!root["target_cmplog"] || !root["target_cmplog"].IsMap()) {
                 return ConfigError{"target_cmplog", "Missing or invalid 'target_cmplog' section", "map", "missing/invalid"};
             }
-            YAML::Node target_cmplog_node = root["target_cmplog"];
-        // --- Check for unknown keys in target_cmplog ---
-        {
-            static const std::unordered_set<std::string> target_cmplog_allowed = {"binary", "args", "env", "env_preserve"};
-            ConfigError err = check_unknown_keys(target_cmplog_node, target_cmplog_allowed, "target_cmplog");
-            if (!err.message.empty()) {
-                return err;
-            }
-        }
-
-        if (!target_cmplog_node["binary"] || !target_cmplog_node["binary"].IsScalar()) {
-            return ConfigError{"target_cmplog.binary", "Missing or invalid 'binary'", "string", "missing/invalid"};
-        }
-        cfg.target_cmplog.binary = target_cmplog_node["binary"].as<std::string>();
-
-        if (target_cmplog_node["args"]) {
-            if (!target_cmplog_node["args"].IsSequence()) {
-                return ConfigError{"target_cmplog.args", "Invalid 'args'", "list of strings", "not a list"};
-            }
-            if (target_cmplog_node["args"].size() == 0) {
-                return ConfigError{"target_cmplog.args", "Must have at least one element", "list of strings with at least one element", "empty list"};
-            }
-            for (const auto& arg : target_cmplog_node["args"]) {
-                if (!arg.IsScalar()) {
-                    return ConfigError{"target_cmplog.args", "Invalid element in 'args'", "string", "not a string"};
+            {
+                ConfigError err = parse_target_section(root["target_cmplog"], "target_cmplog", cfg.target_cmplog);
+                if (!err.message.empty()) {
+                    return err;
                 }
-                cfg.target_cmplog.args.push_back(arg.as<std::string>());
             }
-        } else {
-            // Default to [binary] if args is omitted
-            cfg.target_cmplog.args.push_back(cfg.target_cmplog.binary);
-        }
-
-        // --- Parse target_cmplog.env ---
-        if (target_cmplog_node["env"]) {
-            if (!target_cmplog_node["env"].IsMap()) {
-                return ConfigError{"target_cmplog.env", "Invalid 'env' section", "map of strings", "not a map"};
+            // Standalone section: nothing is inherited from `network`; the cmplog
+            // target may listen on a different host/port and use different timeouts.
+            if (!root["network_cmplog"] || !root["network_cmplog"].IsMap()) {
+                return ConfigError{"network_cmplog", "Missing or invalid 'network_cmplog' section", "map", "missing/invalid"};
             }
-            YAML::Node env_node = target_cmplog_node["env"];
-            for (YAML::Node::iterator it = env_node.begin(); it != env_node.end(); ++it) {
-                if (!it->first.IsScalar() || !it->second.IsScalar()) {
-                    return ConfigError{"target_cmplog.env", "Invalid key-value pair", "string key -> string value", "invalid type"};
+            {
+                ConfigError err = parse_network_section(root["network_cmplog"], "network_cmplog", cfg.network_cmplog);
+                if (!err.message.empty()) {
+                    return err;
                 }
-                cfg.target_cmplog.env[it->first.as<std::string>()] = it->second.as<std::string>();
             }
-        }
-        // --- Parse target_cmplog.env_preserve ---
-        if (target_cmplog_node["env_preserve"]) {
-            if (!target_cmplog_node["env_preserve"].IsScalar()) {
-                return ConfigError{"target_cmplog.env_preserve", "Invalid type", "string", "not a string"};
-            }
-            std::string env_preserve = target_cmplog_node["env_preserve"].as<std::string>();
-            if (env_preserve == "nothing") {
-                cfg.target_cmplog.env_preserve = TargetConfig::EnvPreserveLevel::nothing;
-            } else if (env_preserve == "afl_only") {
-                cfg.target_cmplog.env_preserve = TargetConfig::EnvPreserveLevel::afl_only;
-            } else if (env_preserve == "all") {
-                cfg.target_cmplog.env_preserve = TargetConfig::EnvPreserveLevel::all;
-            } else {
-                return ConfigError{"target_cmplog.env_preserve", "Invalid enum value", "nothing, afl_only, or all", env_preserve};
-            }
-        }
         }
 
         // --- Parse network ---
         if (!root["network"] || !root["network"].IsMap()) {
             return ConfigError{"network", "Missing or invalid 'network' section", "map", "missing/invalid"};
         }
-        YAML::Node net_node = root["network"];
-        // --- Check for unknown keys in network ---
         {
-            static const std::unordered_set<std::string> network_allowed = {"host", "port", "timeout_ms", "initial_ms", "probe"};
-            ConfigError err = check_unknown_keys(net_node, network_allowed, "network");
+            ConfigError err = parse_network_section(root["network"], "network", cfg.network);
             if (!err.message.empty()) {
                 return err;
             }
         }
 
-        
-        if (net_node["host"]) {
-            if (!net_node["host"].IsScalar()) return ConfigError{"network.host", "Invalid type", "string", "not a string"};
-            // WARN: host is not validated beyond being a string; network.cpp connect_target() uses inet_pton(AF_INET) only:
-            //   IPv4 literals work, but hostnames, IPv6 literals, and invalid strings are accepted here and may fail at connect time.
-            cfg.network.host = net_node["host"].as<std::string>();
-        }
-        
-        if (!net_node["port"] || !net_node["port"].IsScalar()) {
-            return ConfigError{"network.port", "Missing or invalid 'port'", "integer 1-65535", "missing/invalid"};
-        }
-        try {
-            cfg.network.port = net_node["port"].as<int>();
-            if (cfg.network.port < 1 || cfg.network.port > 65535) {
-                return ConfigError{"network.port", "Port out of range", "integer 1-65535", std::to_string(cfg.network.port)};
-            }
-        } catch (const YAML::BadConversion&) {
-            return ConfigError{"network.port", "Invalid port type", "integer 1-65535", net_node["port"].Scalar()};
-        }
-
-        if (net_node["timeout_ms"]) {
-            try {
-                cfg.network.timeout_ms = net_node["timeout_ms"].as<int>();
-                if (cfg.network.timeout_ms <= 0) {
-                    return ConfigError{"network.timeout_ms", "Must be > 0", "integer > 0", std::to_string(cfg.network.timeout_ms)};
-                }
-            } catch (const YAML::BadConversion&) {
-                return ConfigError{"network.timeout_ms", "Invalid type", "integer > 0", net_node["timeout_ms"].Scalar()};
-            }
-        }
-
-        if (net_node["initial_ms"]) {
-            try {
-                cfg.network.initial_ms = net_node["initial_ms"].as<int>();
-                if (cfg.network.initial_ms <= 0) {
-                    return ConfigError{"network.initial_ms", "Must be > 0", "integer > 0", std::to_string(cfg.network.initial_ms)};
-                }
-            } catch (const YAML::BadConversion&) {
-                return ConfigError{"network.initial_ms", "Invalid type", "integer > 0", net_node["initial_ms"].Scalar()};
-            }
-        }
-
-        if (net_node["probe"]) {
-            try {
-                cfg.network.probe = net_node["probe"].as<bool>();
-            } catch (const YAML::BadConversion&) {
-                return ConfigError{"network.probe", "Invalid type", "boolean", net_node["probe"].Scalar()};
-            }
-        }
-
-        // afl parsing moved earlier (before target_cmplog) so that target_cmplog
-        // is only required/validated when afl.enable_cmplog is true
+        // afl parsing moved earlier (before target_cmplog/network_cmplog) so that
+        // the cmplog sections are only required when afl.enable_cmplog is true
 
         // --- Parse port_detection ---
         if (root["port_detection"]) {

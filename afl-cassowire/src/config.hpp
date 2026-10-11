@@ -87,6 +87,8 @@ struct Config {
     TargetConfig target;
     TargetConfig target_cmplog;  // compare-mode target, used instead of `target` when __AFL_CMPLOG_SHM_ID is set
     NetworkConfig network;
+    NetworkConfig network_cmplog;  // compare-mode network, used instead of `network` when __AFL_CMPLOG_SHM_ID is set
+                                   // (self-contained: no keys fall back to `network`)
     AflConfig afl;
     PortDetectionConfig port_detection;
     CleanupConfig cleanup;

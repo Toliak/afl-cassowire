@@ -1,6 +1,7 @@
 // src/utils.cpp
 
 #include "utils.hpp"
+#include "log.hpp"
 #include <ctime>
 #include <csignal>
 #include <cstdlib>
@@ -35,6 +36,7 @@ void sleep_ms(int ms) {
 //   raise(SIGSEGV). Note the trailing `_exit()` is unreachable after abort() (abort never returns);
 //   kept as belt-and-suspenders.
 [[noreturn]] void crash_proxy() {
+    PROXY_LOG_ERROR("crash_proxy");
     raise(SIGSEGV);
     // Fallback in case SIGSEGV is somehow blocked, ignored, or caught
     abort();
@@ -42,6 +44,7 @@ void sleep_ms(int ms) {
 }
 
 [[noreturn]] void abort_proxy() {
+    PROXY_LOG_ERROR("abort_proxy");
     raise(SIGABRT);
     // Fallback in case SIGABRT is somehow blocked, ignored, or caught
     abort();

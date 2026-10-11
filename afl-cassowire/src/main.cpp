@@ -315,15 +315,17 @@ int run_proxy_mode(Config cfg, bool forward_output) {
         return 1;
     }
     // __AFL_CMPLOG_SHM_ID presence indicates AFL compare-log mode; its absence
-    // means normal mode. The config validation already ensures target_cmplog is
-    // set when enable_cmplog is true, so we don't need to check it here.
+    // means normal mode. The config validation already ensures target_cmplog and
+    // network_cmplog are set when enable_cmplog is true, so we don't need to
+    // check it here.
     if (!getenv("__AFL_CMPLOG_SHM_ID")) {
         // Normal mode: use `target`
         // cfg is already configured correctly
     } else {
-        // CMPLOG MODE: use `target_cmplog` instead of `target`
+        // CMPLOG MODE: use `target_cmplog`/`network_cmplog` instead of `target`/`network`
         Config cfg_cmplog = cfg;
         cfg_cmplog.target = cfg.target_cmplog;
+        cfg_cmplog.network = cfg.network_cmplog;
         cfg = cfg_cmplog;
     }
 
