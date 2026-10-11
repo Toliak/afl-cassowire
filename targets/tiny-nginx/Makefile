@@ -52,9 +52,33 @@ ifdef FUZZ_DEBUG
 	@echo "AFL++ debug mode"
 endif
 #  -x $(FUZZ_SHARED_DIR)/dict/http.dict
-	$(AFL_FUZZ_ENV) afl-fuzz -i ./in -o ./out -t 1500 -c 0 -- \
-		"$$(which afl-cassowire)" --log-level error --config cassowire.yaml proxy
-#  		"$$(which afl-cassowire)" --log-level trace --child-output --config cassowire.yaml proxy
+	AFL_CASSOWIRE_FORCE_FINAL_LOC=4096 $(AFL_FUZZ_ENV) afl-fuzz  -b 5 -i ./in -o ./out -t 1500 -c 0 -- \
+ 		"$$(which afl-cassowire)" --log-level trace --child-output --config cassowire.yaml proxy
+# 		"$$(which afl-cassowire)" --log-level error --config cassowire.yaml proxy
+
+# Binary-only QEMU mode: afl-cassowire forks+execs afl-qemu-bridge, which runs the
+# uninstrumented guest (src/build/clang/tinynginx, see `make build_clang`).
+# Invariant: AFL_CASSOWIRE_FORCE_FINAL_LOC >= AFL_QEMU_MAP_SIZE (cassowire.qemu.yaml).
+# -c 0: cmplog runs in-emulator (target_cmplog = same bridge + guest on port 8081);
+# the proxy forwards ___AFL_EINS_ZWEI_POLIZEI___ to the bridge.
+fuzz-qemu:
+	mkdir -p ./out ./in
+	cp -f $(FUZZ_SHARED_DIR)/in_http/* ./in/.
+ifdef FUZZ_DEBUG
+	@echo "AFL++ debug mode"
+endif
+	AFL_CASSOWIRE_FORCE_FINAL_LOC=65536 $(AFL_FUZZ_ENV) afl-fuzz -b 5 -i ./in -o ./out -t 2000 -c 0 -- \
+ 		"$$(which afl-cassowire)" --log-level trace --child-output --config cassowire.qemu.yaml proxy
+#  		"$$(which afl-cassowire)" --log-level error --config cassowire.qemu.yaml proxy
+
+# fuzz-qemu-test:
+# 	mkdir -p ./out ./in
+# 	cp -f $(FUZZ_SHARED_DIR)/in_http/* ./in/.
+# ifdef FUZZ_DEBUG
+# 	@echo "AFL++ debug mode"
+# endif
+# 	$(AFL_FUZZ_ENV) afl-fuzz -b 5 -i ./in -o ./out -t 2000 -- \
+# 		/opt/workdir/aflpp/src/distrib/bin/afl-qemu-bridge /opt/workdir/targets/nginx/src/install/clang/usr/bin/nginx -t -c @@
 
 
-.PHONY: build prepare
+.PHONY: build prepare fuzz fuzz-qemu

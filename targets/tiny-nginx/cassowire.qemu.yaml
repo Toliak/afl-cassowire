@@ -1,0 +1,71 @@
+# afl-cassowire QEMU (binary-only) config for tiny-nginx.
+# The "target" is afl-qemu-bridge; the GUEST is the uninstrumented clang build
+# (src/build/clang/tinynginx). Guest coverage flows into the same __AFL_SHM_ID
+# map afl-fuzz gave the proxy.
+#
+# Invariants (violating these silently corrupts coverage):
+#   1. AFL_QEMU_MAP_SIZE <= AFL_CASSOWIRE_FORCE_FINAL_LOC (set by `make fuzz-qemu`)
+#   2. port_detection.primary MUST be "procfs" (ptrace/seccomp would fight the
+#      qemu process's internal threads)
+#   3. env_preserve: afl_only drops AFL_QEMU_MAP_SIZE from the parent env, so it
+#      must be listed explicitly under target.env
+
+target:
+  binary: /opt/workdir/aflpp/src/distrib/bin/afl-qemu-bridge
+  args:                                            # full argv; argv[0] goes first
+    - /opt/workdir/aflpp/src/distrib/bin/afl-qemu-bridge
+    - ./src/build/clang/tinynginx                  # guest binary (UNinstrumented)
+    - -p
+    - "8060"
+  env_preserve: afl_only
+  env:
+    AFL_QEMU_MAP_SIZE: "65536"                     # <= AFL_CASSOWIRE_FORCE_FINAL_LOC
+    WORKERS: "1"
+
+target_cmplog:
+  # CmpLog runs in-emulator (afl-fuzz -c 0): same bridge + UNinstrumented guest,
+  # but on port 8081 (both persistent qemu guests run concurrently). The proxy
+  # forwards ___AFL_EINS_ZWEI_POLIZEI___ and __AFL_CMPLOG_SHM_ID automatically;
+  # AFL_QEMU_CMPLOG_NO_RTN=1 here would disable RTN logging (x86_64-only).
+  binary: /opt/workdir/aflpp/src/distrib/bin/afl-qemu-bridge
+  args:                                            # full argv; argv[0] goes first
+    - /opt/workdir/aflpp/src/distrib/bin/afl-qemu-bridge
+    - ./src/build/clang/tinynginx                  # guest binary (UNinstrumented)
+    - -p
+    - "9060"
+  env_preserve: afl_only
+  env:
+    AFL_QEMU_COMPCOV_DEBUG: "1"
+    AFL_QEMU_CMPLOG_DEBUG: "1"                     # print first-hit-per-bucket cmplog entries to stderr
+    AFL_QEMU_MAP_SIZE: "65536"                     # <= AFL_CASSOWIRE_FORCE_FINAL_LOC
+    WORKERS: "1"
+
+network:
+  host: "127.0.0.1"
+  port: 8060
+  timeout_ms: 200
+  initial_ms: 3000                                 # qemu + guest startup is slower
+  probe: true
+
+network_cmplog:
+  host: "127.0.0.1"
+  port: 9060
+  timeout_ms: 200
+  initial_ms: 3000                                 # qemu + guest startup is slower
+  probe: true
+
+afl:
+  loop_count: 20000
+  enable_cmplog: true
+
+port_detection:
+  primary: "procfs"                                # REQUIRED for QEMU targets
+
+# cleanup:
+#   force_kill_ms: 2000
+#   kill_pattern:
+#     type: comm
+#     value: "afl-qemu-bridge"                       # the qemu process, not the guest
+
+payload:
+  suffix: "\r\n\r\n"

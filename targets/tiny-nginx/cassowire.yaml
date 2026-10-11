@@ -3,7 +3,7 @@
 
 target:
   binary: "./src/build/afl-clang-fast/tinynginx"           # Path to the target binary (required)
-  args: ["tinynginx", "-p", "8080"]                     # Additional arguments (binary is added automatically)
+  args: ["tinynginx", "-p", "8060"]                     # Additional arguments (binary is added automatically)
   env:
     WORKERS: 1
 
@@ -13,14 +13,14 @@ target:
 
 target_cmplog:
   binary: "./src/build/afl-clang-fast_cmplog/tinynginx"           # Path to the compare-mode target binary (required)
-  args: ["tinynginx", "-p", "8081"]                     # Additional arguments (binary is added automatically)
+  args: ["tinynginx", "-p", "9060"]                     # Additional arguments (binary is added automatically)
   env:
     WORKERS: 1
 
 network: &network
   host: "127.0.0.1"            # TCP host to connect to
-  port: 8080                   # Port to connect to (1-65535, required)
-  timeout_ms: 200              # Network send/recv timeout in milliseconds
+  port: 8060                   # Port to connect to (1-65535, required)
+  timeout_ms: 100              # Network send/recv timeout in milliseconds
   initial_ms: 200              # Port detection timeout in milliseconds
 
   probe: true
@@ -28,8 +28,8 @@ network: &network
 network_cmplog: 
   # <<: *network
   host: "127.0.0.1"            # TCP host to connect to
-  port: 8081                   # Port to connect to (1-65535, required)
-  timeout_ms: 200              # Network send/recv timeout in milliseconds
+  port: 9060                   # Port to connect to (1-65535, required)
+  timeout_ms: 100              # Network send/recv timeout in milliseconds
   initial_ms: 200              # Port detection timeout in milliseconds
 
   probe: true
