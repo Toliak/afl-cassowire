@@ -1,29 +1,29 @@
 target:
   binary: "./src/install/afl-clang-fast/usr/bin/nginx"           # Path to the target binary (required)
-  args: ["nginx", "-c", "/opt/workdir/targets/nginx/nginx.conf"]                     # Additional arguments (binary is added automatically)
+  args: ["nginx", "-c", "/opt/workdir/targets/nginx/nginx.new.conf"]                     # Additional arguments (binary is added automatically)
 
 target_cmplog:
   binary: "./src/install/afl-clang-fast_cmplog/usr/bin/nginx"           # Path to the compare-mode target binary (required)
-  args: ["nginx", "-c", "/opt/workdir/targets/nginx/nginx.cmplog.conf"]                     # Additional arguments (binary is added automatically)
+  args: ["nginx", "-c", "/opt/workdir/targets/nginx/nginx.new.cmplog.conf"]                     # Additional arguments (binary is added automatically)
 
 network: &network
   host: "127.0.0.1"            # TCP host to connect to
   port: 8080                   # Port to connect to (1-65535, required)
-  timeout_ms: 2000              # Network send/recv timeout in milliseconds
+  timeout_ms: 100              # Network send/recv timeout in milliseconds
   initial_ms: 200              # Port detection timeout in milliseconds
 
   probe: true
 
 network_cmplog: 
   host: "127.0.0.1"            # TCP host to connect to
-  port: 8081                   # Port to connect to (1-65535, required)
-  timeout_ms: 200              # Network send/recv timeout in milliseconds
+  port: 9080                   # Port to connect to (1-65535, required)
+  timeout_ms: 100              # Network send/recv timeout in milliseconds
   initial_ms: 200              # Port detection timeout in milliseconds
 
   probe: true
 
 afl:
-  loop_count: 30000            # Number of __AFL_LOOP iterations
+  loop_count: 10000            # Number of __AFL_LOOP iterations
   enable_cmplog: true         # Enable AFL compare log (requires __AFL_CMPLOG_SHM_ID)
 
 port_detection:

@@ -90,8 +90,8 @@ ifdef FUZZ_DEBUG
 	@echo "AFL++ debug mode"
 endif
 	export AFL_CASSOWIRE_FORCE_FINAL_LOC=70000 && \
-		$(AFL_FUZZ_ENV) afl-fuzz -i- -o ./out -x $(FUZZ_SHARED_DIR)/dict/http.dict -t 1500 -c 0 -- \
-		"$$(which afl-cassowire)" --log-level error --config cassowire.yaml proxy
-#  		"$$(which afl-cassowire)" --log-level trace --child-output --config cassowire.yaml proxy
+		$(AFL_FUZZ_ENV) afl-fuzz -b 4 -i ./in -o ./out -x $(FUZZ_SHARED_DIR)/dict/http.dict -t 1500 -c 0 -- \
+ 		"$$(which afl-cassowire)" --log-level error --config cassowire.yaml proxy
+# 		"$$(which afl-cassowire)" --log-level debug --child-output --config cassowire.yaml proxy
 
 .PHONY: build prepare
