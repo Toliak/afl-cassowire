@@ -38,6 +38,9 @@ The only default verification is the documented build sequence above.
 ./build/afl-cassowire [-c config.yaml] test --input f # or '-' for stdin
 ```
 `proxy` also requires `AFL_CASSOWIRE_FORCE_FINAL_LOC=<uint64>` in the environment.
+Global options (`-c/--config`, `--log-level`, `--child-output`, `--data-dir`) must
+precede the subcommand. `--data-dir` selects where termination dumps are written
+(default `afl-cassowire-data`, created recursively if missing).
 Config reference: `default.yaml` (copy to `config.yaml`).
 
 ## Layout & conventions
@@ -54,7 +57,8 @@ Config reference: `default.yaml` (copy to `config.yaml`).
 - `src/network.{hpp,cpp}` — namespace `network`: port detection (`procfs` | `ptrace` |
   `seccomp`, all in `wait_for_port()`) plus TCP client (`connect_target`, `send_all`,
   `wait_response`).
-- `src/utils.{hpp,cpp}` — namespace `utils`: time, sleep, `crash_proxy()`.
+- `src/utils.{hpp,cpp}` — namespace `utils`: time, sleep, `crash_proxy()`/`abort_proxy()`
+  (shared `terminate_proxy()` implementation) and their termination dumps.
 - Header guards are `#pragma once`; Doxygen-style comments on public functions;
   4-space indent, no tabs.
 
@@ -80,8 +84,45 @@ Config reference: `default.yaml` (copy to `config.yaml`).
 - Target crash detection: `waitpid(WNOHANG)` + `WIFSIGNALED` → proxy raises `SIGSEGV` so
   AFL registers the finding. Target is cleaned up SIGTERM → wait `cleanup.force_kill_ms`
   → SIGKILL, on the whole process group.
+- Targets are spawned with `PR_SET_PDEATHSIG(SIGKILL)` plus a `getppid()` race check in
+  the pre-exec child (`fork_target()`, src/process.cpp:390-397), so the kernel kills the
+  target whenever the proxy dies — `abort_proxy`, `crash_proxy`, or AFL killing the
+  proxy — in all modes (proxy/test) and all spawn modes, even in procfs port-detection
+  mode. This complements `PTRACE_O_EXITKILL` (ptrace/seccomp only): orphaned reuseport
+  listeners are impossible. Delivery is immediate SIGKILL with no `force_kill_ms` grace —
+  by design, since the proxy is already dead when it fires. It relies on the proxy
+  staying single-threaded (PDEATHSIG watches the forking thread).
+- `crash_proxy(message, payload)`/`abort_proxy(message, payload)` share `terminate_proxy()`
+  and, before raising `SIGSEGV`/`SIGABRT`, write a termination pair into `--data-dir`
+  (default `afl-cassowire-data`, created recursively): `{timestamp}-{tag}.msg` (reason)
+  and `{timestamp}-{tag}.data` (the full payload built for the iteration: prefix + input
+  + suffix), sharing one `YYYYmmdd-HHMMSS-mmm` stem. `-tag` is the instance kind set in
+  `main()` (`normal` | `cmplog` | `test`, via `utils::set_instance_tag()`), so dumps from
+  concurrently running instances stay attributable; the `.msg` content and the
+  termination log line embed it as `{kind}[{tag}]: {reason}`. Dumps are best-effort and
+  never fatal.
 - Payload sent over TCP is `payload.prefix + fuzz input + payload.suffix`
   (`PayloadConfig::wrap()`); values may be `!!binary`.
+- Observability (hang triage): the proxy loop emits an INFO heartbeat every ~5 s
+  (iteration count + max connect/send/wait/probe stage times + slow-iteration
+  count, flushed) and a WARN whenever a stage reaches `network.timeout_ms`
+  (send not drained; response kept open / a `Content-Length` larger than the
+  body sent; slow probe). `wait_for_port()` logs an INFO start line and a WARN
+  on timeout; procfs cannot detect a dead target. Repeated connect/send/wait
+  errors are rate-limited (first 3, then one per 5 s with a suppressed count).
+  Run with `--log-level warn` (or `info`) to see these; `error` hides all but
+  the first few failures. Per-iteration detail stays at TRACE/DEBUG.
+- Probe failures are two-strike, never instantly fatal: `probe_target()` returns
+  a `ProbeResult` carrying the underlying `ConnectError` (kind + errno). On a
+  failed probe the proxy first classifies via `check_target_state()` — a dead
+  target ends in `crash_proxy` (SIGSEGV) / `abort_proxy` (SIGABRT) as usual; a
+  live target gets one probe retry (WARN includes the errno and a hint on
+  `EADDRNOTAVAIL`/`EMFILE`-style resource exhaustion), and only a second
+  consecutive failure aborts the proxy for the AFL respawn.
+- Iteration/probe sockets are armed with `SO_LINGER{1,0}`
+  (`network::arm_rst_on_close()`) once their data is fully read, so `close()`
+  sends RST: nothing sits in TIME_WAIT and the proxy's ephemeral port range
+  cannot be exhausted by fast fuzzing.
 - `port_detection.defork` (requires `primary: seccomp`): the target runs with a
   `bind_defork_filter` BPF (`src/process.cpp`) instead of the plain bind filter.
   It cancels every non-thread fork in-kernel: `fork`/`vfork`/`clone` without

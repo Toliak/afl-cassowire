@@ -7,9 +7,10 @@ target:
   binary: "./target"           # Path to the target binary (required)
   args: []                     # Additional arguments (binary is added automatically)
   # env_preserve: afl_only     # Parent env inheritance: "nothing", "afl_only"
-                               # (PATH, __AFL_SHM_ID, __AFL_CMPLOG_SHM_ID), or "all"
+                               # (PATH, __AFL_SHM_ID, __AFL_CMPLOG_SHM_ID,
+                               # ___AFL_EINS_ZWEI_POLIZEI___), or "all"
 
-network:
+network: &net
   host: "127.0.0.1"            # TCP host to connect to
   port: 8080                   # Port to connect to (1-65535, required)
   timeout_ms: 200              # Network send/recv timeout in milliseconds
@@ -25,8 +26,29 @@ afl:
   loop_count: 50000            # Number of __AFL_LOOP iterations
   enable_cmplog: false         # Enable AFL compare log (requires __AFL_CMPLOG_SHM_ID)
 
+target_cmplog:                 # Compare-mode target (used instead of `target` when __AFL_CMPLOG_SHM_ID is set)
+  binary: "./target-cmplog"    # Path to the compare-mode target binary (required)
+  args: []                     # Additional arguments (binary is added automatically)
+  env: {}                      # Environment variables for target
+  env_preserve: afl_only       # Parent env inheritance: "nothing", "afl_only", or "all"
+
+network_cmplog:                # Compare-mode network (used instead of `network` when __AFL_CMPLOG_SHM_ID is set)
+  host: "127.0.0.1"            # Required when afl.enable_cmplog: true. The section is standalone:
+  port: 8081                   # no key falls back to `network:` (e.g. the cmplog target may listen
+  timeout_ms: 200              # on a different port). Keys and validation are identical to
+  initial_ms: 200              # `network:` (port required 1-65535, rest optional).
+  probe: true                  # To reuse the whole section unchanged: `network_cmplog: *net`
+                               # (yaml-cpp does NOT support `<<` merge keys, so per-key overrides
+                               # require writing the full section).
+
 port_detection:
   primary: "procfs"            # Method: "procfs", "ptrace", or "seccomp"
+  # defork: false              # seccomp only: cancel every non-thread fork()/vfork()/clone()
+                               # inside the target in-kernel (SECCOMP_RET_ERRNO|0 makes the
+                               # syscall return 0 without creating a process). The target runs
+                               # de-forked: worker "child" code executes in the caller. Threads
+                               # (clone with CLONE_THREAD) are unaffected. Requires
+                               # primary: "seccomp". clone3() is not trapped.
 
 cleanup:
   force_kill_ms: 2000          # Wait time after SIGTERM before SIGKILL
