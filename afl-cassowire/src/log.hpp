@@ -42,6 +42,20 @@ namespace log {
     void init(spdlog::level::level_enum level);
 
     /**
+     * @brief Returns the recent warn/error messages captured by the logger.
+     *
+     * The "proxy" logger carries a warn-level ringbuffer sink (capacity 16)
+     * alongside the console sink; every warning/error that reaches the logger
+     * is captured there, even when the runtime --log-level hides it from
+     * stdout (the console sink applies the runtime level, the logger level is
+     * floored at warn). The history survives repeated init() calls.
+     *
+     * @return Formatted log lines (console-style pattern, each ending with a
+     *         newline), oldest first; empty if nothing was captured yet.
+     */
+    [[nodiscard]] std::vector<std::string> recent_lines();
+
+    /**
      * @brief Parses a log level name accepted by the --log-level flag.
      *
      * Accepted (case-sensitive): trace, debug, info, warn, warning, error,

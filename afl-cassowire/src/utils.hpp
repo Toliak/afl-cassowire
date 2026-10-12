@@ -112,7 +112,9 @@ namespace utils {
      * Raises SIGSEGV.
      *
      * Before raising the signal, the reason and the failing payload are dumped
-     * to the configured data directory (see set_data_dir()).
+     * to the configured data directory (see set_data_dir()). The .msg file
+     * also embeds the last warn/error messages captured by the proxy logger
+     * (log::recent_lines()) - the context that preceded the termination.
      *
      * @param message Human-readable reason for the crash.
      * @param input The full payload built for the failing iteration.
@@ -124,7 +126,9 @@ namespace utils {
      *        normally or its state is unknown). Raises SIGABRT.
      *
      * Before raising the signal, the reason and the failing payload are dumped
-     * to the configured data directory (see set_data_dir()).
+     * to the configured data directory (see set_data_dir()). The .msg file
+     * also embeds the last warn/error messages captured by the proxy logger
+     * (log::recent_lines()) - the context that preceded the termination.
      *
      * @param message Human-readable reason for the abort.
      * @param input The full payload built for the failing iteration.

@@ -50,7 +50,9 @@ Config reference: `default.yaml` (copy to `config.yaml`).
   with a structured `ConfigError` (path/message/expected/actual).
 - `src/log.{hpp,cpp}` — namespace `log`: spdlog setup (single-threaded stdout logger,
   flush on warn+), `PROXY_LOG_*` macros gated by `SPDLOG_ACTIVE_LEVEL`
-  (`-Dstrip_low_logs=true` compiles trace/debug out), `parse_level()`, `escape_bytes()`.
+  (`-Dstrip_low_logs=true` compiles trace/debug out), `parse_level()`, `escape_bytes()`,
+  and a warn-level ringbuffer sink (capacity 16) exposing `recent_lines()` for
+  termination dumps.
 - `src/process.{hpp,cpp}` — namespace `process`: stale-process cleanup, `prepare_target()` →
   `fork_target()` → `handshake_tracer()` split (prepare env/argv before `fork()`, no heap
   allocs between `fork()` and `execve()`), ptrace/seccomp arming, stdio/pipe redirection.
@@ -99,8 +101,11 @@ Config reference: `default.yaml` (copy to `config.yaml`).
   + suffix), sharing one `YYYYmmdd-HHMMSS-mmm` stem. `-tag` is the instance kind set in
   `main()` (`normal` | `cmplog` | `test`, via `utils::set_instance_tag()`), so dumps from
   concurrently running instances stay attributable; the `.msg` content and the
-  termination log line embed it as `{kind}[{tag}]: {reason}`. Dumps are best-effort and
-  never fatal.
+  termination log line embed it as `{kind}[{tag}]: {reason}`. The `.msg` additionally
+  embeds the last ≤16 warn/error lines (oldest first, console-style timestamps) captured
+  by the logger's ring sink (`log::recent_lines()`); capture is independent of
+  `--log-level` (logger level is floored at warn, the console sink applies the runtime
+  level), so quiet runs still produce rich dumps. Dumps are best-effort and never fatal.
 - Payload sent over TCP is `payload.prefix + fuzz input + payload.suffix`
   (`PayloadConfig::wrap()`); values may be `!!binary`.
 - Observability (hang triage): the proxy loop emits an INFO heartbeat every ~5 s

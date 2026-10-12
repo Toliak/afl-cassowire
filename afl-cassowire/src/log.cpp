@@ -2,6 +2,7 @@
 
 #include "log.hpp"
 
+#include <spdlog/sinks/ringbuffer_sink.h>
 #include <spdlog/sinks/stdout_color_sinks.h>
 
 #include <algorithm>
@@ -12,18 +13,45 @@
 
 namespace log {
 
+    namespace {
+
+        // Capacity of the warn/error ring sink: the last 16 captured lines
+        // are embedded into termination dumps (.msg) by utils::terminate_proxy().
+        constexpr size_t k_recent_capacity = 16;
+
+        // Created on the first init() and reused afterwards so that the
+        // second init(--log-level) does not wipe the captured history.
+        std::shared_ptr<spdlog::sinks::ringbuffer_sink_st> g_recent_sink;
+
+    } // namespace
+
     void init(spdlog::level::level_enum level) {
         // The logger is constructed manually (not via the stdout_color_st
         // factory) so that init() is idempotent: the factory would try to
         // register the name "proxy" in the global registry on every call and
         // throw spdlog_ex on the second one (main() calls init() twice: once
         // with defaults, once after parsing --log-level).
-        auto sink = std::make_shared<spdlog::sinks::stdout_color_sink_st>();
-        auto logger = std::make_shared<spdlog::logger>("proxy", std::move(sink));
+        if (!g_recent_sink) {
+            g_recent_sink = std::make_shared<spdlog::sinks::ringbuffer_sink_st>(k_recent_capacity);
+            g_recent_sink->set_level(spdlog::level::warn);
+        }
+        auto console_sink = std::make_shared<spdlog::sinks::stdout_color_sink_st>();
+        // The console sink applies the runtime --log-level; the logger level
+        // is floored at warn so that the ring sink keeps capturing warnings
+        // even when the runtime level hides them from stdout (warn/error are
+        // rare and throttled, so the extra formatting is negligible).
+        console_sink->set_level(level);
+        auto logger = std::make_shared<spdlog::logger>(
+            "proxy", spdlog::sinks_init_list{std::move(console_sink), g_recent_sink});
         logger->set_pattern("[%Y-%m-%d %H:%M:%S.%e] [%l] %v");
         logger->flush_on(spdlog::level::warn);
-        logger->set_level(level);
+        logger->set_level(std::min(level, spdlog::level::warn));
         spdlog::set_default_logger(std::move(logger));
+    }
+
+    std::vector<std::string> recent_lines() {
+        if (!g_recent_sink) return {};
+        return g_recent_sink->last_formatted();
     }
 
     std::optional<spdlog::level::level_enum> parse_level(std::string_view name) {

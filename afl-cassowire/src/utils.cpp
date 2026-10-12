@@ -49,6 +49,11 @@ std::string g_data_dir = "afl-cassowire-data";
 // set_instance_tag()).
 std::string g_instance_tag;
 
+// Maximum number of bytes of a captured warn/error history line embedded into
+// the .msg file. History lines are short in practice (repeated per-iteration
+// failures are throttled by the callers); the cap is purely defensive.
+constexpr size_t k_recent_line_cap = 2048;
+
 // Creates g_data_dir recursively. Best-effort: a failure is logged but never
 // aborts the dump attempt (or the process).
 void ensure_data_dir() {
@@ -150,6 +155,24 @@ void dump_termination_data(std::string_view kind, std::string_view message,
         msg += "[" + g_instance_tag + "]";
     }
     msg += ": " + std::string(message) + "\n";
+
+    // Embed the recent warn/error history (oldest first, captured by the
+    // logger's ring sink) so the dump carries the context that preceded the
+    // termination. The final termination line itself is deliberately not part
+    // of the history - it is the reason line above.
+    const std::vector<std::string> recent = log::recent_lines();
+    if (!recent.empty()) {
+        msg += "\n--- last warn/error lines (oldest first) ---\n";
+        for (const std::string& line : recent) {
+            msg += line.substr(0, k_recent_line_cap);
+            if (line.size() > k_recent_line_cap) {
+                msg += "...";
+            }
+            if (msg.back() != '\n') {
+                msg += '\n';
+            }
+        }
+    }
     write_named_file(stem + ".msg", msg.data(), msg.size());
 
     PROXY_LOG_INFO("termination dump written: {}.msg / {}.data", stem, stem);
