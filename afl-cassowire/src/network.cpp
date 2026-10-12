@@ -317,8 +317,10 @@ ConnectResult connect_target(const NetworkConfig& net_cfg) {
     // TODO(claude): (1) the socket is switched back to BLOCKING mode after connect, so send_all()'s timeout
     //   is not enforced: send() can block forever if the target stops reading (the EAGAIN/poll branch in
     //   send_all is dead code). Keep O_NONBLOCK or set SO_SNDTIMEO.
-    //   (2) Thousands of iterations/s create thousands of TIME_WAIT sockets on the client side; consider
-    //   SO_LINGER{1,0} (RST on close) to avoid ephemeral-port exhaustion. Also no TCP_NODELAY / SOCK_CLOEXEC.
+    //   (2) RESOLVED: thousands of iterations/s used to create thousands of TIME_WAIT sockets on the client
+    //       side, eventually exhausting the ephemeral port range (connect fails with EADDRNOTAVAIL). Callers
+    //       now arm SO_LINGER{1,0} via arm_rst_on_close() before dropping the socket, so close() sends RST
+    //       and nothing sits in TIME_WAIT. Also no TCP_NODELAY / SOCK_CLOEXEC.
     //   (3) Only AF_INET + inet_pton is supported; host "localhost"/IPv6 (accepted by config.cpp) fails.
     //   (4) poll() returning -1/EINTR is treated as a connect failure.
     //   (5) The second fcntl() per successful connect (restore of blocking mode) is intentionally left
@@ -471,17 +473,20 @@ std::string probe_outcome_to_string(ProbeOutcome outcome) {
     return "Unknown";
 }
 
-ProbeOutcome probe_target(const NetworkConfig& net_cfg) {
+ProbeResult probe_target(const NetworkConfig& net_cfg) {
     auto conn = connect_target(net_cfg);
     if (std::holds_alternative<ConnectError>(conn)) {
         const ConnectError& err = std::get<ConnectError>(conn);
         // ECONNREFUSED means no listening socket: the target process died, or
         // its listener is gone for other reasons (rate limit, one-shot server).
+        // Everything else is a client-side failure (e.g. EADDRNOTAVAIL on
+        // ephemeral port exhaustion, EMFILE on fd exhaustion); the errno is
+        // propagated in the result so the caller can tell the two apart.
         // Classification is the caller's job (check_target_state()).
         if (err.kind == ConnectError::Kind::ConnectFailed && err.sys_errno == ECONNREFUSED) {
-            return ProbeOutcome::Refused;
+            return ProbeResult{ProbeOutcome::Refused, err};
         }
-        return ProbeOutcome::Failed;
+        return ProbeResult{ProbeOutcome::Failed, err};
     }
     utils::FdGuard sock = std::get<utils::FdGuard>(std::move(conn));
 
@@ -494,6 +499,9 @@ ProbeOutcome probe_target(const NetworkConfig& net_cfg) {
     // means the peer already reset (still a serviced connection), and anything
     // else surfaces at poll() time.
     (void)shutdown(sock.get(), SHUT_WR);
+    // The probe socket is throwaway: abandon it with RST instead of FIN so it
+    // never pins an ephemeral port in TIME_WAIT (see arm_rst_on_close).
+    arm_rst_on_close(sock.get());
 
     // Wait until the target services the probe connection. connect() alone
     // proves nothing (the kernel backlog accepts it), but nothing makes an
@@ -507,7 +515,7 @@ ProbeOutcome probe_target(const NetworkConfig& net_cfg) {
     while (true) {
         int remaining = net_cfg.timeout_ms - (int)(utils::get_time_ms() - start);
         PROXY_LOG_TRACE("probe_target remaining={}", remaining);
-        if (remaining <= 0) return ProbeOutcome::Timeout;
+        if (remaining <= 0) return ProbeResult{ProbeOutcome::Timeout, std::nullopt};
 
         struct pollfd pfd;
         pfd.fd = sock.get();
@@ -517,7 +525,8 @@ ProbeOutcome probe_target(const NetworkConfig& net_cfg) {
         PROXY_LOG_TRACE("probe_target poll_res={}", poll_res);
         if (poll_res < 0) {
             if (errno == EINTR) continue;
-            return ProbeOutcome::Failed;
+            return ProbeResult{ProbeOutcome::Failed,
+                               ConnectError{ConnectError::Kind::PollFailed, errno}};
         }
         if (poll_res == 0) {
             // Release a pending ptrace stop (transparent tracer): a stopped target
@@ -525,8 +534,16 @@ ProbeOutcome probe_target(const NetworkConfig& net_cfg) {
             process::pump_transparent_tracer();
             continue; // poll timeout; the loop top re-checks the overall deadline
         }
-        return ProbeOutcome::Serviced;
+        return ProbeResult{ProbeOutcome::Serviced, std::nullopt};
     }
+}
+
+void arm_rst_on_close(int sock) {
+    struct linger lg;
+    lg.l_onoff = 1;  // enable SO_LINGER
+    lg.l_linger = 0; // zero grace: close() discards and sends RST
+    // Best-effort: on failure the next close() keeps its normal FIN semantics.
+    (void)setsockopt(sock, SOL_SOCKET, SO_LINGER, &lg, sizeof(lg));
 }
 
 } // namespace network

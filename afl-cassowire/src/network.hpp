@@ -6,6 +6,7 @@
 #include "utils.hpp"
 #include <sys/types.h>
 #include <cstdint>
+#include <optional>
 #include <string>
 #include <variant>
 #include <vector>
@@ -177,6 +178,18 @@ namespace network {
     };
 
     /**
+     * @brief probe_target() result: the outcome plus the underlying
+     *        ConnectError (kind + errno) for Refused/Failed, so the caller
+     *        can tell a gone listener (ECONNREFUSED) apart from client-side
+     *        failures (e.g. EADDRNOTAVAIL on ephemeral port exhaustion,
+     *        EMFILE on fd exhaustion). Empty for Serviced/Timeout.
+     */
+    struct ProbeResult {
+        ProbeOutcome outcome;
+        std::optional<ConnectError> error; ///< populated for Refused and Failed
+    };
+
+    /**
      * @brief Post-response quiescence probe: checks that the target has finished
      *        handling the previous request.
      *
@@ -206,14 +219,28 @@ namespace network {
      * they send their greeting, before reading EOF.
      *
      * @param net_cfg The network configuration (host, port, timeout_ms).
-     * @return ProbeOutcome Serviced, Refused, Timeout, or Failed. All outcomes
-     *         are non-fatal; interpretation is up to the caller.
+     * @return ProbeResult Serviced, Refused, Timeout, or Failed with the
+     *         underlying connect error (see ProbeResult). All outcomes are
+     *         non-fatal; interpretation is up to the caller.
      */
-    [[nodiscard]] ProbeOutcome probe_target(const NetworkConfig& net_cfg);
+    [[nodiscard]] ProbeResult probe_target(const NetworkConfig& net_cfg);
 
     /**
      * @brief Convert a ProbeOutcome to its string representation.
      */
     [[nodiscard]] std::string probe_outcome_to_string(ProbeOutcome outcome);
+
+    /**
+     * @brief Arms "RST on close" for a client socket (SO_LINGER with a zero
+     *        timeout): close() then sends RST instead of FIN, so the local
+     *        endpoint never enters TIME_WAIT and no ephemeral port is pinned
+     *        for ~2 minutes. Only safe once the caller is done with the
+     *        socket (all wanted data already read): the RST discards anything
+     *        still unread or in flight. Best-effort: a failure is ignored and
+     *        the next close() keeps its normal FIN semantics.
+     *
+     * @param sock The socket file descriptor.
+     */
+    void arm_rst_on_close(int sock);
 
 } // namespace network

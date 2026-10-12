@@ -145,6 +145,7 @@ struct IterationStats {
     log::Throttle connect_err{3, 5000};
     log::Throttle send_err{3, 5000};
     log::Throttle wait_err{3, 5000};
+    log::Throttle probe_err{3, 5000};
 };
 
 /// Emit at most one INFO iteration summary per this interval.
@@ -173,6 +174,23 @@ static void update_iteration_stats(IterationStats& stats, uint64_t connect_ms,
         spdlog::default_logger()->flush();
         stats.last_heartbeat_ms = now_ms;
     }
+}
+
+/// Human-readable hint appended to probe-failure WARNs when the underlying
+/// connect error points at proxy-side resource exhaustion instead of a target
+/// problem (empty string otherwise).
+static std::string probe_exhaustion_hint(const network::ProbeResult& pr) {
+    if (!pr.error) return "";
+    const int e = pr.error->sys_errno;
+    if (pr.error->kind == network::ConnectError::Kind::SocketCreate && (e == EMFILE || e == ENFILE)) {
+        return " (socket()/fd exhaustion on the proxy side; check ulimit -n)";
+    }
+    if (pr.error->kind == network::ConnectError::Kind::ConnectFailed &&
+        (e == EADDRNOTAVAIL || e == EAGAIN || e == ENOBUFS || e == ENOMEM)) {
+        return " (likely proxy-side ephemeral port exhaustion; check `ss -s`, "
+               "net.ipv4.ip_local_port_range, tcp_tw_reuse)";
+    }
+    return "";
 }
 
 /**
@@ -233,6 +251,12 @@ ExchangeOutcome exchange_once(const Config& cfg, const uint8_t* input, size_t in
         out.response = std::get<std::vector<uint8_t>>(std::move(wait_res));
     }
     out.wait_ms = utils::get_time_ms() - t_stage;
+    // The response is fully read (or the wait gave up), so nothing wanted can
+    // be lost: turn the upcoming close() into an RST so this socket does not
+    // sit in TIME_WAIT for ~2 minutes pinning one ephemeral port. At thousands
+    // of iterations/s that accumulation used to exhaust the local port range
+    // and made later connect()s (including the probe) fail with EADDRNOTAVAIL.
+    network::arm_rst_on_close(sock.get());
     process::pump_transparent_tracer();
     return out;
 }
@@ -348,29 +372,80 @@ void run_fuzz_iteration(const Config& cfg, pid_t child_pid, int target_pidfd,
     // cleanup included). If the target died during that cleanup, the probe
     // socket gets RST (also "readable"), and the health check below sees the
     // dying flags in the same iteration, so the crash stays attributed to the
-    // input that caused it. The probe itself never decides: classification is
-    // done by check_target_state() below.
+    // input that caused it.
+    //
+    // Two-strike failure handling: a failed probe never decides by itself -
+    // check_target_state() classifies. If the target is dead, the
+    // classification terminates the proxy right here with the right signal
+    // (SIGSEGV for a crash, SIGABRT for a clean/unknown exit). If the target
+    // is alive, the failure was likely transient, so the probe runs once
+    // more; only a second consecutive failure aborts the proxy so AFL
+    // respawns it. (The old single-shot abort killed the whole run on purely
+    // local errors, e.g. EADDRNOTAVAIL from ephemeral port exhaustion.)
     uint64_t probe_ms = 0;
     if (cfg.network.probe) {
         uint64_t t_probe = utils::get_time_ms();
         auto pr = network::probe_target(cfg.network);
         probe_ms = utils::get_time_ms() - t_probe;
-        switch (pr) {
-            case network::ProbeOutcome::Refused:
-            case network::ProbeOutcome::Timeout:
-            case network::ProbeOutcome::Failed:
-                PROXY_LOG_WARN("probe connection {} after {} ms (timeout {} ms) - target listener is gone",
-                               network::probe_outcome_to_string(pr), probe_ms, budget_ms);
-                utils::abort_proxy("probe connection " + network::probe_outcome_to_string(pr) +
-                                       " after " + std::to_string(probe_ms) + " ms - target listener is gone",
+
+        if (pr.outcome != network::ProbeOutcome::Serviced) {
+            const uint64_t first_ms = probe_ms;
+            const auto first_outcome = pr.outcome;
+
+            // First strike: classify the target before deciding anything.
+            auto st = process::check_target_state(child_pid, target_pidfd, cfg.cleanup.force_kill_ms);
+            switch (st.kind) {
+            case process::TargetState::Kind::Crashed:
+                PROXY_LOG_WARN("target {} after probe failure ({}), crashing the proxy so AFL records the finding",
+                               st.to_string(), network::probe_outcome_to_string(pr.outcome));
+                utils::crash_proxy("target " + st.to_string() + " after probe failure ("
+                                       + network::probe_outcome_to_string(pr.outcome) + ")",
                                    payload_buf);
                 break;
-            case network::ProbeOutcome::Serviced:
-                // ok just continue
+            case process::TargetState::Kind::Exited:
+            case process::TargetState::Kind::Unknown:
+                PROXY_LOG_WARN("target {} after probe failure ({}), aborting the proxy so AFL respawns it",
+                               st.to_string(), network::probe_outcome_to_string(pr.outcome));
+                utils::abort_proxy("target " + st.to_string() + " after probe failure ("
+                                       + network::probe_outcome_to_string(pr.outcome) + ")",
+                                   payload_buf);
                 break;
+            case process::TargetState::Kind::Alive:
+                break; // transient failure, handled below (retry once)
+            }
+
+            if (stats.probe_err.allow()) {
+                PROXY_LOG_WARN("probe connection {} after {} ms (timeout {} ms) against a live target{}{}{}",
+                               network::probe_outcome_to_string(pr.outcome), first_ms, budget_ms,
+                               pr.error ? ": " + pr.error->to_string() : std::string(),
+                               probe_exhaustion_hint(pr),
+                               log::throttle_suffix(stats.probe_err));
+            }
+
+            // Second strike: the same probe again. Serviced -> the first
+            // failure was transient, keep fuzzing; anything else -> the
+            // listener is persistently unavailable, respawn via AFL.
+            t_probe = utils::get_time_ms();
+            pr = network::probe_target(cfg.network);
+            probe_ms += utils::get_time_ms() - t_probe;
+
+            if (pr.outcome == network::ProbeOutcome::Serviced) {
+                PROXY_LOG_INFO("probe recovered on retry after {} ms total", probe_ms);
+            } else {
+                std::string err_detail = pr.error ? ": " + pr.error->to_string() : std::string();
+                PROXY_LOG_WARN("probe connection {} twice in one iteration ({} ms total; "
+                               "first attempt: {} after {} ms){} - target listener is gone",
+                               network::probe_outcome_to_string(pr.outcome), probe_ms,
+                               network::probe_outcome_to_string(first_outcome), first_ms,
+                               err_detail);
+                utils::abort_proxy("probe connection " + network::probe_outcome_to_string(pr.outcome)
+                                       + " twice in one iteration (total " + std::to_string(probe_ms)
+                                       + " ms" + err_detail + ") - target listener is gone",
+                                   payload_buf);
+            }
         }
 
-        PROXY_LOG_TRACE("probe: {} ({} ms)", network::probe_outcome_to_string(pr), probe_ms);
+        PROXY_LOG_TRACE("probe: {} ({} ms)", network::probe_outcome_to_string(pr.outcome), probe_ms);
         if (probe_ms >= budget_ms) {
             PROXY_LOG_WARN("probe took {} ms (>= timeout {} ms)", probe_ms, budget_ms);
         }
@@ -724,6 +799,15 @@ int main(int argc, char* argv[]) {
 
     // Destination for crash/abort termination dumps (.msg/.data).
     utils::set_data_dir(parsed.data_dir);
+
+    // Tag termination dumps and their log lines with the instance kind: the
+    // normal and the cmplog proxy can run concurrently against the same data
+    // dir, so their dumps must stay attributable.
+    if (parsed.is_test_mode) {
+        utils::set_instance_tag("test");
+    } else {
+        utils::set_instance_tag(getenv("__AFL_CMPLOG_SHM_ID") ? "cmplog" : "normal");
+    }
 
     // Load Configuration
     auto config_res = load_config(parsed.config_path);
