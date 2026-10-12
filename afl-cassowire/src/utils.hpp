@@ -93,6 +93,21 @@ namespace utils {
     void set_data_dir(std::string dir);
 
     /**
+     * @brief Sets the instance tag embedded into termination dumps.
+     *
+     * The tag identifies which proxy instance produced a dump ("normal",
+     * "cmplog", or "test"): it is appended to the dump file stem
+     * ("<timestamp>-<tag>.msg/.data") and embedded into the .msg content and
+     * the termination log line ("<kind>[<tag>]: <reason>"). The normal and the
+     * cmplog proxy can run concurrently against the same data dir, so dumps
+     * stay attributable. An empty tag (the default) keeps the plain
+     * "<timestamp>" stem and the "<kind>: <reason>" format.
+     *
+     * @param tag Instance tag ("" disables tagging).
+     */
+    void set_instance_tag(std::string tag);
+
+    /**
      * @brief Crashes the proxy intentionally (e.g., to trigger AFL respawn).
      * Raises SIGSEGV.
      *
