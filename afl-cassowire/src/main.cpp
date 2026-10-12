@@ -422,6 +422,11 @@ void run_fuzz_iteration(const Config& cfg, pid_t child_pid, int target_pidfd,
                                log::throttle_suffix(stats.probe_err));
             }
 
+            // Apply retry delay if configured
+            if (cfg.network.probe_retry_ms > 0) {
+                utils::sleep_ms(cfg.network.probe_retry_ms);
+            }
+
             // Second strike: the same probe again. Serviced -> the first
             // failure was transient, keep fuzzing; anything else -> the
             // listener is persistently unavailable, respawn via AFL.

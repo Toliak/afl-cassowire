@@ -16,11 +16,13 @@ network: &net
   timeout_ms: 200              # Network send/recv timeout in milliseconds
   initial_ms: 200              # Port detection timeout in milliseconds
   probe: true                  # Post-response quiescence probe: after each response,
-                               # open a throwaway connection and wait until the target
-                               # services it (data/EOF/RST). Catches crashes in
-                               # post-response cleanup within the same iteration.
-                               # Disable for targets that rate-limit connections or
-                               # cannot tolerate an extra short-lived connection.
+                                # open a throwaway connection and wait until the target
+                                 # services it (data/EOF/RST). Catches crashes in
+                                 # post-response cleanup within the same iteration.
+                                 # Disable for targets that rate-limit connections or
+                                 # cannot tolerate an extra short-lived connection.
+  probe_retry_ms: 5            # Delay in milliseconds between probe retries when the
+                                 # first probe fails. Set to 0 for no delay (current behavior).
 
 afl:
   loop_count: 50000            # Number of __AFL_LOOP iterations
@@ -38,8 +40,10 @@ network_cmplog:                # Compare-mode network (used instead of `network`
   timeout_ms: 200              # on a different port). Keys and validation are identical to
   initial_ms: 200              # `network:` (port required 1-65535, rest optional).
   probe: true                  # To reuse the whole section unchanged: `network_cmplog: *net`
-                               # (yaml-cpp does NOT support `<<` merge keys, so per-key overrides
-                               # require writing the full section).
+                                 # (yaml-cpp does NOT support `<<` merge keys, so per-key overrides
+                                 # require writing the full section).
+  probe_retry_ms: 5            # Delay in milliseconds between probe retries when the
+                                 # first probe fails. Set to 0 for no delay (current behavior).
 
 port_detection:
   primary: "procfs"            # Method: "procfs", "ptrace", or "seccomp"

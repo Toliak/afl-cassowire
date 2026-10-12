@@ -125,7 +125,7 @@ ConfigError parse_target_section(const YAML::Node& node, const std::string& pref
 // Sections are standalone: no values are inherited from any other section.
 // Returns a ConfigError with an empty message on success.
 ConfigError parse_network_section(const YAML::Node& node, const std::string& prefix, NetworkConfig& out) {
-    static const std::unordered_set<std::string> network_allowed = {"host", "port", "timeout_ms", "initial_ms", "probe"};
+    static const std::unordered_set<std::string> network_allowed = {"host", "port", "timeout_ms", "initial_ms", "probe", "probe_retry_ms"};
     ConfigError err = check_unknown_keys(node, network_allowed, prefix);
     if (!err.message.empty()) {
         return err;
@@ -177,6 +177,17 @@ ConfigError parse_network_section(const YAML::Node& node, const std::string& pre
             out.probe = node["probe"].as<bool>();
         } catch (const YAML::BadConversion&) {
             return ConfigError{prefix + ".probe", "Invalid type", "boolean", node["probe"].Scalar()};
+        }
+    }
+
+    if (node["probe_retry_ms"]) {
+        try {
+            out.probe_retry_ms = node["probe_retry_ms"].as<int>();
+            if (out.probe_retry_ms < 0) {
+                return ConfigError{prefix + ".probe_retry_ms", "Must be >= 0", "integer >= 0", std::to_string(out.probe_retry_ms)};
+            }
+        } catch (const YAML::BadConversion&) {
+            return ConfigError{prefix + ".probe_retry_ms", "Invalid type", "integer >= 0", node["probe_retry_ms"].Scalar()};
         }
     }
 
