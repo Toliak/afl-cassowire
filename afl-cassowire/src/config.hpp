@@ -43,8 +43,8 @@ struct NetworkConfig {
     // cannot tolerate an extra short-lived connection per iteration.
     bool probe = true;
     // Delay in milliseconds between probe retries when the first probe fails.
-    // Set to 0 for no delay (current behavior).
-    int probe_retry_ms = 0;
+    // Set to 0 for no delay.
+    int probe_retry_ms = 5;
 };
 
 struct AflConfig {
