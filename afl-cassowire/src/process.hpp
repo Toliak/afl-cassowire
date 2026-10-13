@@ -66,11 +66,14 @@ namespace process {
     };
 
     /**
-     * @brief Result of fork_target(): the child PID and, for MapSizePass, the read end of the pipe.
+     * @brief Result of fork_target(): the child PID, the map-size pipe (Pass 1),
+     *        and the seccomp notification listener fd when applicable.
      */
     struct SpawnedTarget {
         pid_t pid = -1;                   // -1 indicates failure
         int map_size_fd = -1;             // read end of the pipe for map size; -1 otherwise
+        int notif_fd = -1;                // SECCOMP_RET_USER_NOTIF listener for the target;
+                                          // -1 when port_detection.primary != "seccomp"
     };
 
     /**
@@ -83,7 +86,8 @@ namespace process {
     std::optional<TargetPrepared> prepare_target(const Config& cfg, SpawnMode mode);
 
     /**
-     * @brief Fork the child process, set up its file descriptors and process group, then arm ptrace/seccomp.
+     * @brief Fork the child process, set up its file descriptors and process group,
+     *        and (in seccomp mode) hand the target's notification listener to the parent.
      *
      * The child never returns; on success it execve()s the target binary.
      *
@@ -93,6 +97,15 @@ namespace process {
      * its stdout is a pipe carrying the map size and its stderr goes to
      * /dev/null.
      *
+     * With port_detection.primary == "seccomp" (every mode except MapSizePass,
+     * which performs no port detection) the child installs the bind()/listen()
+     * SECCOMP_RET_USER_NOTIF filter (SECCOMP_FILTER_FLAG_NEW_LISTENER) before
+     * execve(), passes the returned listener fd to the parent over a private
+     * socketpair via SCM_RIGHTS, and waits for a 1-byte ack; the parent returns
+     * with SpawnedTarget::notif_fd set (non-blocking, owned by the caller). No
+     * ptrace is involved. A failed handshake kills+reaps the child and returns
+     * pid == -1.
+     *
      * @param cfg global configuration
      * @param prep output from prepare_target()
      * @param mode selects redirection rules and other mode-specific behavior
@@ -100,55 +113,12 @@ namespace process {
      *                       descriptors (--child-output flag) instead of /dev/null
      * @param publish_pid if non-null, written with the child's PID before any blocking operation
      *                    (intended for g_child_pid in main.cpp to make signal handlers safe)
-     * @return SpawnedTarget containing the child PID and, for MapSizePass, the pipe file descriptor
-     *         (caller must close map_size_fd after use). On failure, pid == -1.
+     * @return SpawnedTarget containing the child PID, the map-size pipe fd for
+     *         MapSizePass (caller must close it after use), and the seccomp
+     *         notification listener fd in seccomp mode. On failure, pid == -1.
      */
     SpawnedTarget fork_target(const Config& cfg, const TargetPrepared& prep, SpawnMode mode,
                               bool forward_output, volatile sig_atomic_t* publish_pid);
-
-    /**
-     * @brief Parent-side tracer handshake after fork_target().
-     * 
-     * Blocks until the child stops via SIGSTOP (from arm_tracer()), then configures
-     * ptrace options and resumes the child with PTRACE_CONT.
-     * 
-     * @param pid child process ID (must match the value returned by fork_target())
-     * @param cfg global configuration (needed for port_detection.primary)
-     */
-    void handshake_tracer(pid_t pid, const Config& cfg);
-
-    /**
-     * @brief Remember the target that stays traced after startup ("transparent tracer").
-     *
-     * In seccomp port-detection mode the tracer does not detach once readiness is
-     * detected: the installed BPF filter is unremovable, and a SECCOMP_RET_TRACE
-     * notification with no attached tracer fails the syscall with ENOSYS. Keeping
-     * the tracer attached and resuming every seccomp stop with PTRACE_CONT lets any
-     * later bind()/listen() in the target execute normally.
-     *
-     * The remembered pid also makes the pump callable from poll loops in other
-     * translation units (network.cpp) without threading target pids through them.
-     *
-     * @param pid The traced target pid, or 0 to disable the pump.
-     */
-    void set_transparent_tracer(pid_t pid);
-
-    /**
-     * @brief Drain pending ptrace stops of the transparent-traced target.
-     *
-     * No-op unless a pid was registered with set_transparent_tracer(). Consumes
-     * waitpid(WNOHANG) events until none remain. The resume policy matches
-     * wait_target_exit(): seccomp stops (SIGTRAP + event), syscall stops
-     * (SIGTRAP|0x80) and group-stops/SIGSTOP are dropped with signal 0, any other
-     * stop signal is re-injected so fatal signals still kill the target. Death
-     * events are consumed silently: the health check classifies via pidfd and
-     * /proc flags, and cleanup paths tolerate ECHILD afterwards.
-     *
-     * Call at bounded intervals (e.g. in poll-timeout re-checks) - a pending
-     * ptrace stop blocks the target inside the kernel, so every network
-     * operation against it stalls until the pump resumes it.
-     */
-    void pump_transparent_tracer();
 
     /**
      * @brief Result of wait_target_exit().
@@ -159,23 +129,15 @@ namespace process {
     };
 
     /**
-     * @brief Wait for the target to exit, resuming it through any ptrace stops.
-     *
-     * After handshake_tracer() resumes the child, a traced target stops again on
-     * every ptrace event - most importantly the unconditional SIGTRAP exec stop -
-     * and on delivered signals. A bare blocking waitpid() therefore returns while
-     * the child is still alive (frozen at execve, before the AFL runtime has run),
-     * which deadlocks callers that then block on the child's output.
+     * @brief Wait (bounded) for the target child to exit.
      *
      * Polls waitpid(WNOHANG) with a short sleep so @p timeout_ms is always
-     * enforced. Ptrace stops are resumed with PTRACE_CONT: SIGTRAP, SIGTRAP|0x80
-     * and SIGSTOP are dropped (resume with signal 0), any other signal is
-     * re-injected so fatal signals still kill the target. On timeout the tracee
-     * is detached (PTRACE_DETACH, errors ignored) so the caller's SIGTERM/SIGKILL
-     * cleanup is not swallowed by ptrace.
+     * enforced; the target is NOT killed here. The child is never ptraced
+     * anymore, so waitpid cannot report ptrace stops (WUNTRACED is not set and
+     * group-stops are not observed).
      *
      * @param pid Target pid (must be our direct child).
-     * @param timeout_ms Upper bound on the total wait; the target is NOT killed here.
+     * @param timeout_ms Upper bound on the total wait.
      * @return TargetExit with exited == true and the raw status when the child died;
      *         exited == false on timeout, waitpid failure, or a non-child pid (ECHILD).
      */

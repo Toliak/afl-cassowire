@@ -18,7 +18,7 @@ namespace network {
      */
     struct DetectError {
         enum class Kind {
-            TimedOut,      ///< initial_ms elapsed without seeing the configured port bound and listened (procfs with verify_ownership: the port listened but was held by a non-target process)
+            TimedOut,      ///< initial_ms elapsed without seeing the configured port bound and listened (procfs with verify_ownership: the port listened but was held by a non-target process; seccomp: the listen notification never confirmed in /proc)
             TargetDied,    ///< target exited or was signalled during startup (wait_status holds the waitpid status)
             WaitpidFailed, ///< waitpid() failed (sys_errno holds errno)
             UnknownMethod, ///< port_detection.primary is not a known method
@@ -39,13 +39,20 @@ namespace network {
 
     /**
      * @brief Waits for the target process to bind and listen on the configured port.
-     * Uses the method specified in port_detection.primary (procfs, ptrace, seccomp).
-     * The ptrace/seccomp methods declare readiness on a successful listen() exit on
-     * the fd bound to the configured port (fd tracked from bind stops). In seccomp
-     * mode the tracer does NOT detach on success (the seccomp filter is
-     * unremovable): it stays attached and resumes every seccomp stop with
-     * PTRACE_CONT so later bind()/listen() in the target execute normally
-     * ("transparent tracer"; enable the pump with process::set_transparent_tracer()).
+     * Uses the method specified in port_detection.primary ("procfs" | "seccomp").
+     *
+     * The seccomp method consumes the target's SECCOMP_RET_USER_NOTIF listener
+     * fd (@p notif_fd, installed before the target's execve in fork_target and
+     * passed back via SCM_RIGHTS). Notifications arrive for bind()/listen()
+     * issued by ANY thread or forked descendant of the target tree (the filter
+     * is inherited; no ptrace is involved), including a QEMU guest's workers.
+     * A bind notification records fd -> port (sockaddr read with
+     * process_vm_readv on the notifying tid); a listen notification on an fd
+     * bound to the configured port triggers a bounded (~100 ms) /proc/net/tcp
+     * confirmation scan, because user notifications carry syscall ENTRY only
+     * and have no exit value to prove success. Every pending notification is
+     * answered with CONTINUE before returning, and the pump below keeps the
+     * (irremovable) filter usable for the target's whole life.
      *
      * The procfs method polls /proc/net/tcp{,6} for a LISTEN entry on the
      * configured port and additionally (port_detection.verify_ownership, default
@@ -55,19 +62,41 @@ namespace network {
      * false-positive. A setuid-style target with an unreadable fd dir
      * (EACCES/EPERM) is accepted unverified with a WARN. Every poll pass also
      * checks waitpid(WNOHANG), so a target that dies during startup reports
-     * TargetDied instead of a silent initial_ms stall (the zombie is reaped
-     * here, like the ptrace/seccomp death path).
+     * TargetDied instead of a silent initial_ms stall (both methods reap the
+     * zombie here on that path; callers must not waitpid the target afterwards).
      *
      * @param target_pid The PID of the target process.
      * @param cfg The global configuration.
-     * @param tracer_attached Optional out-param; set to true when the tracer was
-     *        left attached to the target after successful detection (seccomp mode
-     *        only). The caller should then enable process::set_transparent_tracer().
+     * @param notif_fd The seccomp listener fd from SpawnedTarget::notif_fd;
+     *        ignored by procfs, required by seccomp (UnknownMethod if < 0).
      * @return DetectResult Success if the port was successfully detected within
      *         initial_ms, otherwise a DetectError explaining what happened.
      */
-    [[nodiscard]] DetectResult wait_for_port(pid_t target_pid, const Config& cfg,
-                                             bool* tracer_attached = nullptr);
+    [[nodiscard]] DetectResult wait_for_port(pid_t target_pid, const Config& cfg, int notif_fd);
+
+    /**
+     * @brief Register the target's seccomp notification listener for the
+     *        steady-state pump (call after successful port detection).
+     *
+     * The bind/listen notification filter installed before the target's
+     * execve() is irremovable and inherited by all its threads and descendants,
+     * so notifications keep arriving for the target's whole life (reloads,
+     * per-worker reuseport binds, QEMU guest workers). Every pending
+     * notification must be answered or the issuing task sleeps in the kernel
+     * forever. Pass -1 to disable the pump.
+     */
+    void set_notif_listener(int fd);
+
+    /**
+     * @brief Drain and release pending seccomp notifications (non-blocking).
+     *
+     * No-op unless a listener fd was registered with set_notif_listener().
+     * Answers every queued notification with SECCOMP_USER_NOTIF_FLAG_CONTINUE
+     * so the syscall runs normally. Call at bounded intervals (poll-timeout
+     * re-checks and between exchange stages): a notified task is suspended
+     * until pumped, so the worst-case target stall is one poll leg.
+     */
+    void pump_notif_listener();
 
     /**
      * @brief Reason why connect_target() could not establish a connection.

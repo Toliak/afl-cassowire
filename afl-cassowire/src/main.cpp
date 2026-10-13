@@ -18,7 +18,6 @@
 #include <unistd.h>
 #include <fcntl.h>
 #include <sys/wait.h>
-#include <sys/ptrace.h>
 #include <sys/types.h>
 #include <sys/stat.h>
 #include <time.h>
@@ -54,23 +53,11 @@ void timed_kill_pgid(pid_t pgid, int ms) {
 
     while (true) {
         int status;
-        // Check if the process group leader has exited
+        // Check if the process group leader has exited. The target is never
+        // ptraced, so waitpid(WNOHANG) without WUNTRACED reports real death
+        // only; nothing else can make this loop spin early.
         pid_t res = waitpid(pgid, &status, WNOHANG);
         if (res == pgid) {
-            if (WIFSTOPPED(status)) {
-                // A traced target (transparent tracer, seccomp mode) takes the
-                // SIGTERM in a signal-delivery stop; resume it (SIGTRAP-family /
-                // SIGSTOP dropped, real signals re-injected) so a graceful
-                // shutdown remains possible before the SIGKILL fallback below.
-                // Only AS-safe syscalls here (this runs in signal handlers too).
-                int inject = 0;
-                int sig = WSTOPSIG(status);
-                if (sig != SIGTRAP && sig != (SIGTRAP | 0x80) && sig != SIGSTOP) {
-                    inject = sig;
-                }
-                ptrace(PTRACE_CONT, pgid, 0, inject);
-                continue;
-            }
             break; // Process exited
         } else if (res == -1) {
             if (errno == ECHILD) {
@@ -210,7 +197,7 @@ static std::string probe_exhaustion_hint(const network::ProbeResult& pr) {
 ExchangeOutcome exchange_once(const Config& cfg, const uint8_t* input, size_t input_len,
                               std::vector<uint8_t>& payload_buf) {
     ExchangeOutcome out;
-    process::pump_transparent_tracer();
+    network::pump_notif_listener();
 
     // Final payload = configured prefix + input data + configured suffix.
     // Built before connecting so payload_buf always reflects the current
@@ -230,7 +217,7 @@ ExchangeOutcome exchange_once(const Config& cfg, const uint8_t* input, size_t in
     }
     utils::FdGuard sock = std::get<utils::FdGuard>(std::move(conn));
     // The socket is closed when `sock` goes out of scope at the end.
-    process::pump_transparent_tracer();
+    network::pump_notif_listener();
 
     t_stage = utils::get_time_ms();
     if (auto send_res = network::send_all(sock.get(), payload_buf.data(), payload_buf.size(), cfg.network.timeout_ms);
@@ -257,7 +244,7 @@ ExchangeOutcome exchange_once(const Config& cfg, const uint8_t* input, size_t in
     // of iterations/s that accumulation used to exhaust the local port range
     // and made later connect()s (including the probe) fail with EADDRNOTAVAIL.
     network::arm_rst_on_close(sock.get());
-    process::pump_transparent_tracer();
+    network::pump_notif_listener();
     return out;
 }
 
@@ -572,7 +559,6 @@ int run_proxy_mode(Config cfg, bool forward_output) {
         PROXY_LOG_ERROR("failed to spawn target process.");
         return 1;
     }
-    process::handshake_tracer(spawned.pid, cfg);
     g_child_pid = spawned.pid;
 
     // Pollable pidfd for the target, used by the race-free health check
@@ -586,24 +572,24 @@ int run_proxy_mode(Config cfg, bool forward_output) {
         return 1;
     }
 
-    // Wait for port readiness
+    // Wait for port readiness. In seccomp(user-notif) mode the listener fd
+    // (from fork_target) guards the target's irremovable bind/listen filter:
+    // keep it open for the whole run and register it for the pump right after
+    // successful detection so later bind()/listen() (workers, reloads, QEMU
+    // guest forks) are released instead of parking in the kernel.
     PROXY_LOG_DEBUG("Waiting for port");
-    bool tracer_attached = false;
-    auto port_res = network::wait_for_port(g_child_pid, cfg, &tracer_attached);
+    utils::FdGuard notif_guard{spawned.notif_fd};
+    auto port_res = network::wait_for_port(g_child_pid, cfg, spawned.notif_fd);
     if (std::holds_alternative<network::DetectError>(port_res)) {
         PROXY_LOG_ERROR("failed to detect port {}: {}",
                         cfg.network.port, std::get<network::DetectError>(port_res).to_string());
 
         // TODO: make a health check here maybe?
+        network::set_notif_listener(-1);
         timed_kill_pgid(g_child_pid, cfg.cleanup.force_kill_ms);
         return 1;
     }
-    if (tracer_attached) {
-        // Seccomp mode: the tracer stayed attached after detection. Register the
-        // target with the pump so later bind()/listen() (whose seccomp stops are
-        // resumed with PTRACE_CONT) do not stall it.
-        process::set_transparent_tracer(g_child_pid);
-    }
+    network::set_notif_listener(spawned.notif_fd);
 
     // Main AFL Loop
     // Scratch buffer reused every iteration to send prefix + fuzz data + suffix
@@ -656,17 +642,15 @@ int run_test_mode(const Config& cfg, const std::string& input_path, bool forward
         unsetenv("AFL_DUMP_MAP_SIZE");
         return 1;
     }
-    process::handshake_tracer(spawned1.pid, cfg);
     g_child_pid = spawned1.pid;
 
     // TODO(claude): the exit status is only logged, not acted on, and Pass 1 still proceeds to Pass 2
     //   even when the map size was missing/invalid (see the TODO below; spec 6.2 wants a hard error).
-    //   RESOLVED (was): (1) bare blocking waitpid() with no timeout - a traced child reports an
-    //   unconditional SIGTRAP ptrace stop at execve, so the old waitpid() returned at that stop while
-    //   the child sat frozen before its first instruction, the AFL runtime never ran, and the
-    //   map-size pipe read below hung forever; wait_target_exit() now drains ptrace stops, bounds the
-    //   wait with network.initial_ms and kills the target (SIGTERM->SIGKILL via timed_kill_pgid) on
-    //   timeout, as the spec requires. (2) g_child_pid is set during Pass 1, so Ctrl+C kills the
+    //   RESOLVED (was): (1) bare blocking waitpid() with no timeout; wait_target_exit()
+    //   now bounds the wait with network.initial_ms and kills the target (SIGTERM->SIGKILL
+    //   via timed_kill_pgid) on timeout, as the spec requires (the ptrace exec-stop that
+    //   used to make a bare waitpid return early is gone with ptrace port detection).
+    //   (2) g_child_pid is set during Pass 1, so Ctrl+C kills the
     //   target. (3) The exit status is logged.
     PROXY_LOG_DEBUG("before waitpid");
     auto pass1 = process::wait_target_exit(spawned1.pid, cfg.network.initial_ms);
@@ -736,22 +720,19 @@ int run_test_mode(const Config& cfg, const std::string& input_path, bool forward
         PROXY_LOG_ERROR("failed to spawn target for test iteration.");
         return 1;
     }
-    PROXY_LOG_DEBUG("handshake_tracer 2");
-    process::handshake_tracer(spawned2.pid, cfg);
     g_child_pid = spawned2.pid;
 
     PROXY_LOG_DEBUG("wait_for_port");
-    bool tracer_attached = false;
-    auto port_res2 = network::wait_for_port(g_child_pid, cfg, &tracer_attached);
+    utils::FdGuard notif_guard{spawned2.notif_fd};
+    auto port_res2 = network::wait_for_port(g_child_pid, cfg, spawned2.notif_fd);
     if (std::holds_alternative<network::DetectError>(port_res2)) {
         PROXY_LOG_ERROR("failed to detect port {}: {}",
                         cfg.network.port, std::get<network::DetectError>(port_res2).to_string());
+        network::set_notif_listener(-1);
         timed_kill_pgid(g_child_pid, cfg.cleanup.force_kill_ms);
         return 1;
     }
-    if (tracer_attached) {
-        process::set_transparent_tracer(g_child_pid);
-    }
+    network::set_notif_listener(spawned2.notif_fd);
 
     // One-shot of the same connect -> send -> wait cycle the AFL loop runs.
     PROXY_LOG_DEBUG("exchange_once");

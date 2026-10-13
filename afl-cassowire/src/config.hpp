@@ -59,15 +59,12 @@ struct AflConfig {
 };
 
 struct PortDetectionConfig {
-    std::string primary = "procfs"; // "procfs", "ptrace", "seccomp"
-    // De-fork the target: every non-thread clone()/fork()/vfork() inside the
-    // execve'd binary returns 0 without creating a process (the "child" code
-    // path runs in the caller). Implemented purely in the seccomp BPF filter
-    // (SECCOMP_RET_ERRNO|0 for the syscall; clone() calls with CLONE_THREAD
-    // are allowed through so pthreads keep working). Only valid when
-    // primary == "seccomp".
-    bool defork = false;
-    // procfs only (silently ignored by ptrace/seccomp, which verify ownership by
+    std::string primary = "procfs"; // "procfs" or "seccomp"
+    // "seccomp": the target runs with a SECCOMP_RET_USER_NOTIF filter on
+    // bind()/listen() installed before its execve(); the proxy polls the
+    // notification fd, which aggregates those syscalls from every thread and
+    // forked descendant (kernel >= 5.0).
+    // procfs only (silently ignored by seccomp, which verifies ownership by
     // construction): require the matched LISTEN socket's inode to be held by the
     // target or one of its descendants (/proc/<pid>/fd readlinks), so a stale or
     // foreign listener no longer satisfies port detection. When the fd directory

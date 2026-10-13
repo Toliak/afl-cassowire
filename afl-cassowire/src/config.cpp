@@ -544,7 +544,7 @@ std::variant<Config, ConfigError> load_config(const std::string& path) {
             YAML::Node pd_node = root["port_detection"];
         // --- Check for unknown keys in port_detection ---
         {
-            static const std::unordered_set<std::string> pd_allowed = {"primary", "defork", "verify_ownership"};
+            static const std::unordered_set<std::string> pd_allowed = {"primary", "verify_ownership"};
             ConfigError err = check_unknown_keys(pd_node, pd_allowed, "port_detection");
             if (!err.message.empty()) {
                 return err;
@@ -554,18 +554,10 @@ std::variant<Config, ConfigError> load_config(const std::string& path) {
             if (pd_node["primary"]) {
                 if (!pd_node["primary"].IsScalar()) return ConfigError{"port_detection.primary", "Invalid type", "string", "not a string"};
                 std::string primary = pd_node["primary"].as<std::string>();
-                if (primary != "procfs" && primary != "ptrace" && primary != "seccomp") {
-                    return ConfigError{"port_detection.primary", "Invalid enum value", "procfs, ptrace, or seccomp", primary};
+                if (primary != "procfs" && primary != "seccomp") {
+                    return ConfigError{"port_detection.primary", "Invalid enum value", "procfs or seccomp", primary};
                 }
                 cfg.port_detection.primary = primary;
-            }
-
-            if (pd_node["defork"]) {
-                try {
-                    cfg.port_detection.defork = pd_node["defork"].as<bool>();
-                } catch (const YAML::BadConversion&) {
-                    return ConfigError{"port_detection.defork", "Invalid type", "boolean", pd_node["defork"].Scalar()};
-                }
             }
 
             if (pd_node["verify_ownership"]) {
@@ -574,16 +566,9 @@ std::variant<Config, ConfigError> load_config(const std::string& path) {
                 } catch (const YAML::BadConversion&) {
                     return ConfigError{"port_detection.verify_ownership", "Invalid type", "boolean", pd_node["verify_ownership"].Scalar()};
                 }
-                // Only meaningful for procfs: ptrace/seccomp watch the target's
-                // own bind()/listen() syscalls and therefore verify ownership
-                // by construction. Silently ignored elsewhere.
-            }
-
-            // De-forking is implemented purely in the seccomp BPF filter and
-            // is meaningless (and unsafe) in the other port-detection modes.
-            if (cfg.port_detection.defork && cfg.port_detection.primary != "seccomp") {
-                return ConfigError{"port_detection.defork", "Defork requires seccomp port detection",
-                                   "port_detection.primary == \"seccomp\"", cfg.port_detection.primary};
+                // Only meaningful for procfs: seccomp(user-notif) watches the
+                // target's own bind()/listen() notifications and therefore
+                // verifies ownership by construction. Silently ignored there.
             }
         }
 

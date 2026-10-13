@@ -18,9 +18,8 @@
 #include <poll.h>
 #include <sys/types.h>
 #include <sys/wait.h>
-#include <sys/ptrace.h>
 #include <sys/prctl.h>
-#include <sys/user.h>
+#include <sys/socket.h>
 #include <sys/syscall.h>
 #include <linux/seccomp.h>
 #include <linux/filter.h>
@@ -34,84 +33,101 @@ extern char** environ;
 
 namespace process {
 
-// Seccomp BPF filter that traces bind() and listen() (arch-agnostic, as in the original code)
-// Note: The spec requires arch-awareness, but we keep the original implementation
-// for now; a TODO is carried in the function that builds it.
-static struct sock_filter bind_listen_filter[] = {
-    // Load syscall number
-    BPF_STMT(BPF_LD | BPF_W | BPF_ABS, offsetof(struct seccomp_data, nr)),
-    // Jump if equal to __NR_bind (49 on x86_64)
-    BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, __NR_bind, 1, 0),
-    // Jump if equal to __NR_listen (50 on x86_64)
-    BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, __NR_listen, 0, 1),
-    // Return TRACE
-    BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_TRACE),
-    // Return ALLOW
-    BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_ALLOW)
-};
-
-static const struct sock_fprog seccomp_prog = {
-    .len = sizeof(bind_listen_filter) / sizeof(bind_listen_filter[0]),
-    .filter = bind_listen_filter,
-};
-
-// clone() flag bit identifying thread creation. Defined here (instead of
-// including <linux/sched.h>) to avoid header conflicts with <sched.h>.
-static constexpr __u32 DEFORK_CLONE_THREAD = 0x00010000U;
-
-// Extended seccomp filter used when port_detection.defork is set (x86_64).
-// It keeps the bind()/listen()->TRACE rules of the plain filter for port
-// detection and additionally "de-forks" the target: process-creating syscalls
-// are cancelled in-kernel and made to return 0 to the caller, so only a single
-// process ever exists (the caller continues in the child code path).
-//
-// Rules:
-//   arch != AUDIT_ARCH_X86_64            -> KILL_PROCESS   (arch-aware)
-//   bind / listen                        -> TRACE          (port detection)
-//   fork / vfork                         -> ERRNO|0        (de-fork)
-//   clone with CLONE_THREAD (pthreads)   -> ALLOW          (threads keep working)
-//   clone without CLONE_THREAD           -> ERRNO|0        (de-fork; covers
-//                                                          CLONE_VM|CLONE_VFORK)
-//   everything else                      -> ALLOW
-//
-// SECCOMP_RET_ERRNO with data 0 makes the kernel return -(0 & 0xffff) == 0
-// without executing the syscall. The man page only sanctions data 1-4095,
-// but the kernel applies no lower-bound check (data & SECCOMP_RET_DATA), so
-// the syscall "succeeds" with 0 -- exactly the child's view of a real fork().
-//
-// clone3() is deliberately NOT trapped: its flags live in a userspace
-// struct clone_args that cBPF cannot dereference, and a blanket ERRNO|0 would
-// break clone3-based threads. (glibc on x86_64 creates pthreads via clone().)
-//
-// vfork caveat: a caller that vforks expecting to execve/_exit immediately
-// afterwards (classic child path) would execve *itself* -- accepted per the
-// project decision to de-fork all non-thread forks.
-//
-// No ptrace is involved in de-forking: the kernel cancels the syscall inline,
-// so the transparent tracer is not burdened by fork stops -- the filter is
-// installed before execve() and is irremovable, so protection lasts the
-// target's whole life and is inherited across the execve.
-static struct sock_filter bind_defork_filter[] = {
+// Seccomp BPF filter for user-notification port detection (kernel >= 5.0).
+// bind() and listen() are reported to the proxy over a SECCOMP_RET_USER_NOTIF
+// listener fd (SECCOMP_FILTER_FLAG_NEW_LISTENER); everything else is allowed.
+// The filter is installed in the child between fork() and execve() and is
+// inherited by every thread and forked descendant, so notifications arrive no
+// matter which task of the target (or of a QEMU guest) issues bind()/listen().
+// Arch-aware: a non-x86_64 audit arch means the syscall numbers below are
+// meaningless for the filter, so such tasks are killed instead of silently
+// bypassing detection.
+static struct sock_filter bind_listen_notif_filter[] = {
     /* 0 */ BPF_STMT(BPF_LD | BPF_W | BPF_ABS, offsetof(struct seccomp_data, arch)),
-    /* 1 */ BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, AUDIT_ARCH_X86_64, 0, 11), // mismatch -> 13 KILL
-    /* 2 */ BPF_STMT(BPF_LD | BPF_W | BPF_ABS, offsetof(struct seccomp_data, nr)),
-    /* 3 */ BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, __NR_bind, 6, 0),   // bind   -> 10 TRACE
-    /* 4 */ BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, __NR_listen, 5, 0), // listen -> 10 TRACE
-    /* 5 */ BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, __NR_fork, 6, 0),   // fork   -> 12 DEFORK
-    /* 6 */ BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, __NR_vfork, 5, 0),  // vfork  -> 12 DEFORK
-    /* 7 */ BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, __NR_clone, 0, 3),  // clone -> 8; other -> 11 ALLOW
-    /* 8 */ BPF_STMT(BPF_LD | BPF_W | BPF_ABS, offsetof(struct seccomp_data, args)), // low dword of args[0] = clone flags (rdi)
-    /* 9 */ BPF_JUMP(BPF_JMP | BPF_JSET | BPF_K, DEFORK_CLONE_THREAD, 1, 2), // thread -> 11 ALLOW; else -> 12 DEFORK
-    /* 10*/ BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_TRACE),
-    /* 11*/ BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_ALLOW),
-    /* 12*/ BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_ERRNO | 0),
-    /* 13*/ BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_KILL_PROCESS),
+    /* 1 */ BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, AUDIT_ARCH_X86_64, 1, 0),
+    /* 2 */ BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_KILL_PROCESS),
+    /* 3 */ BPF_STMT(BPF_LD | BPF_W | BPF_ABS, offsetof(struct seccomp_data, nr)),
+    /* 4 */ BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, __NR_bind, 0, 1),
+    /* 5 */ BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_USER_NOTIF),
+    /* 6 */ BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, __NR_listen, 0, 1),
+    /* 7 */ BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_USER_NOTIF),
+    /* 8 */ BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_ALLOW),
 };
 
-static const struct sock_fprog seccomp_prog_defork = {
-    .len = sizeof(bind_defork_filter) / sizeof(bind_defork_filter[0]),
-    .filter = bind_defork_filter,
+static const struct sock_fprog seccomp_notif_prog = {
+    .len = sizeof(bind_listen_notif_filter) / sizeof(bind_listen_notif_filter[0]),
+    .filter = bind_listen_notif_filter,
 };
+
+// Send a descriptor over a connected UNIX socket (SCM_RIGHTS). Async-signal-safe
+// in the sense required between fork() and execve(): fixed stack buffers only,
+// no allocation, no stdio. Returns 0 on success, -1 with errno set.
+static int send_fd(int sock, int fd) {
+    char byte = '\0';
+    struct iovec iov = {};
+    iov.iov_base = &byte;
+    iov.iov_len = sizeof(byte);
+
+    union {
+        char buf[CMSG_SPACE(sizeof(int))];
+        struct cmsghdr align;
+    } control = {};
+
+    struct msghdr msg = {};
+    msg.msg_iov = &iov;
+    msg.msg_iovlen = 1;
+    msg.msg_control = control.buf;
+    msg.msg_controllen = sizeof(control.buf);
+
+    struct cmsghdr* cmsg = CMSG_FIRSTHDR(&msg);
+    cmsg->cmsg_level = SOL_SOCKET;
+    cmsg->cmsg_type = SCM_RIGHTS;
+    cmsg->cmsg_len = CMSG_LEN(sizeof(int));
+    memcpy(CMSG_DATA(cmsg), &fd, sizeof(fd));
+
+    return sendmsg(sock, &msg, 0) < 0 ? -1 : 0;
+}
+
+// Receive a descriptor over a connected UNIX socket, or -1 with errno set
+// (the child closing the peer before sending yields ECONNRESET).
+static int recv_fd(int sock) {
+    char byte = '\0';
+    struct iovec iov = {};
+    iov.iov_base = &byte;
+    iov.iov_len = sizeof(byte);
+
+    union {
+        char buf[CMSG_SPACE(sizeof(int))];
+        struct cmsghdr align;
+    } control = {};
+
+    struct msghdr msg = {};
+    msg.msg_iov = &iov;
+    msg.msg_iovlen = 1;
+    msg.msg_control = control.buf;
+    msg.msg_controllen = sizeof(control.buf);
+
+    ssize_t n;
+    do {
+        n = recvmsg(sock, &msg, 0);
+    } while (n < 0 && errno == EINTR);
+
+    if (n <= 0) {
+        if (n == 0) errno = ECONNRESET;
+        return -1;
+    }
+
+    struct cmsghdr* cmsg = CMSG_FIRSTHDR(&msg);
+    if (cmsg == nullptr || cmsg->cmsg_level != SOL_SOCKET ||
+        cmsg->cmsg_type != SCM_RIGHTS || cmsg->cmsg_len != CMSG_LEN(sizeof(int))) {
+        errno = EINVAL;
+        return -1;
+    }
+
+    int fd = -1;
+    memcpy(&fd, CMSG_DATA(cmsg), sizeof(fd));
+    return fd;
+}
 
 void cleanup_stale_processes(const CleanupConfig& cleanup_cfg) {
     // TODO(claude): DANGEROUS. (1) This is a global /proc scan with no protection against matching the proxy
@@ -476,9 +492,27 @@ SpawnedTarget fork_target(const Config& cfg, const TargetPrepared& prep, SpawnMo
     // Capture parent PID for the child's PDEATHSIG safety check
     const pid_t parent_pid = getpid();
 
+    // seccomp(user-notif) mode: a socketpair carries the notification fd from
+    // the child (which installs the filter) back to us via SCM_RIGHTS before
+    // execve(). MapSizePass performs no port detection, so it skips the setup.
+    const bool use_notif = (cfg.port_detection.primary == "seccomp") &&
+                           (mode != SpawnMode::MapSizePass);
+    int sv[2] = {-1, -1};
+    if (use_notif) {
+        if (socketpair(AF_UNIX, SOCK_DGRAM, 0, sv) != 0) {
+            PROXY_LOG_ERROR("socketpair for seccomp listener handoff failed: {}", strerror(errno));
+            sigprocmask(SIG_SETMASK, &old_mask, nullptr);
+            return SpawnedTarget{-1, -1};
+        }
+    }
+
     int pipefd[2] = {-1, -1};
     if (mode == SpawnMode::MapSizePass) {
         if (pipe(pipefd) < 0) {
+            if (use_notif) {
+                close(sv[0]);
+                close(sv[1]);
+            }
             PROXY_LOG_ERROR("failed to create pipe for map size extraction");
             sigprocmask(SIG_SETMASK, &old_mask, nullptr);
             return SpawnedTarget{-1, -1};
@@ -490,6 +524,10 @@ SpawnedTarget fork_target(const Config& cfg, const TargetPrepared& prep, SpawnMo
         if (mode == SpawnMode::MapSizePass) {
             close(pipefd[0]);
             close(pipefd[1]);
+        }
+        if (use_notif) {
+            close(sv[0]);
+            close(sv[1]);
         }
         PROXY_LOG_ERROR("fork() failed: {}", strerror(errno));
         sigprocmask(SIG_SETMASK, &old_mask, nullptr);
@@ -533,24 +571,47 @@ SpawnedTarget fork_target(const Config& cfg, const TargetPrepared& prep, SpawnMo
             _exit(127);
         }
 
-        // Ptrace/Seccomp setup (child side)
-        const bool use_ptrace = (cfg.port_detection.primary == "ptrace");
-        const bool use_seccomp = (cfg.port_detection.primary == "seccomp");
-        if (use_ptrace || use_seccomp) {
-            ptrace(PTRACE_TRACEME, 0, nullptr, nullptr);
+        // Seccomp user-notification setup (child side). Runs between fork()
+        // and execve(): async-signal-safe calls only (prctl/syscall/sendmsg/
+        // read/close), failures reported through the saved stderr fd.
+        // The filter is installed with SECCOMP_FILTER_FLAG_NEW_LISTENER, which
+        // returns the notification fd; it is handed to the parent via
+        // SCM_RIGHTS and the child waits for a 1-byte ack (the in-flight fd
+        // and the ack guarantee the parent holds the listener before the
+        // target can reach any bind()/listen()). No ptrace is used.
+        if (use_notif) {
+            close(sv[0]);
 
-            if (use_seccomp) {
-                prctl(PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0);
-                // Pointer selection only: both progs are static const, so no
-                // allocation happens between fork() and execve().
-                const struct sock_fprog* prog = cfg.port_detection.defork ? &seccomp_prog_defork
-                                                                           : &seccomp_prog;
-                prctl(PR_SET_SECCOMP, SECCOMP_MODE_FILTER, prog);
+            if (prctl(PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) != 0) {
+                dprintf(original_stderr, "proxy: PR_SET_NO_NEW_PRIVS failed: %s\n", strerror(errno));
+                _exit(126);
             }
 
-            dprintf(original_stderr, "proxy: raise(SIGSTOP)\n");
-            raise(SIGSTOP);
-            dprintf(original_stderr, "after SIGSTOP\n");
+            long listener = syscall(SYS_seccomp, SECCOMP_SET_MODE_FILTER,
+                                    SECCOMP_FILTER_FLAG_NEW_LISTENER, &seccomp_notif_prog);
+            if (listener < 0) {
+                dprintf(original_stderr, "proxy: seccomp(SET_MODE_FILTER, NEW_LISTENER) failed: %s\n",
+                        strerror(errno));
+                _exit(126);
+            }
+
+            if (send_fd(sv[1], (int)listener) != 0) {
+                dprintf(original_stderr, "proxy: sending seccomp listener fd failed: %s\n", strerror(errno));
+                _exit(126);
+            }
+
+            char ack = '\0';
+            ssize_t r;
+            do {
+                r = read(sv[1], &ack, 1);
+            } while (r < 0 && errno == EINTR);
+            if (r != 1) {
+                dprintf(original_stderr, "proxy: waiting for listener ack failed: %s\n", strerror(errno));
+                _exit(126);
+            }
+
+            close((int)listener); // the parent owns the SCM-received copy now
+            close(sv[1]);
         }
 
         execve(cfg.target.binary.c_str(), prep.argv.data(), prep.envp.data());
@@ -573,50 +634,40 @@ SpawnedTarget fork_target(const Config& cfg, const TargetPrepared& prep, SpawnMo
         close(pipefd[1]);
     }
 
+    int notif_fd = -1;
+    if (use_notif) {
+        close(sv[1]);
+        // Blocks until the child sends the listener fd; the child cannot die
+        // quietly first (it is blocked on the ack read, and PDEATHSIG covers
+        // our own death), so a failure here means the bootstrap itself
+        // failed: the child exits and recvmsg returns ECONNRESET.
+        notif_fd = recv_fd(sv[0]);
+        char ack = '\0';
+        ssize_t w = write(sv[0], &ack, 1); // release the child even on failure
+        (void)w;
+        close(sv[0]);
+        if (notif_fd < 0) {
+            PROXY_LOG_ERROR("seccomp listener fd handoff failed: {}", strerror(errno));
+            // The ack write above may have released a child that execve()d a
+            // long-running target (handshake races are not: recv_fd only fails
+            // with ECONNRESET/EINVAL). Kill unconditionally, then reap.
+            kill(pid, SIGKILL);
+            int st = 0;
+            waitpid(pid, &st, 0);
+            if (mode == SpawnMode::MapSizePass) {
+                close(pipefd[0]);
+            }
+            return SpawnedTarget{-1, -1};
+        }
+        // Non-blocking for the life-of-target pump (network::pump_notif_listener).
+        fcntl(notif_fd, F_SETFL, O_NONBLOCK);
+    }
+
     return SpawnedTarget{
         .pid = pid,
-        .map_size_fd = (mode == SpawnMode::MapSizePass) ? pipefd[0] : -1
+        .map_size_fd = (mode == SpawnMode::MapSizePass) ? pipefd[0] : -1,
+        .notif_fd = notif_fd
     };
-}
-
-void handshake_tracer(pid_t pid, const Config& cfg) {
-    const bool use_ptrace = (cfg.port_detection.primary == "ptrace");
-    const bool use_seccomp = (cfg.port_detection.primary == "seccomp");
-    if (!use_ptrace && !use_seccomp) {
-        return;
-    }
-
-    int status;
-    // Wait for SIGSTOP from child
-    PROXY_LOG_DEBUG("Waiting handshake");
-    if (waitpid(pid, &status, 0) == -1) {
-        PROXY_LOG_DEBUG("No handshake");
-        // TODO(claude): handle error? In the original code, this was ignored.
-        return;
-    }
-    PROXY_LOG_DEBUG("Yes handshake");
-
-    if (WIFSTOPPED(status) && WSTOPSIG(status) == SIGSTOP) {
-        long opts = 0;
-        if (use_ptrace) {
-            opts = PTRACE_O_TRACESYSGOOD;
-        } else if (use_seccomp) {
-            opts = PTRACE_O_TRACESECCOMP | PTRACE_O_TRACESYSGOOD;
-        }
-        // If the tracer (proxy) exits while the target is still traced - including
-        // SIGKILL, which bypasses every cleanup handler - the kernel kills the
-        // tracee. Otherwise a half-started target would survive holding the port,
-        // and in seccomp mode it would keep a SECCOMP_RET_TRACE filter with no
-        // tracer (later bind()/listen() fail with ENOSYS). After PTRACE_DETACH the
-        // option no longer applies (the tracee is not traced anymore).
-        opts |= PTRACE_O_EXITKILL;
-        ptrace(PTRACE_SETOPTIONS, pid, 0, opts);
-        ptrace(PTRACE_CONT, pid, 0, 0);
-        PROXY_LOG_DEBUG("Continued");
-    }
-    // If we didn't get a SIGSTOP, something went wrong; we just continue and let
-    // the child run (or die) without tracing. This matches the original behavior
-    // where the parent would proceed anyway.
 }
 
 TargetExit wait_target_exit(pid_t pid, uint64_t timeout_ms) {
@@ -625,19 +676,6 @@ TargetExit wait_target_exit(pid_t pid, uint64_t timeout_ms) {
     while (true) {
         pid_t res = waitpid(pid, &status, WNOHANG);
         if (res == pid) {
-            if (WIFSTOPPED(status)) {
-                // A traced child stops on every ptrace event (exec SIGTRAP, syscall
-                // stops, delivered signals). Resume it; SIGTRAP-family stops and
-                // group-stops are consumed with signal 0, real signals are
-                // re-injected so fatal signals still kill the target.
-                int inject = 0;
-                int sig = WSTOPSIG(status);
-                if (sig != SIGTRAP && sig != (SIGTRAP | 0x80) && sig != SIGSTOP) {
-                    inject = sig;
-                }
-                ptrace(PTRACE_CONT, pid, 0, inject);  // ESRCH (child died racing us) is reaped below
-                continue;
-            }
             return TargetExit{.exited = true, .status = status};
         }
         if (res == -1) {
@@ -645,51 +683,9 @@ TargetExit wait_target_exit(pid_t pid, uint64_t timeout_ms) {
             return TargetExit{.exited = false, .status = 0};  // e.g. ECHILD
         }
         if (utils::get_time_ms() - start >= timeout_ms) {
-            // Detach so the caller's SIGTERM/SIGKILL cleanup is not swallowed by
-            // ptrace (the tracee may sit in a ptrace stop). Errors ignored, as in
-            // network.cpp's timeout path.
-            ptrace(PTRACE_DETACH, pid, 0, 0);
             return TargetExit{.exited = false, .status = 0};
         }
         utils::sleep_ms(10);
-    }
-}
-
-// pid of the target that stays traced after startup ("transparent tracer", seccomp
-// port detection); 0 disables pump_transparent_tracer().
-static pid_t g_transparent_tracer_pid = 0;
-
-void set_transparent_tracer(pid_t pid) {
-    g_transparent_tracer_pid = pid;
-}
-
-void pump_transparent_tracer() {
-    const pid_t pid = g_transparent_tracer_pid;
-    if (pid <= 0) return;
-
-    int status;
-    while (true) {
-        pid_t res = waitpid(pid, &status, WNOHANG);
-        if (res != pid) return; // running (0), error or already reaped elsewhere (-1)
-
-        if (WIFEXITED(status) || WIFSIGNALED(status)) {
-            // Death consumed silently: the health check classifies via pidfd and
-            // /proc flags; cleanup paths tolerate ECHILD afterwards.
-            return;
-        }
-        if (WIFSTOPPED(status)) {
-            // Same resume policy as wait_target_exit(): seccomp stops (SIGTRAP +
-            // event), syscall stops (SIGTRAP|0x80) and group-stops/SIGSTOP are
-            // dropped with signal 0 (a seccomp stop resumed with PTRACE_CONT
-            // executes the syscall normally); real signals are re-injected so
-            // fatal signals still kill the target.
-            int inject = 0;
-            int sig = WSTOPSIG(status);
-            if (sig != SIGTRAP && sig != (SIGTRAP | 0x80) && sig != SIGSTOP) {
-                inject = sig;
-            }
-            ptrace(PTRACE_CONT, pid, 0, inject); // ESRCH (racing death) is handled by the next round
-        }
     }
 }
 

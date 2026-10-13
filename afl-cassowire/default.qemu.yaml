@@ -9,8 +9,11 @@
 #      The SHM segment is sized to FORCE_FINAL_LOC; the bridge writes edge IDs
 #      0..AFL_QEMU_MAP_SIZE-1. Too small a FORCE_FINAL_LOC = out-of-bounds
 #      writes into the SHM and coverage lost past the scanned region.
-#   2. port_detection.primary MUST be "procfs". ptrace/seccomp would attach the
-#      tracer/filter to the qemu process and fight its internal threads.
+#   2. port_detection.primary: "procfs" (default/recommended) or "seccomp".
+#      The seccomp mode is SECCOMP_RET_USER_NOTIF-based: its single
+#      notification fd sees bind()/listen() issued by ANY thread or grandchild
+#      of the qemu process (validated with tools/seccomp_strace), unlike the
+#      old ptrace-based detection (now removed) which fought QEMU's threads.
 #   3. QEMU env vars (AFL_QEMU_MAP_SIZE, AFL_INST_LIBS, ...) reach the proxy
 #      from afl-fuzz, but env_preserve: afl_only drops them for the target, so
 #      they must be listed explicitly under target.env (below).
@@ -79,8 +82,9 @@ afl:
                                                   # define target_cmplog/network_cmplog
 
 port_detection:
-  primary: "procfs"                               # REQUIRED: guest bind() -> host bind()
-                                                  # issued by the afl-qemu-bridge process
+  primary: "procfs"                               # guest bind() -> host bind() issued by the
+                                                  # afl-qemu-bridge process; "seccomp"
+                                                  # (user-notification) works there too
 
 cleanup:
   force_kill_ms: 2000

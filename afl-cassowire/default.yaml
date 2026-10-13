@@ -83,13 +83,14 @@ network_cmplog:                # Compare-mode network (used instead of `network`
   probe_attempts: 2             # Maximum probe attempts per iteration (see network:)
 
 port_detection:
-  primary: "procfs"            # Method: "procfs", "ptrace", or "seccomp"
-  # defork: false              # seccomp only: cancel every non-thread fork()/vfork()/clone()
-                               # inside the target in-kernel (SECCOMP_RET_ERRNO|0 makes the
-                               # syscall return 0 without creating a process). The target runs
-                               # de-forked: worker "child" code executes in the caller. Threads
-                               # (clone with CLONE_THREAD) are unaffected. Requires
-                               # primary: "seccomp". clone3() is not trapped.
+  primary: "procfs"            # Method: "procfs" or "seccomp"
+                               # "seccomp": the target runs with a
+                               # SECCOMP_RET_USER_NOTIF filter on bind()/listen()
+                               # installed before its execve(); the proxy polls the
+                               # notification fd, which aggregates those syscalls
+                               # from every thread and forked descendant (works
+                               # under QEMU-mode targets too; kernel >= 5.0).
+                               # Readiness is confirmed with a bounded /proc scan.
   verify_ownership: true       # procfs only: the matched LISTEN entry in /proc/net/tcp{,6}
                                # must be attributable to the target - the socket inode
                                # (10th token of the line) must be held via a
@@ -98,7 +99,8 @@ port_detection:
                                # listener therefore fails detection after initial_ms
                                # instead of false-positiving. A setuid target whose fd
                                # directory is unreadable (EACCES/EPERM) is accepted
-                               # unverified (WARN). Silently ignored by ptrace/seccomp.
+                               # unverified (WARN). Silently ignored by seccomp, which
+                               # verifies ownership by construction.
                                # Independent of this flag, the procfs loop checks
                                # waitpid(WNOHANG) every pass, so a target that dies
                                # during startup reports TargetDied instead of a

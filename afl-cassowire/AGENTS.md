@@ -55,10 +55,12 @@ are ignored helper-anchor fields (see Important details).
   and a warn-level ringbuffer sink (capacity 16) exposing `recent_lines()` for
   termination dumps.
 - `src/process.{hpp,cpp}` — namespace `process`: stale-process cleanup, `prepare_target()` →
-  `fork_target()` → `handshake_tracer()` split (prepare env/argv before `fork()`, no heap
-  allocs between `fork()` and `execve()`), ptrace/seccomp arming, stdio/pipe redirection.
-- `src/network.{hpp,cpp}` — namespace `network`: port detection (`procfs` | `ptrace` |
-  `seccomp`, all in `wait_for_port()`) plus TCP client (`connect_target`, `send_all`,
+  `fork_target()` split (prepare env/argv before `fork()`, no heap
+  allocs between `fork()` and `execve()`), seccomp user-notif filter install +
+  listener-fd handoff (`SpawnedTarget::notif_fd`) in the pre-exec child, stdio/pipe redirection.
+- `src/network.{hpp,cpp}` — namespace `network`: port detection (`procfs` |
+  `seccomp`, both in `wait_for_port()`), the steady-state notification pump
+  (`set_notif_listener`/`pump_notif_listener`) plus TCP client (`connect_target`, `send_all`,
   `wait_response`).
 - `src/utils.{hpp,cpp}` — namespace `utils`: time, sleep, `crash_proxy()`/`abort_proxy()`
   (shared `terminate_proxy()` implementation) and their termination dumps.
@@ -67,15 +69,27 @@ are ignored helper-anchor fields (see Important details).
 
 ## Important details
 - Port detection must confirm the *configured* port, not just any `bind()`; a bound port
-  of 0 (ephemeral) logs a warning and is skipped. Readiness is a successful `listen()` EXIT
-  on the fd bound to the configured port (fd→port tracked from bind stops; `listen` is
-  syscall 50 on x86_64). `bind` is syscall 49 on x86_64; read the
-  `sockaddr` via `PTRACE_GETREGS` + `process_vm_readv()` (not `PTRACE_PEEKDATA`).
-  In seccomp mode the tracer stays attached after detection and is pumped via
-  `process::pump_transparent_tracer()` from `exchange_once` and the network poll loops
-  (worst-case stall for the target = one poll leg); ptrace options include
-  `PTRACE_O_EXITKILL`, and `timed_kill_pgid` resumes traced targets so SIGTERM stays
-  deliverable.
+  of 0 (ephemeral) logs a warning and is skipped. Seccomp mode is
+  `SECCOMP_RET_USER_NOTIF`-based (kernel >= 5.0; **no ptrace anywhere**): the
+  pre-exec child installs a bind/listen filter (`SECCOMP_SET_MODE_FILTER` +
+  `SECCOMP_FILTER_FLAG_NEW_LISTENER`; x86_64 arch guard, foreign arch ->
+  `KILL_PROCESS`), hands the listener fd back over a private socketpair via
+  `SCM_RIGHTS`, and blocks on a 1-byte ack so the proxy is guaranteed to hold
+  the fd before the target can reach any `bind()`. Threads and forked children
+  inherit the filter automatically and notify the same fd — multi-process and
+  multi-threaded targets (and QEMU guests: guest `bind`/`listen` translate to
+  real host syscalls with faithful fd/sockaddr values) are fully covered.
+  Readiness = a `listen` notification on an fd recorded from a `bind`
+  notification for the configured port (`sockaddr` read with
+  `process_vm_readv` on the notifying tid), plus a bounded (~100 ms)
+  `/proc/net/tcp{,6}` LISTEN confirmation — notifications carry syscall ENTRY
+  only, so there is no exit value and e.g. EADDRINUSE is invisible otherwise.
+  Every notification must be answered (`SECCOMP_USER_NOTIF_FLAG_CONTINUE`):
+  the filter is irremovable, so `network::pump_notif_listener()` (non-blocking
+  drain; registered after detection via `network::set_notif_listener()`) runs
+  from `exchange_once` and the network poll loops for the target's whole life
+  (worst-case stall for the target = one poll leg). Both detection methods and
+  the procfs path poll `waitpid(WNOHANG)` and report `TargetDied`.
 - Stdio redirection differs per mode: stdin always → `/dev/null`; the target's
   stdout/stderr go to `/dev/null` by default and are forwarded to the proxy's fds with
   `--child-output` (both proxy and test pass 2). MapSizePass always pipes stdout (map
@@ -88,11 +102,10 @@ are ignored helper-anchor fields (see Important details).
   AFL registers the finding. Target is cleaned up SIGTERM → wait `cleanup.force_kill_ms`
   → SIGKILL, on the whole process group.
 - Targets are spawned with `PR_SET_PDEATHSIG(SIGKILL)` plus a `getppid()` race check in
-  the pre-exec child (`fork_target()`, src/process.cpp:390-397), so the kernel kills the
-  target whenever the proxy dies — `abort_proxy`, `crash_proxy`, or AFL killing the
+  the pre-exec child (`fork_target()`), so the kernel kills the target whenever the
+  proxy dies — `abort_proxy`, `crash_proxy`, or AFL killing the
   proxy — in all modes (proxy/test) and all spawn modes, even in procfs port-detection
-  mode. This complements `PTRACE_O_EXITKILL` (ptrace/seccomp only): orphaned reuseport
-  listeners are impossible. Delivery is immediate SIGKILL with no `force_kill_ms` grace —
+  mode. Delivery is immediate SIGKILL with no `force_kill_ms` grace —
   by design, since the proxy is already dead when it fires. It relies on the proxy
   staying single-threaded (PDEATHSIG watches the forking thread).
 - `crash_proxy(message, payload)`/`abort_proxy(message, payload)` share `terminate_proxy()`
@@ -122,13 +135,14 @@ are ignored helper-anchor fields (see Important details).
   count, flushed) and a WARN whenever a stage reaches `network.timeout_ms`
   (send not drained; response kept open / a `Content-Length` larger than the
   body sent; slow probe). `wait_for_port()` logs an INFO start line and a WARN
-  on timeout; procfs can detect a dead target (waitpid(WNOHANG) every pass) and
-  a foreign port holder (ownership check, see below). Repeated connect/send/wait
+  on timeout; both detection methods notice a dead target (waitpid(WNOHANG)
+  every pass), and procfs additionally flags a foreign port holder (ownership
+  check, see below). Repeated connect/send/wait
   errors are rate-limited (first 3, then one per 5 s with a suppressed count).
   `port_detection.verify_ownership` (procfs only, default `true`) additionally
   requires the matched LISTEN socket inode to be held by the target's process
   tree (`process::collect_pid_tree()`); an unreadable `/proc/<pid>/fd` (setuid
-  targets) is accepted with a WARN, and the key is ignored for ptrace/seccomp
+  targets) is accepted with a WARN, and the key is ignored for seccomp
   (ownership is verified by construction there).
   Run with `--log-level warn` (or `info`) to see these; `error` hides all but
   the first few failures. Per-iteration detail stays at TRACE/DEBUG.
@@ -143,39 +157,34 @@ are ignored helper-anchor fields (see Important details).
   (`network::arm_rst_on_close()`) once their data is fully read, so `close()`
   sends RST: nothing sits in TIME_WAIT and the proxy's ephemeral port range
   cannot be exhausted by fast fuzzing.
-- `port_detection.defork` (requires `primary: seccomp`): the target runs with a
-  `bind_defork_filter` BPF (`src/process.cpp`) instead of the plain bind filter.
-  It cancels every non-thread fork in-kernel: `fork`/`vfork`/`clone` without
-  `CLONE_THREAD` -> `SECCOMP_RET_ERRNO|0` (kernel returns 0, syscall never runs,
-  so the caller continues in the child path and no second process exists);
-  `clone` with `CLONE_THREAD` (pthreads) -> ALLOW; `bind`/`listen` -> TRACE as
-  usual.
-  De-forking needs NO tracer interaction (no PTRACE_O_TRACEFORK, no
-  create-then-kill) and stays installed for the target's whole life (seccomp
-  filters are irremovable). `clone3` is intentionally not
-  trapped (its flags live in a userspace struct cBPF cannot dereference; glibc
-  x86_64 pthread_create uses `clone`). The defork filter is arch-aware
-  (non-x86_64 seccomp arch -> `SECCOMP_RET_KILL_PROCESS`); the plain bind filter
-  remains arch-unaware (TODO in source).
+- `port_detection.defork` and the ptrace-based port-detection modes were REMOVED.
+  Seccomp detection is now `SECCOMP_RET_USER_NOTIF`-based, which handles
+  multi-process and multi-threaded targets correctly (all inherited-filter
+  tasks notify the same fd), so the old fork-cancelling workaround is no
+  longer needed for detection. If de-forking is ever wanted again, the clean
+  route is NOTIF on `fork`/`vfork`/`clone` with `SECCOMP_USER_NOTIF` responses
+  faking a return value of 0 — not a BPF `ERRNO|0` hack.
 
 ## Known deviations from the spec
 - `src/afl_compat.h` (not `.hpp`) defines *no-op* AFL++ macros instead of `#error`-ing;
   the "must use an AFL++ compiler" enforcement was moved to the `meson.build` compiler
   probe. Don't add an `#error` guard to the header.
 - Extra config keys not in the spec: `target.env`, `target.env_preserve`, `payload.*`,
-  `target_cmplog.*`, `network_cmplog.*`, `port_detection.defork`, and the required
+  `target_cmplog.*`, `network_cmplog.*`, and the required
   `AFL_CASSOWIRE_FORCE_FINAL_LOC` env var. `target_cmplog`/`network_cmplog` are standalone
   (no key falls back to `target`/`network`) and required when `afl.enable_cmplog: true`;
   in cmplog mode both replace their normal counterparts in `run_proxy_mode()` before
   spawn, so port detection, connect, timeouts, and probe all use the cmplog values.
-- Port detection (`ptrace`/`seccomp`) deviates from spec §4/5.2: the seccomp BPF filter
-  traps `bind` AND `listen`, and readiness is declared on the successful `listen()` exit
-  (fd tracked from bind stops), not at `bind()` entry as the spec says. After detection
-  the tracer stays attached as a *transparent tracer* (every seccomp stop is resumed with
-  PTRACE_CONT so later bind()/listen() work despite the unremovable filter); the target's
-  forked children inherit the filter UNTRACED — their bind()/listen() still fail with
-  ENOSYS (accepted limitation). `PTRACE_O_EXITKILL` is set so a proxy death kills the
-  traced target instead of leaving a filter-lame process holding the port.
+- Port detection deviates from spec §4/5.2: there is **no ptrace at all** — the `ptrace`
+  primary and the TRACEME/`SECCOMP_RET_TRACE` realization of `seccomp` were removed in
+  favor of `SECCOMP_RET_USER_NOTIF` (listener fd handed over `SCM_RIGHTS` pre-exec,
+  polled by the proxy; readiness = `listen` notification for the configured port's fd
+  + bounded `/proc/net/tcp` confirmation, since notifications carry no syscall exit
+  value — the spec wanted readiness at `bind()` ENTRY; both are deviations). The
+  inherited filter notifies for every thread and forked child, so the old
+  "children fail bind/listen with ENOSYS" limitation is gone; QEMU-mode targets
+  work with `seccomp` now (procfs remains the default there). `PDEATHSIG` (see above)
+  replaced `PTRACE_O_EXITKILL` as the proxy-death backstop.
 - Logging/target-stdio behavior intentionally diverges from the spec (spec is deprecated
   on these points): proxy logs go through spdlog to stdout with `--log-level` (not
   `std::cout`/`std::cerr`); the spec's `target.log.*` config keys were removed — target
