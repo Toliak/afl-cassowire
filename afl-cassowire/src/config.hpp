@@ -67,6 +67,15 @@ struct PortDetectionConfig {
     // are allowed through so pthreads keep working). Only valid when
     // primary == "seccomp".
     bool defork = false;
+    // procfs only (silently ignored by ptrace/seccomp, which verify ownership by
+    // construction): require the matched LISTEN socket's inode to be held by the
+    // target or one of its descendants (/proc/<pid>/fd readlinks), so a stale or
+    // foreign listener no longer satisfies port detection. When the fd directory
+    // of a target-tree pid is unreadable (EACCES/EPERM, e.g. a setuid target that
+    // dropped privileges), the port is accepted unverified with a WARN.
+    // Independent of this flag, the procfs loop checks waitpid(WNOHANG) every
+    // pass, so a target that dies during startup reports TargetDied.
+    bool verify_ownership = true;
 };
 
 struct KillPattern {

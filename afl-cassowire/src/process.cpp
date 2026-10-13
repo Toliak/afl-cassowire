@@ -11,6 +11,7 @@
 #include <regex>
 #include <algorithm>
 #include <cctype>
+#include <unordered_set>
 #include <dirent.h>
 #include <unistd.h>
 #include <fcntl.h>
@@ -214,6 +215,118 @@ void cleanup_stale_processes(const CleanupConfig& cleanup_cfg) {
             }
         }
     }
+}
+
+// Parse the ppid field (whitespace field 4) out of a /proc stat buffer:
+// "pid (comm) state ppid ...". comm (field 2) may contain spaces and
+// parentheses, so the field numbering restarts after the LAST ')' (same
+// trick as parse_proc_flags below).
+static bool parse_proc_ppid(const char* buf, size_t len, pid_t* out) {
+    size_t rparen = 0;
+    bool found = false;
+    for (size_t i = 0; i < len; i++) {
+        if (buf[i] == ')') { rparen = i; found = true; }
+    }
+    if (!found) return false;
+    const char* p = buf + rparen + 1;
+    // Fields after ')': 0=state 1=ppid ...
+    int idx = -1;
+    while (true) {
+        while (*p == ' ' || *p == '\t') p++;
+        if (*p == '\0' || *p == '\n') break;
+        idx++;
+        if (idx == 1) {
+            long v = 0;
+            bool neg = false;
+            if (*p == '-') { neg = true; p++; }
+            while (*p >= '0' && *p <= '9') { v = v * 10 + static_cast<long>(*p - '0'); p++; }
+            *out = static_cast<pid_t>(neg ? -v : v);
+            return true;
+        }
+        while (*p && *p != ' ' && *p != '\t' && *p != '\n' && *p != '\0') p++;
+    }
+    return false;
+}
+
+// Children of one pid via /proc/<pid>/task/<tid>/children (one file per
+// thread, because clone() makes a child a child of the *thread* that created
+// it). Returns false when the files cannot be read at all (kernel built
+// without CONFIG_PROC_CHILDREN, or an EPERM-protected task dir); the caller
+// then falls back to children_via_ppid_scan().
+static bool children_via_procfs(pid_t pid, std::vector<pid_t>& out) {
+    char path[64];
+    snprintf(path, sizeof(path), "/proc/%d/task", pid);
+    DIR* d = opendir(path);
+    if (!d) return false;
+    struct dirent* e;
+    bool ok = true;
+    while ((e = readdir(d)) != nullptr) {
+        if (e->d_name[0] < '0' || e->d_name[0] > '9') continue;
+        char cpath[96];
+        snprintf(cpath, sizeof(cpath), "/proc/%d/task/%s/children", pid, e->d_name);
+        std::ifstream f(cpath);
+        if (!f.is_open()) { ok = false; continue; }
+        std::string line;
+        if (std::getline(f, line)) {
+            std::istringstream iss(line);
+            pid_t child = 0;
+            while (iss >> child) out.push_back(child);
+        }
+    }
+    closedir(d);
+    return ok;
+}
+
+// Fallback for kernels without CONFIG_PROC_CHILDREN (or an unreadable task
+// dir): one /proc scan collecting pids whose stat ppid equals @p pid. This
+// misses children created by a non-leader thread (their stat ppid is the
+// thread's tgid, which equals the group leader's pid only for leader-created
+// children) - hence it is a fallback only.
+static void children_via_ppid_scan(pid_t pid, std::vector<pid_t>& out) {
+    DIR* proc = opendir("/proc");
+    if (!proc) return;
+    struct dirent* e;
+    while ((e = readdir(proc)) != nullptr) {
+        if (e->d_name[0] < '0' || e->d_name[0] > '9') continue;
+        // std::stoi replaced by the exception-free utils::parse_u32_strict
+        // (see cleanup_stale_processes above for the rationale).
+        auto parsed_pid = utils::parse_u32_strict(e->d_name);
+        if (!std::holds_alternative<std::uint32_t>(parsed_pid)) continue;
+        pid_t cand = static_cast<pid_t>(std::get<std::uint32_t>(parsed_pid));
+        if (cand == pid) continue;
+        char spath[64];
+        snprintf(spath, sizeof(spath), "/proc/%d/stat", cand);
+        int fd = ::open(spath, O_RDONLY | O_CLOEXEC);
+        if (fd < 0) continue;
+        char buf[512];
+        ssize_t n = ::read(fd, buf, sizeof(buf) - 1);
+        ::close(fd);
+        if (n <= 0) continue;
+        buf[n] = '\0';
+        pid_t ppid = -1;
+        if (parse_proc_ppid(buf, static_cast<size_t>(n), &ppid) && ppid == pid) {
+            out.push_back(cand);
+        }
+    }
+    closedir(proc);
+}
+
+std::vector<pid_t> collect_pid_tree(pid_t root) {
+    std::vector<pid_t> tree;
+    tree.push_back(root);
+    std::unordered_set<pid_t> seen{root};
+    // BFS with an index loop: the vector grows while we iterate it.
+    for (size_t i = 0; i < tree.size(); i++) {
+        std::vector<pid_t> kids;
+        if (!children_via_procfs(tree[i], kids)) {
+            kids.clear();
+            children_via_ppid_scan(tree[i], kids);
+        }
+        for (pid_t k : kids) {
+            if (k > 0 && seen.insert(k).second) tree.push_back(k);
+        }
+    }
+    return tree;
 }
 
 std::optional<TargetPrepared> prepare_target(const Config& cfg, SpawnMode mode) {

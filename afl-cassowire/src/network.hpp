@@ -18,7 +18,7 @@ namespace network {
      */
     struct DetectError {
         enum class Kind {
-            TimedOut,      ///< initial_ms elapsed without seeing the configured port bound and listened
+            TimedOut,      ///< initial_ms elapsed without seeing the configured port bound and listened (procfs with verify_ownership: the port listened but was held by a non-target process)
             TargetDied,    ///< target exited or was signalled during startup (wait_status holds the waitpid status)
             WaitpidFailed, ///< waitpid() failed (sys_errno holds errno)
             UnknownMethod, ///< port_detection.primary is not a known method
@@ -46,6 +46,17 @@ namespace network {
      * unremovable): it stays attached and resumes every seccomp stop with
      * PTRACE_CONT so later bind()/listen() in the target execute normally
      * ("transparent tracer"; enable the pump with process::set_transparent_tracer()).
+     *
+     * The procfs method polls /proc/net/tcp{,6} for a LISTEN entry on the
+     * configured port and additionally (port_detection.verify_ownership, default
+     * true) requires the entry's socket inode to be held via a socket:[<inode>]
+     * readlink in /proc/<pid>/fd of @p target_pid or one of its descendants
+     * (process::collect_pid_tree), so a stale or foreign listener cannot
+     * false-positive. A setuid-style target with an unreadable fd dir
+     * (EACCES/EPERM) is accepted unverified with a WARN. Every poll pass also
+     * checks waitpid(WNOHANG), so a target that dies during startup reports
+     * TargetDied instead of a silent initial_ms stall (the zombie is reaped
+     * here, like the ptrace/seccomp death path).
      *
      * @param target_pid The PID of the target process.
      * @param cfg The global configuration.

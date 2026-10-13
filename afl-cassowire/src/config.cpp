@@ -544,7 +544,7 @@ std::variant<Config, ConfigError> load_config(const std::string& path) {
             YAML::Node pd_node = root["port_detection"];
         // --- Check for unknown keys in port_detection ---
         {
-            static const std::unordered_set<std::string> pd_allowed = {"primary", "defork"};
+            static const std::unordered_set<std::string> pd_allowed = {"primary", "defork", "verify_ownership"};
             ConfigError err = check_unknown_keys(pd_node, pd_allowed, "port_detection");
             if (!err.message.empty()) {
                 return err;
@@ -566,6 +566,17 @@ std::variant<Config, ConfigError> load_config(const std::string& path) {
                 } catch (const YAML::BadConversion&) {
                     return ConfigError{"port_detection.defork", "Invalid type", "boolean", pd_node["defork"].Scalar()};
                 }
+            }
+
+            if (pd_node["verify_ownership"]) {
+                try {
+                    cfg.port_detection.verify_ownership = pd_node["verify_ownership"].as<bool>();
+                } catch (const YAML::BadConversion&) {
+                    return ConfigError{"port_detection.verify_ownership", "Invalid type", "boolean", pd_node["verify_ownership"].Scalar()};
+                }
+                // Only meaningful for procfs: ptrace/seccomp watch the target's
+                // own bind()/listen() syscalls and therefore verify ownership
+                // by construction. Silently ignored elsewhere.
             }
 
             // De-forking is implemented purely in the seccomp BPF filter and

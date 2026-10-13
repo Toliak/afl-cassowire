@@ -6,6 +6,7 @@
 #include "process.hpp"
 
 #include <chrono>
+#include <cstdio>
 #include <fstream>
 #include <sstream>
 #include <string>
@@ -14,6 +15,7 @@
 #include <cstring>
 #include <cstdint>
 #include <cerrno>
+#include <dirent.h>
 #include <unistd.h>
 #include <fcntl.h>
 #include <sys/types.h>
@@ -89,46 +91,147 @@ std::string WaitError::to_string() const {
     return ss.str();
 }
 
-// TODO(claude): procfs detection is global (spec accepts that) but it also cannot notice that the target
-//   already died: it polls the whole initial_ms even if the child exited. Consider a waitpid(WNOHANG) check
-//   on the target pid inside the loop (needs target_pid passed in). It can also false-positive on a port that
-//   is held by a stale/other process.
-static DetectResult check_procfs(int target_port, uint64_t timeout_ms) {
+// True if "socket:[<inode>]" is held by @p target_pid or any process in its
+// subtree (NGINX-style workers included). Sets @p fd_dir_unreadable when a
+// tree pid's /proc/<pid>/fd could not be opened for permission reasons
+// (EACCES/EPERM, e.g. a setuid target that dropped privileges): ownership
+// then cannot be proven, and the caller decides to accept or reject.
+static bool inode_owned_by_tree(pid_t target_pid, const std::string& inode,
+                                bool* fd_dir_unreadable) {
+    const std::string want = "socket:[" + inode + "]";
+    std::vector<pid_t> tree = process::collect_pid_tree(target_pid);
+    for (pid_t pid : tree) {
+        char dir[64];
+        snprintf(dir, sizeof(dir), "/proc/%d/fd", pid);
+        DIR* d = opendir(dir);
+        if (!d) {
+            if ((errno == EACCES || errno == EPERM) && fd_dir_unreadable) {
+                *fd_dir_unreadable = true;
+            }
+            continue; // vanished pid or another error: skip it
+        }
+        struct dirent* e;
+        while ((e = readdir(d)) != nullptr) {
+            if (e->d_name[0] < '0' || e->d_name[0] > '9') continue; // skip "." and ".."
+            char path[96];
+            snprintf(path, sizeof(path), "%s/%s", dir, e->d_name);
+            char link[128]; // "socket:[" + <=20 inode digits + "]" fits easily
+            ssize_t n = readlink(path, link, sizeof(link) - 1);
+            if (n <= 0) continue;
+            link[n] = '\0';
+            if (want == link) {
+                closedir(d);
+                return true;
+            }
+        }
+        closedir(d);
+    }
+    return false;
+}
+
+// TODO(claude): RESOLVED (was: procfs detection could not notice that the target already died - it
+//   polled the whole initial_ms even if the child exited - and could false-positive on a port held
+//   by a stale/foreign process): the loop now polls waitpid(WNOHANG) every pass and reports
+//   TargetDied (the zombie is reaped here, like trace_port's death path), and with
+//   port_detection.verify_ownership (default true) the matched LISTEN line's socket inode
+//   (10th token of the /proc/net/tcp{,6} entry) must be held via a socket:[<inode>] readlink in
+//   /proc/<pid>/fd of the direct child or one of its descendants (process::collect_pid_tree). A
+//   setuid-style target with an unreadable fd dir (EACCES/EPERM) is accepted unverified with a WARN.
+//
+// TODO(claude): the ownership check races with the target itself: a LISTEN entry whose fd was
+//   already closed (socket half-torn-down) fails ownership for one poll pass and then disappears;
+//   that is benign (we keep polling), but a rebinding target (SO_REUSEADDR close->bind) can pass
+//   with the OLD inode on the very pass after its close - the next exchange would still work since
+//   the port is then genuinely listening again.
+static DetectResult check_procfs(pid_t target_pid, int target_port, uint64_t timeout_ms,
+                                 bool verify_ownership) {
     uint64_t start = utils::get_time_ms();
+    std::string stale_inode;   // last LISTEN inode that failed ownership verification
+    bool warned_unreadable = false;
     while (utils::get_time_ms() - start < timeout_ms) {
-        bool found = false;
+        // Death check: the target is the proxy's direct child and nothing else
+        // reaps it during detection (handshake_tracer() is a no-op in procfs
+        // mode), so a non-zero waitpid(WNOHANG) result is a real death event.
+        int wait_status = 0;
+        pid_t reaped = waitpid(target_pid, &wait_status, WNOHANG);
+        if (reaped == target_pid) {
+            return DetectError{DetectError::Kind::TargetDied, 0, wait_status};
+        }
+        if (reaped == -1) {
+            if (errno == EINTR) continue;
+            return DetectError{DetectError::Kind::WaitpidFailed, errno, 0};
+        }
+
+        // Find a LISTEN entry on the configured port and remember its socket
+        // inode (10th token: sl local rem st tx:rx tr:tm retrnsmt uid timeout inode).
+        std::string listen_inode;
         for (const char* path : {"/proc/net/tcp", "/proc/net/tcp6"}) {
             std::ifstream file(path);
             if (!file.is_open()) continue;
-            
+
             std::string line;
             std::getline(file, line); // skip header
             while (std::getline(file, line)) {
                 std::istringstream iss(line);
                 std::string idx, local_addr, rem_addr, state;
-                if (iss >> idx >> local_addr >> rem_addr >> state) {
-                    if (state == "0A") { // TCP_LISTEN
-                        size_t colon = local_addr.find(':');
-                        if (colon != std::string::npos) {
-                            std::string port_hex = local_addr.substr(colon + 1);
-                            auto parsed = utils::parse_u16_strict(port_hex, 16);
-                            if (std::holds_alternative<std::uint16_t>(parsed) &&
-                                std::get<std::uint16_t>(parsed) == target_port) {
-                                found = true;
-                                break;
-                            }
-                        }
-                    }
+                if (!(iss >> idx >> local_addr >> rem_addr >> state)) continue;
+                if (state != "0A") continue; // TCP_LISTEN
+                size_t colon = local_addr.find(':');
+                if (colon == std::string::npos) continue;
+                auto parsed = utils::parse_u16_strict(local_addr.substr(colon + 1), 16);
+                if (!std::holds_alternative<std::uint16_t>(parsed) ||
+                    std::get<std::uint16_t>(parsed) != target_port) {
+                    continue;
+                }
+                std::string tok;
+                for (int i = 0; i < 6; i++) {
+                    if (!(iss >> tok)) { tok.clear(); break; }
+                }
+                if (!tok.empty()) {
+                    listen_inode = tok;
+                    break;
                 }
             }
-            if (found) break;
+            if (!listen_inode.empty()) break;
         }
-        if (found) return std::monostate{};
+        if (listen_inode.empty()) {
+            utils::sleep_ms(10);
+            continue;
+        }
+        if (!verify_ownership) return std::monostate{};
+
+        // Ownership verification: the inode must be held by the target or one of
+        // its descendants (NGINX-style workers included).
+        bool fd_dir_unreadable = false;
+        if (inode_owned_by_tree(target_pid, listen_inode, &fd_dir_unreadable)) {
+            PROXY_LOG_DEBUG("port {} listening via inode {} owned by target {} (procfs)",
+                            target_port, listen_inode, static_cast<int>(target_pid));
+            return std::monostate{};
+        }
+        if (fd_dir_unreadable) {
+            // Cannot prove ownership (e.g. a setuid target that dropped
+            // privileges): accept rather than wedge the proxy, but say so.
+            if (!warned_unreadable) {
+                PROXY_LOG_WARN("port {} is listening (inode {}) but the fd directory of target "
+                               "{} or a descendant is unreadable (EACCES/EPERM, e.g. a setuid "
+                               "target); accepting the port unverified",
+                               target_port, listen_inode, static_cast<int>(target_pid));
+                warned_unreadable = true;
+            }
+            return std::monostate{};
+        }
+        stale_inode = listen_inode;
         utils::sleep_ms(10);
     }
-    PROXY_LOG_WARN("port {} not seen listening after {} ms via procfs "
-                   "(procfs cannot tell whether the target died)",
-                   target_port, timeout_ms);
+    if (!stale_inode.empty()) {
+        PROXY_LOG_WARN("port {} is held by a listener whose socket inode {} is not owned by "
+                       "target {} or any of its descendants (stale or foreign process?); "
+                       "failing detection after {} ms via procfs",
+                       target_port, stale_inode, static_cast<int>(target_pid), timeout_ms);
+    } else {
+        PROXY_LOG_WARN("port {} not seen listening after {} ms via procfs",
+                       target_port, timeout_ms);
+    }
     return DetectError{DetectError::Kind::TimedOut, 0, 0};
 }
 
@@ -304,7 +407,8 @@ DetectResult wait_for_port(pid_t target_pid, const Config& cfg, bool* tracer_att
     PROXY_LOG_INFO("waiting for port {} via {} (initial_ms={})",
                    cfg.network.port, cfg.port_detection.primary, cfg.network.initial_ms);
     if (cfg.port_detection.primary == "procfs") {
-        return check_procfs(cfg.network.port, cfg.network.initial_ms);
+        return check_procfs(target_pid, cfg.network.port, cfg.network.initial_ms,
+                            cfg.port_detection.verify_ownership);
     } else if (cfg.port_detection.primary == "ptrace") {
         return trace_port(target_pid, cfg.network.port, cfg.network.initial_ms, false, tracer_attached);
     } else if (cfg.port_detection.primary == "seccomp") {

@@ -23,6 +23,29 @@ namespace process {
      * */
     void cleanup_stale_processes(const CleanupConfig& cleanup_cfg);
 
+    /**
+     * @brief Collect @p root and all of its descendants (the "target tree").
+     *
+     * BFS over the process tree: for each pid the children are read from
+     * /proc/<pid>/task/<tid>/children (one file per thread, because clone()
+     * makes a child a child of the *thread* that created it); when those files
+     * are unavailable (kernel built without CONFIG_PROC_CHILDREN) or unreadable,
+     * each pid falls back to a /proc scan matching the ppid field of
+     * /proc/<pid>/stat (which misses children created by non-leader threads -
+     * a best-effort fallback only). Used by procfs port detection to attribute
+     * a listening socket inode to the target or one of its workers
+     * (NGINX-style).
+     *
+     * Best-effort: a pid that vanishes mid-scan contributes no children, and
+     * pid reuse can theoretically graft a foreign (short-lived) subtree onto
+     * the result - which can only produce a false-positive ownership match,
+     * never a missed one.
+     *
+     * @param root The pid to start from (included in the result).
+     * @return The tree in BFS order (root first), duplicates removed.
+     */
+    std::vector<pid_t> collect_pid_tree(pid_t root);
+
     enum class SpawnMode {
         ProxyMode,   // persistent AFL++ proxy mode
         PlainTest,   // test mode Pass 2 (single iteration)

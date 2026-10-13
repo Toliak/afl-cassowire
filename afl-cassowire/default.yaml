@@ -90,6 +90,19 @@ port_detection:
                                # de-forked: worker "child" code executes in the caller. Threads
                                # (clone with CLONE_THREAD) are unaffected. Requires
                                # primary: "seccomp". clone3() is not trapped.
+  verify_ownership: true       # procfs only: the matched LISTEN entry in /proc/net/tcp{,6}
+                               # must be attributable to the target - the socket inode
+                               # (10th token of the line) must be held via a
+                               # socket:[<inode>] readlink in /proc/<pid>/fd of the
+                               # direct child or one of its descendants. A stale/foreign
+                               # listener therefore fails detection after initial_ms
+                               # instead of false-positiving. A setuid target whose fd
+                               # directory is unreadable (EACCES/EPERM) is accepted
+                               # unverified (WARN). Silently ignored by ptrace/seccomp.
+                               # Independent of this flag, the procfs loop checks
+                               # waitpid(WNOHANG) every pass, so a target that dies
+                               # during startup reports TargetDied instead of a
+                               # silent initial_ms stall.
 
 cleanup:
   force_kill_ms: 2000          # Wait time after SIGTERM before SIGKILL

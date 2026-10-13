@@ -170,12 +170,17 @@
         "primary": {
           "enum": ["procfs", "ptrace", "seccomp"],
           "default": "procfs",
-          "description": "Port detection method: \"procfs\" (scan /proc, cannot detect a dead target), \"ptrace\", or \"seccomp\". Note for QEMU mode: ptrace/seccomp attach to the QEMU backend process and fight its internal threads, so procfs is required there."
+          "description": "Port detection method: \"procfs\" (scan /proc/net/tcp{,6}; polls waitpid(WNOHANG) every pass so a dying target is reported, and with verify_ownership: true the LISTEN entry must be owned by the target's process tree), \"ptrace\", or \"seccomp\". Note for QEMU mode: ptrace/seccomp attach to the QEMU backend process and fight its internal threads, so procfs is required there."
         },
         "defork": {
           "type": "boolean",
           "default": false,
           "description": "seccomp only: cancel every non-thread fork()/vfork()/clone() inside the target in-kernel (SECCOMP_RET_ERRNO|0), so the target runs de-forked: worker \"child\" code executes in the caller. Threads (clone with CLONE_THREAD) are unaffected. clone3() is not trapped. Requires primary: \"seccomp\"."
+        },
+        "verify_ownership": {
+          "type": "boolean",
+          "default": true,
+          "description": "procfs only (silently ignored by ptrace/seccomp, which verify ownership by construction): the matched LISTEN entry in /proc/net/tcp{,6} must be attributable to the target - the socket inode (10th token of the line) must be held via a socket:[<inode>] readlink in /proc/<pid>/fd of the direct child or one of its descendants. A stale/foreign listener therefore fails detection after initial_ms instead of false-positiving; if the fd directory of a target-tree pid is unreadable (EACCES/EPERM, e.g. a setuid target that dropped privileges), the port is accepted unverified with a WARN. Independent of this flag, the procfs loop checks waitpid(WNOHANG) every pass, so a target that dies during startup reports TargetDied instead of a silent initial_ms stall."
         }
       },
       "allOf": [

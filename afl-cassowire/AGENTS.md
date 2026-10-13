@@ -122,8 +122,14 @@ are ignored helper-anchor fields (see Important details).
   count, flushed) and a WARN whenever a stage reaches `network.timeout_ms`
   (send not drained; response kept open / a `Content-Length` larger than the
   body sent; slow probe). `wait_for_port()` logs an INFO start line and a WARN
-  on timeout; procfs cannot detect a dead target. Repeated connect/send/wait
+  on timeout; procfs can detect a dead target (waitpid(WNOHANG) every pass) and
+  a foreign port holder (ownership check, see below). Repeated connect/send/wait
   errors are rate-limited (first 3, then one per 5 s with a suppressed count).
+  `port_detection.verify_ownership` (procfs only, default `true`) additionally
+  requires the matched LISTEN socket inode to be held by the target's process
+  tree (`process::collect_pid_tree()`); an unreadable `/proc/<pid>/fd` (setuid
+  targets) is accepted with a WARN, and the key is ignored for ptrace/seccomp
+  (ownership is verified by construction there).
   Run with `--log-level warn` (or `info`) to see these; `error` hides all but
   the first few failures. Per-iteration detail stays at TRACE/DEBUG.
 - Probe failures are two-strike, never instantly fatal: `probe_target()` returns
