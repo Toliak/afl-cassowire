@@ -1,5 +1,6 @@
 #include "trace.hpp"
 
+#include <asm/unistd_64.h>
 #include <cstddef>
 #include <sstream>
 #include <sys/syscall.h>
@@ -39,6 +40,18 @@ const std::vector<trace::syscall_entry> kTraced = {
 #endif
     {__NR_fork, "fork"},
     {__NR_vfork, "vfork"},
+
+    {__NR_read, "read"},
+    // {__NR_readv, "readv"},
+    {__NR_recvfrom, "recvfrom"},
+    // {__NR_recvmsg, "recvmsg"},
+    // {__NR_recvmmsg, "recvmmsg"},
+
+    {__NR_write, "write"},
+    // {__NR_writev, "writev"},
+    {__NR_sendto, "sendto"},
+    // {__NR_sendmsg, "sendmsg"},
+    // {__NR_sendmmsg, "sendmmsg"},
 };
 
 } // namespace
