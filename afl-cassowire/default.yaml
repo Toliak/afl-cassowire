@@ -1,11 +1,13 @@
-# TODO: check
+# yaml-language-server: $schema=./schema/config.schema.json
 
 # Default configuration for afl-cassowire
 # Copy this to config.yaml and adjust values as needed.
 
 target:
   binary: "./target"           # Path to the target binary (required)
-  args: []                     # Additional arguments (binary is added automatically)
+  # args: []                   # Full argv; argv[0] goes first. Omit `args` instead of
+                               # passing an empty list (an empty list is rejected) —
+                               # when omitted, argv defaults to [binary].
   # env_preserve: afl_only     # Parent env inheritance: "nothing", "afl_only"
                                # (PATH, __AFL_SHM_ID, __AFL_CMPLOG_SHM_ID,
                                # ___AFL_EINS_ZWEI_POLIZEI___), or "all"
@@ -21,8 +23,8 @@ network: &net
                                  # post-response cleanup within the same iteration.
                                  # Disable for targets that rate-limit connections or
                                  # cannot tolerate an extra short-lived connection.
-  probe_retry_ms: 5            # Delay in milliseconds between probe retries when the
-                                 # first probe fails. Set to 0 for no delay (current behavior).
+  probe_retry_ms: 5             # Delay in milliseconds between probe retries when the
+                                 # first probe fails. Set to 0 for no delay.
 
 afl:
   loop_count: 50000            # Number of __AFL_LOOP iterations
@@ -34,6 +36,7 @@ target_cmplog:                 # Compare-mode target (used instead of `target` w
   env: {}                      # Environment variables for target
   env_preserve: afl_only       # Parent env inheritance: "nothing", "afl_only", or "all"
 
+
 network_cmplog:                # Compare-mode network (used instead of `network` when __AFL_CMPLOG_SHM_ID is set)
   host: "127.0.0.1"            # Required when afl.enable_cmplog: true. The section is standalone:
   port: 8081                   # no key falls back to `network:` (e.g. the cmplog target may listen
@@ -43,7 +46,7 @@ network_cmplog:                # Compare-mode network (used instead of `network`
                                  # (yaml-cpp does NOT support `<<` merge keys, so per-key overrides
                                  # require writing the full section).
   probe_retry_ms: 5            # Delay in milliseconds between probe retries when the
-                                 # first probe fails. Set to 0 for no delay (current behavior).
+                                 # first probe fails. Set to 0 for no delay.
 
 port_detection:
   primary: "procfs"            # Method: "procfs", "ptrace", or "seccomp"
@@ -56,7 +59,7 @@ port_detection:
 
 cleanup:
   force_kill_ms: 2000          # Wait time after SIGTERM before SIGKILL
-  kill_pattern:                # Optional: auto-kill stale target processes
+  # kill_pattern:              # Optional: auto-kill stale target processes
     # Scalar form — matches /proc/<pid>/comm:
     # "nginx"
     #

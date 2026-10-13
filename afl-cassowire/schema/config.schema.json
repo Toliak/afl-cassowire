@@ -1,0 +1,250 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "afl-cassowire configuration",
+  "description": "Configuration file for afl-cassowire, the persistent-mode network proxy for afl-fuzz.\n\nThe loader (src/config.cpp) rejects unknown keys at every level, so additionalProperties is false throughout. YAML anchors and aliases work (e.g. `network_cmplog: *net`); merge keys (`<<`) are NOT supported by yaml-cpp. Scalar types are strict: ports/timeouts must be unquoted integers and booleans must be true/false. Note that JSON Schema cannot distinguish `!!binary` tagged scalars from plain strings, so payload prefix/suffix are modeled as strings.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["target", "network"],
+  "properties": {
+    "target": {
+      "$ref": "#/definitions/target_section"
+    },
+    "network": {
+      "$ref": "#/definitions/network_section"
+    },
+    "target_cmplog": {
+      "description": "Compare-mode target, used instead of `target` when __AFL_CMPLOG_SHM_ID is set. Standalone: no key falls back to `target`. Ignored and not validated unless afl.enable_cmplog is true, in which case this section is required."
+    },
+    "network_cmplog": {
+      "description": "Compare-mode network, used instead of `network` when __AFL_CMPLOG_SHM_ID is set. Standalone: no key falls back to `network` (the cmplog target may listen on a different port). To reuse the whole section unchanged: `network_cmplog: *net`. Ignored and not validated unless afl.enable_cmplog is true, in which case this section is required."
+    },
+    "afl": {
+      "$ref": "#/definitions/afl_section"
+    },
+    "port_detection": {
+      "$ref": "#/definitions/port_detection_section"
+    },
+    "cleanup": {
+      "$ref": "#/definitions/cleanup_section"
+    },
+    "payload": {
+      "$ref": "#/definitions/payload_section"
+    }
+  },
+  "allOf": [
+    {
+      "if": {
+        "properties": {
+          "afl": {
+            "type": "object",
+            "properties": {
+              "enable_cmplog": {
+                "const": true
+              }
+            },
+            "required": ["enable_cmplog"]
+          }
+        },
+        "required": ["afl"]
+      },
+      "then": {
+        "required": ["target_cmplog", "network_cmplog"],
+        "properties": {
+          "target_cmplog": {
+            "$ref": "#/definitions/target_section"
+          },
+          "network_cmplog": {
+            "$ref": "#/definitions/network_section"
+          }
+        }
+      }
+    }
+  ],
+  "definitions": {
+    "target_section": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["binary"],
+      "properties": {
+        "binary": {
+          "type": "string",
+          "description": "Path to the target binary (required)."
+        },
+        "args": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "minItems": 1,
+          "description": "Full argv passed to execve; argv[0] goes first. When omitted, defaults to a single-element argv [binary]. When present it must be non-empty: an empty list is rejected by the loader."
+        },
+        "env": {
+          "type": "object",
+          "propertyNames": {
+            "type": "string"
+          },
+          "additionalProperties": {
+            "type": "string"
+          },
+          "description": "Environment variables set for the target process (string -> string)."
+        },
+        "env_preserve": {
+          "enum": ["nothing", "afl_only", "all"],
+          "default": "afl_only",
+          "description": "Parent environment inheritance: \"nothing\" (no vars), \"afl_only\" (PATH, __AFL_SHM_ID, __AFL_CMPLOG_SHM_ID, ___AFL_EINS_ZWEI_POLIZEI___), or \"all\" (entire parent environment)."
+        }
+      }
+    },
+    "network_section": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["port"],
+      "properties": {
+        "host": {
+          "type": "string",
+          "default": "127.0.0.1",
+          "description": "TCP host to connect to. Only IPv4 dotted literals work at connect time (the client uses inet_pton with AF_INET); hostnames and IPv6 literals are accepted here but will fail to connect."
+        },
+        "port": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 65535,
+          "description": "TCP port to connect to (required, 1-65535). Must match the port the target binds; port detection confirms this configured port."
+        },
+        "timeout_ms": {
+          "type": "integer",
+          "exclusiveMinimum": 0,
+          "default": 200,
+          "description": "Network send/recv timeout in milliseconds."
+        },
+        "initial_ms": {
+          "type": "integer",
+          "exclusiveMinimum": 0,
+          "default": 200,
+          "description": "Port detection timeout in milliseconds."
+        },
+        "probe": {
+          "type": "boolean",
+          "default": true,
+          "description": "Post-response quiescence probe: after each response, open a throwaway connection and wait until the target services it (data/EOF/RST). Catches crashes in post-response cleanup within the same iteration. Disable for targets that rate-limit connections or cannot tolerate an extra short-lived connection."
+        },
+        "probe_retry_ms": {
+          "type": "integer",
+          "minimum": 0,
+          "default": 0,
+          "description": "Delay in milliseconds between probe retries when the first probe fails. Set to 0 for no delay (the loader default)."
+        }
+      }
+    },
+    "afl_section": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "loop_count": {
+          "type": "integer",
+          "exclusiveMinimum": 0,
+          "default": 50000,
+          "description": "Number of __AFL_LOOP iterations."
+        },
+        "enable_cmplog": {
+          "type": "boolean",
+          "default": false,
+          "description": "Enable AFL compare log (requires __AFL_CMPLOG_SHM_ID). When true, the target_cmplog and network_cmplog sections become required."
+        }
+      }
+    },
+    "port_detection_section": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "primary": {
+          "enum": ["procfs", "ptrace", "seccomp"],
+          "default": "procfs",
+          "description": "Port detection method: \"procfs\" (scan /proc, cannot detect a dead target), \"ptrace\", or \"seccomp\". Note for QEMU mode: ptrace/seccomp attach to the QEMU backend process and fight its internal threads, so procfs is required there."
+        },
+        "defork": {
+          "type": "boolean",
+          "default": false,
+          "description": "seccomp only: cancel every non-thread fork()/vfork()/clone() inside the target in-kernel (SECCOMP_RET_ERRNO|0), so the target runs de-forked: worker \"child\" code executes in the caller. Threads (clone with CLONE_THREAD) are unaffected. clone3() is not trapped. Requires primary: \"seccomp\"."
+        }
+      },
+      "allOf": [
+        {
+          "if": {
+            "properties": {
+              "defork": {
+                "const": true
+              }
+            },
+            "required": ["defork"]
+          },
+          "then": {
+            "required": ["primary"],
+            "properties": {
+              "primary": {
+                "const": "seccomp"
+              }
+            }
+          }
+        }
+      ]
+    },
+    "cleanup_section": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "force_kill_ms": {
+          "type": "integer",
+          "exclusiveMinimum": 0,
+          "default": 2000,
+          "description": "Wait time after SIGTERM before SIGKILL (whole process group)."
+        },
+        "kill_pattern": {
+          "$ref": "#/definitions/kill_pattern"
+        }
+      }
+    },
+    "kill_pattern": {
+      "description": "Auto-kill stale target processes at startup. Scalar form: process name matched against /proc/<pid>/comm (the kernel truncates comm to 15 characters; a longer comm can never match). Object form: {type: \"comm\"|\"regexp\", value: <pattern>, target: \"comm\"|\"argv0\"|\"argv\" (meaningful for regexp)}. WARNING: the object form currently has a known loader bug (config.cpp parses `type` after the unknown-key check), so the `target` key is always rejected and `type: regexp` cannot load yet; the schema therefore accepts any object until that is fixed.",
+      "oneOf": [
+        {
+          "type": "string"
+        },
+        {
+          "type": "object"
+        }
+      ]
+    },
+    "payload_section": {
+      "description": "Optional prefix/suffix wrapped around every payload sent to the target (in `proxy` and `test` mode): the transmitted data is prefix + fuzz input + suffix. Values may be plain strings or YAML `!!binary` base64-encoded bytes (a YAML tag, which JSON Schema cannot see - tagged scalars appear as plain strings here). Omit the section or a key to send the payload unmodified. A null section is accepted and treated as empty.",
+      "anyOf": [
+        {
+          "type": "null"
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "prefix": {
+              "$ref": "#/definitions/bytes_value"
+            },
+            "suffix": {
+              "$ref": "#/definitions/bytes_value"
+            }
+          }
+        }
+      ]
+    },
+    "bytes_value": {
+      "anyOf": [
+        {
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "description": "Raw bytes: plain string or YAML !!binary tagged scalar (base64-decoded by the loader)."
+    }
+  }
+}
