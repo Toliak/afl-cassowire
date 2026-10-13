@@ -63,7 +63,8 @@
         "recommendations": [
             "mesonbuild.mesonbuild",
             "llvm-vs-code-extensions.vscode-clangd",
-            "ms-vscode.hexeditor"
+            "ms-vscode.hexeditor",
+            "redhat.vscode-yaml"
         ]
     }
 }

@@ -137,7 +137,8 @@ RUN --mount=type=cache,sharing=locked,target=/var/cache/apt \
         clangd \
         gdb \
         net-tools \
-        ffmpeg
+        ffmpeg \
+        iproute2
 
 # gcc-14-plugin-dev \
 
