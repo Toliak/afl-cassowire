@@ -1,0 +1,93 @@
+# afl-cassowire reference config for a binary-only (QEMU) network target.
+# Runs an uninstrumented target (e.g. NGINX) under afl-qemu-bridge: the guest
+# binary is the real server, and afl-qemu-bridge acts as the "target" binary
+# that cassowire forks+execs. Coverage flows from the guest's edges (captured
+# by QEMU's TCG) into the same __AFL_SHM_ID map afl-fuzz gave the proxy.
+#
+# Invariants (violating these silently corrupts/truncates coverage):
+#   1. AFL_QEMU_MAP_SIZE  <=  AFL_CASSOWIRE_FORCE_FINAL_LOC
+#      The SHM segment is sized to FORCE_FINAL_LOC; the bridge writes edge IDs
+#      0..AFL_QEMU_MAP_SIZE-1. Too small a FORCE_FINAL_LOC = out-of-bounds
+#      writes into the SHM and coverage lost past the scanned region.
+#   2. port_detection.primary MUST be "procfs". ptrace/seccomp would attach the
+#      tracer/filter to the qemu process and fight its internal threads.
+#   3. QEMU env vars (AFL_QEMU_MAP_SIZE, AFL_INST_LIBS, ...) reach the proxy
+#      from afl-fuzz, but env_preserve: afl_only drops them for the target, so
+#      they must be listed explicitly under target.env (below).
+#
+# Known limitations:
+#   - "test" mode is unusable: Pass 1 (AFL_DUMP_MAP_SIZE) needs the native AFL
+#     runtime, so under qemu it just runs NGINX forever and the single
+#     iteration (Pass 2) is never reached. Debug via proxy mode instead.
+#   - The whole guest (master + workers) is ONE host process, so cleanup.kill_pattern
+#     matches the qemu binary only.
+#
+# CMPLOG (afl.enable_cmplog: true) works for QEMU targets: define
+# target_cmplog/network_cmplog running the same bridge + guest on a DIFFERENT
+# port (both persistent qemu guests run concurrently). Run afl-fuzz with -c 0;
+# the proxy auto-forwards the CmpLog trigger (___AFL_EINS_ZWEI_POLIZEI___) and
+# __AFL_CMPLOG_SHM_ID to the bridge. AFL_QEMU_CMPLOG_NO_RTN=1 (under
+# target_cmplog.env) disables routine/arg (RTN) logging; RTN is x86_64-only.
+#
+# Both afl-qemu-bridge and afl-qemu-trace can be used as QEMU backends.
+# To use afl-qemu-trace instead of afl-qemu-bridge:
+#   1. Replace the binary path with /path/to/afl-qemu-trace
+#   2. Add '--' as an argument before the guest argv to separate qemu-trace options
+#   3. Update cleanup.kill_pattern.value to "afl-qemu-trace"
+# Example for afl-qemu-trace:
+# target:
+#   binary: /opt/workdir/aflpp/src/afl-qemu-trace
+#   args:
+#     - /opt/workdir/aflpp/src/afl-qemu-trace
+#     - --
+#     - ./nginx
+#     - -g
+#     - "daemon off;"
+#     - -c
+#     - /path/to/nginx.conf
+# cleanup:
+#   kill_pattern:
+#     value: "afl-qemu-trace"
+
+# yaml-language-server: $schema=./schema/config.schema.json
+
+target:
+  binary: /opt/workdir/aflpp/src/afl-qemu-bridge   # full path to the QEMU backend
+  args:                                            # full argv; argv[0] goes first
+    - /opt/workdir/aflpp/src/afl-qemu-bridge
+    - ./nginx                                     # guest binary (uninstrumented)
+    - -g
+    - "daemon off;"                               # or set `daemon off;` in nginx.conf
+    - -c
+    - /path/to/nginx.conf
+  # env_preserve: afl_only                        # keeps PATH + __AFL_SHM_ID only
+  env:                                            # forwarded verbatim to afl-qemu-bridge
+    AFL_QEMU_MAP_SIZE: "65536"                    # <= AFL_CASSOWIRE_FORCE_FINAL_LOC
+    # AFL_INST_LIBS: "1"                          # instrument shared libs too
+    # AFL_INST_RATIO: "100"                       # instrument 1-100% of blocks
+
+network:
+  host: "127.0.0.1"
+  port: 8080                                      # must match the guest's listen port
+  timeout_ms: 200
+  initial_ms: 3000                                # qemu + guest startup is slower; bump this
+  probe: true
+
+afl:
+  loop_count: 50000
+  enable_cmplog: false                            # works for QEMU: set true and
+                                                  # define target_cmplog/network_cmplog
+
+port_detection:
+  primary: "procfs"                               # REQUIRED: guest bind() -> host bind()
+                                                  # issued by the afl-qemu-bridge process
+
+cleanup:
+  force_kill_ms: 2000
+  kill_pattern:                                   # match the qemu process, not the guest
+    type: comm
+    value: "afl-qemu-bridge"                      # /proc/<pid>/comm (15 chars max)
+
+payload:
+  prefix: "GET / HTTP/1.1\r\nHost: localhost\r\n\r\n"
+  suffix: !!binary DQoNCg==

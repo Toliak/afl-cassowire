@@ -171,6 +171,9 @@ Config reference: `default.yaml` (copy to `config.yaml`).
   test pass 2 always inherits); the test-mode response is logged as escaped text at info
   level (spec said raw bytes on stdout). DEV_SPECIFICATION.md is NOT updated — trust
   this file for logging/stdio behavior.
+- Both `afl-qemu-bridge` and `afl-qemu-trace` are supported as QEMU backends for
+  binary-only fuzzing. See `default.qemu.yaml` for configuration examples and instructions
+  on switching between them.
 
 ## Review markers
 Existing review notes are tagged `TODO(claude): ...` (≈40 across `src/`). Preserve the
