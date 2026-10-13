@@ -83,6 +83,35 @@ $(ALL_BUILD_SUBTARGETS): build_%:
 
 build: $(ALL_BUILD_SUBTARGETS)
 
+# Ports for the generated configs. cmplog variants use 9xxx ports so the
+# main and cmplog nginx instances can run side by side.
+# Expand config templates. Supported placeholders:
+#   @PORT_MAIN@ @PORT_BACKEND@ @PORT_BACKEND2@ @PORT_BACKEND3@ @TARGET_DIR@
+SED_EXPAND       = -e 's/@PORT_MAIN@/$(1)/g' \
+                   -e 's/@PORT_BACKEND@/$(2)/g' \
+                   -e 's/@PORT_BACKEND2@/$(3)/g' \
+                   -e 's/@PORT_BACKEND3@/$(4)/g' \
+                   -e 's|@TARGET_DIR@|$(CURDIR)|g'
+
+# Small synthetic test videos, generated instead of being committed.
+FFMPEG_SRC       := -f lavfi -i smptebars=duration=2:size=320x240:rate=15
+FFMPEG_ENC       := -pix_fmt yuv420p -c:v libx264
+FFMPEG_COMMON    := -nostdin -loglevel error -y
+
+# Expand data_template/ into ./data: payload files are copied as-is, the two
+# config templates produce the four nginx configs (normal + cmplog), and the
+# test videos are rendered with ffmpeg. Safe to re-run (wipes ./data).
+data:
+	rm -rf ./data && cp -r ./data_template ./data && mkdir -p ./data/dav
+	sed $(call SED_EXPAND,8080,8090,8091,8092) ./data_template/nginx.conf     > ./data/nginx.conf
+	sed $(call SED_EXPAND,8080,8090,8091,8092) ./data_template/nginx.new.conf > ./data/nginx.new.conf
+	sed $(call SED_EXPAND,9080,9090,9091,9092) ./data_template/nginx.conf     > ./data/nginx.cmplog.conf
+	sed $(call SED_EXPAND,9080,9090,9091,9092) ./data_template/nginx.new.conf > ./data/nginx.new.cmplog.conf
+	ffmpeg $(FFMPEG_SRC) $(FFMPEG_ENC) $(FFMPEG_COMMON)             ./data/www/test.mp4
+	ffmpeg $(FFMPEG_SRC) $(FFMPEG_ENC) -f flv $(FFMPEG_COMMON)      ./data/www/test.flv
+
+fuzz: data
+
 fuzz:
 	mkdir -p ./out ./in
 	cp -f $(FUZZ_SHARED_DIR)/in_http/* ./in/.
@@ -90,8 +119,8 @@ ifdef FUZZ_DEBUG
 	@echo "AFL++ debug mode"
 endif
 	export AFL_CASSOWIRE_FORCE_FINAL_LOC=70000 && \
-		$(AFL_FUZZ_ENV) afl-fuzz -b 4 -i ./in -o ./out -x $(FUZZ_SHARED_DIR)/dict/http.dict -t 1500 -c 0 -- \
+		$(AFL_FUZZ_ENV) afl-fuzz -b 4 -i- -o ./out -x $(FUZZ_SHARED_DIR)/dict/http.dict -t 1500 -c 0 -- \
  		"$$(which afl-cassowire)" --log-level error --config cassowire.yaml proxy
 # 		"$$(which afl-cassowire)" --log-level debug --child-output --config cassowire.yaml proxy
 
-.PHONY: build prepare
+.PHONY: build data fuzz

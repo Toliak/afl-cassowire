@@ -1,0 +1,8 @@
+<!--#set var="v" value="x$args" -->
+<!--#if expr="$v = /x.*/" -->match<!--#else -->nomatch<!--#endif -->
+<!--#echo var="v" encoding="url" -->
+<!--#include virtual="/ssi/inc.txt" -->
+<!--#include virtual="/backend/ok" wait="yes" -->
+<!--#config timefmt="%Y" sizefmt="bytes" errmsg="err" -->
+<!--#fsize virtual="/ssi/inc.txt" --><!--#flastmod virtual="/ssi/inc.txt" -->
+<!--#block name="b1" -->blk<!--#endblock -->
