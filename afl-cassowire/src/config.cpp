@@ -2,6 +2,8 @@
 
 #include "config.hpp"
 #include <yaml-cpp/yaml.h>
+#include <cstdlib>
+#include <fstream>
 #include <sstream>
 #include <regex>
 #include <iostream>
@@ -323,13 +325,114 @@ ConfigError parse_network_section(const YAML::Node& node, const std::string& pre
     return ConfigError{"", "", "", ""}; // no error
 }
 
+// Reads the config file as raw text and expands environment variables before
+// any YAML parsing happens. Supported syntax:
+//   $$               -> literal '$' (escape, prevents accidental expansion)
+//   ${NAME}          -> value of NAME; unset NAME is a hard error
+//                       (use ${NAME:-} for an empty fallback)
+//   ${NAME:-word}    -> value of NAME, or `word` when NAME is unset or empty
+//   ${NAME:?message} -> value of NAME; unset/empty NAME is a ConfigError
+//                       whose message ends with `message`
+// `word`/`message` are used verbatim (no nested expansion, a `}` cannot be
+// part of them). A lone '$' not followed by '{' or '$' is kept verbatim.
+// Expansion is a plain textual substitution applied to the whole file, so
+// quoted YAML values should be used when a substituted value could change the
+// scalar type (e.g. port: "${PORT}").
+std::variant<std::string, ConfigError> read_and_expand_env(const std::string& path) {
+    std::ifstream in(path);
+    if (!in) {
+        return ConfigError{"", "Failed to load YAML file: cannot open file", "valid file", path};
+    }
+    std::stringstream ss;
+    ss << in.rdbuf();
+    std::string text = ss.str();
+
+    std::string out;
+    out.reserve(text.size());
+
+    size_t pos = 0;
+    while (pos < text.size()) {
+        size_t dollar = text.find('$', pos);
+        if (dollar == std::string::npos) {
+            out.append(text, pos, std::string::npos);
+            break;
+        }
+        out.append(text, pos, dollar - pos);
+        pos = dollar;
+
+        if (pos + 1 < text.size() && text[pos + 1] == '$') {
+            out += '$'; // "$$" escape
+            pos += 2;
+            continue;
+        }
+        if (pos + 1 >= text.size() || text[pos + 1] != '{') {
+            out += '$'; // lone '$', kept verbatim
+            pos += 1;
+            continue;
+        }
+
+        size_t close = text.find('}', pos + 2);
+        if (close == std::string::npos) {
+            return ConfigError{"", "Unterminated '${' in config file", "'}'", "missing"};
+        }
+
+        std::string inner = text.substr(pos + 2, close - pos - 2);
+        std::string name = inner;
+        char op = '\0'; // '\0' = plain ${NAME}, '-' = ${NAME:-word}, '?' = ${NAME:?msg}
+        std::string word;
+        size_t colon = inner.find(':');
+        if (colon != std::string::npos) {
+            name = inner.substr(0, colon);
+            std::string rest = inner.substr(colon + 1);
+            if (!rest.empty() && (rest[0] == '-' || rest[0] == '?')) {
+                op = rest[0];
+                word = rest.substr(1);
+            } else {
+                return ConfigError{"", "Invalid parameter expansion '${" + inner + "}'",
+                                   "${NAME}, ${NAME:-word}, or ${NAME:?message}", inner};
+            }
+        }
+
+        if (name.empty() || name.find_first_not_of(
+                "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_") != std::string::npos) {
+            return ConfigError{"", "Invalid environment variable name in '${" + inner + "}'",
+                               "[A-Za-z0-9_]+", name.empty() ? "(empty)" : name};
+        }
+
+        const char* value = getenv(name.c_str());
+        bool missing = (value == nullptr) || value[0] == '\0';
+        if (missing && op == '-') {
+            out += word; // ${NAME:-word}: use fallback on unset or empty
+        } else if (missing && op == '?') {
+            std::string message = "Environment variable '" + name + "' is not set or empty";
+            if (!word.empty()) {
+                message += ": " + word;
+            }
+            return ConfigError{"", message, "set environment variable '" + name + "'", "unset/empty"};
+        } else if (missing) {
+            return ConfigError{"", "Environment variable '" + name + "' is not set",
+                               "set it, use ${" + name + ":-fallback}, or ${" + name + ":?message}", "unset"};
+        } else {
+            out += value;
+        }
+        pos = close + 1;
+    }
+    return out;
+}
+
 } // namespace
 
 std::variant<Config, ConfigError> load_config(const std::string& path) {
     Config cfg;
     
     try {
-        YAML::Node root = YAML::LoadFile(path);
+        // Expand environment variables (${NAME}, ${NAME:-word}, ${NAME:?msg})
+        // in the raw file text before YAML parsing.
+        auto expanded = read_and_expand_env(path);
+        if (std::holds_alternative<ConfigError>(expanded)) {
+            return std::get<ConfigError>(expanded);
+        }
+        YAML::Node root = YAML::Load(std::get<std::string>(expanded));
         if (!root.IsMap()) {
             return ConfigError{"", "Root node must be a map", "map", root.Type() == YAML::NodeType::Null ? "null" : "other"};
         }
@@ -615,8 +718,6 @@ std::variant<Config, ConfigError> load_config(const std::string& path) {
            }
  
 
-    } catch (const YAML::BadFile& e) {
-        return ConfigError{"", "Failed to load YAML file: " + std::string(e.what()), "valid file", path};
     } catch (const ConfigError& e) {
         return e;
     } catch (const std::exception& e) {

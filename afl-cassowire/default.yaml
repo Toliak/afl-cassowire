@@ -14,6 +14,20 @@
 # The exemption is root-only: `__`-prefixed keys inside target/network/afl/...
 # are still rejected as unknown keys.
 
+# Environment variable expansion happens on the raw file text before YAML
+# parsing. Supported syntax (POSIX-style, no nesting):
+#   $$               -> literal '$'
+#   ${NAME}          -> value of NAME; unset NAME is a config error
+#                       (use ${NAME:-} for an empty value instead)
+#   ${NAME:-word}    -> value of NAME, or `word` when NAME is unset or empty
+#   ${NAME:?message} -> value of NAME; unset/empty NAME is a config error
+#                       whose message includes `message`
+# Since expansion is textual, quote values whose content could change the
+# scalar type (e.g. port: "${PORT}"). Examples:
+#   binary: "${NGINX_BIN:-/usr/sbin/nginx}"
+#   port: "${PORT:-8080}"
+#   host: "${CASSOWIRE_HOST:?set CASSOWIRE_HOST}"
+
 target:
   binary: "./target"           # Path to the target binary (required)
   # args: []                   # Full argv; argv[0] goes first. Omit `args` instead of
