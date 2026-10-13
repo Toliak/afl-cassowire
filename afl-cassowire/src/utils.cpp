@@ -49,6 +49,13 @@ std::string g_data_dir = "afl-cassowire-data";
 // set_instance_tag()).
 std::string g_instance_tag;
 
+// Current 1-based iteration of the proxy's __AFL_LOOP at the moment
+// crash_proxy()/abort_proxy() fire; written as a dedicated "iteration: N"
+// line into the .msg dump. 0 (the default) means the termination happened
+// outside the loop (start-up path) or in test mode; see
+// set_current_iteration().
+uint64_t g_current_iteration = 0;
+
 // Maximum number of bytes of a captured warn/error history line embedded into
 // the .msg file. History lines are short in practice (repeated per-iteration
 // failures are throttled by the callers); the cap is purely defensive.
@@ -156,6 +163,11 @@ void dump_termination_data(std::string_view kind, std::string_view message,
     }
     msg += ": " + std::string(message) + "\n";
 
+    // Current __AFL_LOOP iteration (1-based; 0 = termination outside the
+    // loop). Lets a dump be correlated with the periodic heartbeat lines,
+    // which count completed iterations.
+    msg += "iteration: " + std::to_string(g_current_iteration) + "\n";
+
     // Embed the recent warn/error history (oldest first, captured by the
     // logger's ring sink) so the dump carries the context that preceded the
     // termination. The final termination line itself is deliberately not part
@@ -204,6 +216,10 @@ void set_data_dir(std::string dir) {
 
 void set_instance_tag(std::string tag) {
     g_instance_tag = std::move(tag);
+}
+
+void set_current_iteration(uint64_t n) {
+    g_current_iteration = n;
 }
 
 [[noreturn]] void crash_proxy(std::string_view message, std::span<const uint8_t> input) {

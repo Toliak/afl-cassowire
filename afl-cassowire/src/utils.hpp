@@ -108,6 +108,21 @@ namespace utils {
     void set_instance_tag(std::string tag);
 
     /**
+     * @brief Sets the __AFL_LOOP iteration embedded into termination dumps.
+     *
+     * The counter is the current 1-based iteration of the proxy's AFL loop
+     * at the moment crash_proxy()/abort_proxy() fire; it is written as a
+     * dedicated "iteration: N" line into the .msg file so a termination can
+     * be correlated with the heartbeat lines (which report completed
+     * iterations). The default of 0 means the termination happened outside
+     * the loop (start-up path) or in test mode. The proxy is
+     * single-threaded, so a plain non-atomic store suffices.
+     *
+     * @param n Current 1-based iteration number (0 = not inside the loop).
+     */
+    void set_current_iteration(uint64_t n);
+
+    /**
      * @brief Crashes the proxy intentionally (e.g., to trigger AFL respawn).
      * Raises SIGSEGV.
      *

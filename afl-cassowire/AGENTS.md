@@ -105,7 +105,10 @@ Config reference: `default.yaml` (copy to `config.yaml`).
   embeds the last ≤16 warn/error lines (oldest first, console-style timestamps) captured
   by the logger's ring sink (`log::recent_lines()`); capture is independent of
   `--log-level` (logger level is floored at warn, the console sink applies the runtime
-  level), so quiet runs still produce rich dumps. Dumps are best-effort and never fatal.
+   level), so quiet runs still produce rich dumps. The `.msg` also embeds the
+   current 1-based `__AFL_LOOP` iteration as an `iteration: N` line (set once per
+   loop pass via `utils::set_current_iteration()` in `run_proxy_mode()`; `0` =
+   termination outside the loop or test mode). Dumps are best-effort and never fatal.
 - Payload sent over TCP is `payload.prefix + fuzz input + payload.suffix`
   (`PayloadConfig::wrap()`); values may be `!!binary`.
 - Observability (hang triage): the proxy loop emits an INFO heartbeat every ~5 s

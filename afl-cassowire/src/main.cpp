@@ -595,6 +595,10 @@ int run_proxy_mode(Config cfg, bool forward_output) {
     stats.last_heartbeat_ms = utils::get_time_ms();
 
     while (__AFL_LOOP(cfg.afl.loop_count)) {
+        // One-based iteration number for the termination dumps (.msg), set
+        // before run_fuzz_iteration() so every failure path inside it
+        // reports the same, current iteration.
+        utils::set_current_iteration(stats.iterations + 1);
         run_fuzz_iteration(cfg, g_child_pid, target_pidfd.get(), payload_buf, stats);
     }
 
