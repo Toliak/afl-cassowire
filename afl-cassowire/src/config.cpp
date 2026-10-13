@@ -7,6 +7,7 @@
 #include <iostream>
 #include <filesystem>
 #include <unordered_set>
+#include <vector>
 
 std::string ConfigError::to_string() const {
     std::stringstream ss;
@@ -41,17 +42,134 @@ std::vector<uint8_t> PayloadConfig::wrap(const uint8_t* data, size_t len) const 
 
 namespace {
 
+// Root-level helper keys start with "__" and carry no meaning for the proxy;
+// they exist so configs can anchor reusable fragments (e.g. `__net: &net`).
+bool is_helper_key(const std::string& key) {
+    return key.rfind("__", 0) == 0;
+}
+
 // Returns a ConfigError with an empty message when every key is allowed.
+// When `ignore_helpers` is true, "__"-prefixed keys are skipped; it is used
+// for the root node only, so nested sections stay strict.
 ConfigError check_unknown_keys(const YAML::Node& node, const std::unordered_set<std::string>& allowed,
-                               const std::string& prefix) {
+                               const std::string& prefix, bool ignore_helpers = false) {
     for (YAML::const_iterator it = node.begin(); it != node.end(); ++it) {
         std::string key = it->first.as<std::string>();
+        if (ignore_helpers && is_helper_key(key)) {
+            continue;
+        }
         if (allowed.find(key) == allowed.end()) {
             std::string full_key = prefix.empty() ? key : prefix + "." + key;
             return ConfigError{full_key, "Unknown key: " + full_key, "", ""};
         }
     }
     return ConfigError{"", "", "", ""}; // no error
+}
+
+// Forward declaration for circular reference detection
+static thread_local std::vector<YAML::Node>* g_merge_key_visiting = nullptr;
+
+// Recursively resolves YAML 1.2 merge keys (<<) in a mapping node.
+// Supports:
+//   <<: *anchor                    (scalar alias)
+//   <<: [*anchor1, *anchor2]       (sequence of aliases, later wins)
+//   <<: { key: value }             (inline mapping)
+// Removes the << key after merging. Throws ConfigError on cycles or invalid types.
+void resolve_merge_keys(YAML::Node& node, const std::string& path) {
+    if (!node.IsMap()) {
+        return;
+    }
+
+    // Initialize visiting tracker on first call
+    std::vector<YAML::Node> visiting_storage;
+    if (!g_merge_key_visiting) {
+        g_merge_key_visiting = &visiting_storage;
+    }
+
+    // Check for circular reference: does this node's underlying data
+    // match any node currently being visited?
+    for (const auto& visiting : *g_merge_key_visiting) {
+        if (node.is(visiting)) {
+            throw ConfigError{path, "Circular merge key reference", "acyclic merge keys", "cycle detected"};
+        }
+    }
+
+    g_merge_key_visiting->push_back(node);
+
+    // First, recurse into all values (depth-first) to resolve nested merge keys
+    for (YAML::iterator it = node.begin(); it != node.end(); ++it) {
+        YAML::Node& value = it->second;
+        std::string child_path = path.empty() ? it->first.as<std::string>() : path + "." + it->first.as<std::string>();
+        resolve_merge_keys(value, child_path);
+    }
+
+    // Now process merge keys at this level
+    // We need to collect merge keys first since we'll modify the map while iterating
+    struct MergeSource {
+        YAML::Node source;
+        std::string source_path;
+    };
+    std::vector<MergeSource> merge_sources;
+    std::vector<std::string> merge_keys_to_remove;
+
+    for (YAML::const_iterator it = node.begin(); it != node.end(); ++it) {
+        std::string key = it->first.as<std::string>();
+        if (key == "<<") {
+            merge_keys_to_remove.push_back(key);
+            YAML::Node merge_value = it->second;
+            std::string mp = path.empty() ? "<<": path + ".<<";
+
+            if (merge_value.IsNull()) {
+                throw ConfigError{mp, "Merge key references undefined anchor", "alias or mapping", "null"};
+            }
+
+            if (merge_value.IsMap()) {
+                // Inline mapping: <<: { key: value }
+                merge_sources.push_back({merge_value, mp});
+            } else if (merge_value.IsSequence()) {
+                // Sequence of aliases: <<: [*a, *b]
+                for (size_t i = 0; i < merge_value.size(); ++i) {
+                    YAML::Node item = merge_value[i];
+                    std::string item_path = mp + "[" + std::to_string(i) + "]";
+                    if (item.IsNull()) {
+                        throw ConfigError{item_path, "Merge key references undefined anchor", "alias", "null"};
+                    }
+                    if (!item.IsMap()) {
+                        throw ConfigError{item_path, "Merge key sequence item must be a mapping", "mapping", "other"};
+                    }
+                    merge_sources.push_back({item, item_path});
+                }
+            } else if (merge_value.IsScalar()) {
+                // Scalar alias: <<: *anchor (yaml-cpp resolves aliases at load time,
+                // so this would be the aliased node, which should be a map)
+                if (!merge_value.IsMap()) {
+                    throw ConfigError{mp, "Merge key alias must resolve to a mapping", "mapping", "other"};
+                }
+                merge_sources.push_back({merge_value, mp});
+            } else {
+                throw ConfigError{mp, "Invalid merge key value", "map, sequence of mappings, or alias", "other"};
+            }
+        }
+    }
+
+    // Apply merges in order (later sources override earlier for keys not already present)
+    for (const auto& ms : merge_sources) {
+        const YAML::Node& source = ms.source;
+        for (YAML::const_iterator it = source.begin(); it != source.end(); ++it) {
+            std::string key = it->first.as<std::string>();
+            // Only insert if key doesn't already exist in target (YAML 1.2 spec)
+            if (!node[key]) {
+                node[key] = it->second;
+            }
+        }
+    }
+
+    // Remove the << keys
+    for (const auto& key : merge_keys_to_remove) {
+        node.remove(key);
+    }
+
+    g_merge_key_visiting->pop_back();
 }
 
 // Parses a target-shaped section ("binary"/"args"/"env"/"env_preserve"). `prefix`
@@ -205,10 +323,15 @@ std::variant<Config, ConfigError> load_config(const std::string& path) {
             return ConfigError{"", "Root node must be a map", "map", root.Type() == YAML::NodeType::Null ? "null" : "other"};
         }
 
+        // Resolve YAML merge keys (<<) before validation
+        resolve_merge_keys(root, "");
+
         // --- Check for unknown keys at root ---
+        // Root keys starting with "__" are ignored: they are reserved for
+        // helper fragments anchored for reuse (aliases / merge keys) below.
         {
             static const std::unordered_set<std::string> root_allowed = {"target", "target_cmplog", "network", "network_cmplog", "afl", "port_detection", "cleanup", "payload"};
-            ConfigError err = check_unknown_keys(root, root_allowed, "");
+            ConfigError err = check_unknown_keys(root, root_allowed, "", true);
             if (!err.message.empty()) {
                 return err;
             }
@@ -483,6 +606,8 @@ std::variant<Config, ConfigError> load_config(const std::string& path) {
 
     } catch (const YAML::BadFile& e) {
         return ConfigError{"", "Failed to load YAML file: " + std::string(e.what()), "valid file", path};
+    } catch (const ConfigError& e) {
+        return e;
     } catch (const std::exception& e) {
         return ConfigError{path, "Unexpected error parsing config: " + std::string(e.what()), "valid config", "exception"};
     }

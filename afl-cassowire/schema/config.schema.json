@@ -1,9 +1,12 @@
 {
   "$schema": "http://json-schema.org/draft-07/schema#",
   "title": "afl-cassowire configuration",
-  "description": "Configuration file for afl-cassowire, the persistent-mode network proxy for afl-fuzz.\n\nThe loader (src/config.cpp) rejects unknown keys at every level, so additionalProperties is false throughout. YAML anchors and aliases work (e.g. `network_cmplog: *net`); merge keys (`<<`) are NOT supported by yaml-cpp. Scalar types are strict: ports/timeouts must be unquoted integers and booleans must be true/false. Note that JSON Schema cannot distinguish `!!binary` tagged scalars from plain strings, so payload prefix/suffix are modeled as strings.",
+  "description": "Configuration file for afl-cassowire, the persistent-mode network proxy for afl-fuzz.\n\nThe loader (src/config.cpp) rejects unknown keys at every level except root keys starting with `__`, which are ignored and reserved for helper fragments: anchor reusable maps there (`__net: &net { ... }`) and reference them from real sections via aliases (`network: *net`) or merge keys (`<<: *net`). Nested sections do not allow `__`-prefixed keys. So additionalProperties is false throughout, with a patternProperties `^__` exemption at the root. YAML anchors and aliases work (e.g. `network_cmplog: *net`); merge keys (`<<`) are resolved by the loader. Scalar types are strict: ports/timeouts must be unquoted integers and booleans must be true/false. Note that JSON Schema cannot distinguish `!!binary` tagged scalars from plain strings, so payload prefix/suffix are modeled as strings.",
   "type": "object",
   "additionalProperties": false,
+  "patternProperties": {
+    "^__": {}
+  },
   "required": ["target", "network"],
   "properties": {
     "target": {

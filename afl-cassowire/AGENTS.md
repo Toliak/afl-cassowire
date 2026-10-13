@@ -41,7 +41,8 @@ The only default verification is the documented build sequence above.
 Global options (`-c/--config`, `--log-level`, `--child-output`, `--data-dir`) must
 precede the subcommand. `--data-dir` selects where termination dumps are written
 (default `afl-cassowire-data`, created recursively if missing).
-Config reference: `default.yaml` (copy to `config.yaml`).
+Config reference: `default.yaml` (copy to `config.yaml`). Root `__`-prefixed keys
+are ignored helper-anchor fields (see Important details).
 
 ## Layout & conventions
 - `src/main.cpp` — CLI (argparse), mode routing, signal handlers, AFL loop.
@@ -111,6 +112,11 @@ Config reference: `default.yaml` (copy to `config.yaml`).
    termination outside the loop or test mode). Dumps are best-effort and never fatal.
 - Payload sent over TCP is `payload.prefix + fuzz input + payload.suffix`
   (`PayloadConfig::wrap()`); values may be `!!binary`.
+- Root config keys starting with `__` (e.g. `__helpers: &anchor`) are ignored by
+  `load_config()` and exempted in `config.schema.json` (root `patternProperties
+  "^__"`): a reserved namespace for YAML anchor/merge (`<<`) helper fragments.
+  The exemption is root-only — `__`-prefixed keys inside any section are still
+  rejected as unknown keys. Fixtures: `test/schema_validate/cases/*helper*.yaml`.
 - Observability (hang triage): the proxy loop emits an INFO heartbeat every ~5 s
   (iteration count + max connect/send/wait/probe stage times + slow-iteration
   count, flushed) and a WARN whenever a stage reaches `network.timeout_ms`

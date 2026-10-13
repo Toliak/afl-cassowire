@@ -3,6 +3,17 @@
 # Default configuration for afl-cassowire
 # Copy this to config.yaml and adjust values as needed.
 
+# Root keys starting with "__" (e.g. `__helpers`) are ignored by the config
+# parser and by the schema: a reserved namespace for helper fragments that
+# real sections below reuse via YAML anchors/aliases or merge keys (`<<`).
+# Example:
+#   __net: &shared_net
+#     host: "127.0.0.1"
+#     port: 8080
+#   network: *shared_net
+# The exemption is root-only: `__`-prefixed keys inside target/network/afl/...
+# are still rejected as unknown keys.
+
 target:
   binary: "./target"           # Path to the target binary (required)
   # args: []                   # Full argv; argv[0] goes first. Omit `args` instead of
