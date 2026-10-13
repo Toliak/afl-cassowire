@@ -36,6 +36,14 @@ network: &net
                                  # cannot tolerate an extra short-lived connection.
   probe_retry_ms: 5             # Delay in milliseconds between probe retries when the
                                  # first probe fails. Set to 0 for no delay.
+  probe_attempts: 2              # Maximum number of probe attempts per iteration. A
+                                 # failed probe never decides by itself: after each
+                                 # failure the target state is classified - a dead
+                                 # target terminates the proxy immediately, a live
+                                 # target gets the next attempt after probe_retry_ms.
+                                 # Only when ALL attempts fail does the proxy abort
+                                 # so AFL respawns it. Default 2 (the historical
+                                 # two-strike behavior).
 
 afl:
   loop_count: 50000            # Number of __AFL_LOOP iterations
@@ -58,6 +66,7 @@ network_cmplog:                # Compare-mode network (used instead of `network`
                                  # require writing the full section).
   probe_retry_ms: 5            # Delay in milliseconds between probe retries when the
                                  # first probe fails. Set to 0 for no delay.
+  probe_attempts: 2             # Maximum probe attempts per iteration (see network:)
 
 port_detection:
   primary: "procfs"            # Method: "procfs", "ptrace", or "seccomp"

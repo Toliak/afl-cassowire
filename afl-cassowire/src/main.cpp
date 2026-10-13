@@ -374,25 +374,50 @@ void run_fuzz_iteration(const Config& cfg, pid_t child_pid, int target_pidfd,
     // dying flags in the same iteration, so the crash stays attributed to the
     // input that caused it.
     //
-    // Two-strike failure handling: a failed probe never decides by itself -
-    // check_target_state() classifies. If the target is dead, the
-    // classification terminates the proxy right here with the right signal
-    // (SIGSEGV for a crash, SIGABRT for a clean/unknown exit). If the target
-    // is alive, the failure was likely transient, so the probe runs once
-    // more; only a second consecutive failure aborts the proxy so AFL
+    // Multi-strike failure handling (network.probe_attempts, default 2): a
+    // failed probe never decides by itself - check_target_state() classifies.
+    // If the target is dead, the classification terminates the proxy right
+    // here with the right signal (SIGSEGV for a crash, SIGABRT for a
+    // clean/unknown exit). If the target is alive, the failure was likely
+    // transient, so the probe is retried after probe_retry_ms; only when all
+    // configured attempts fail consecutively does the proxy abort so AFL
     // respawns it. (The old single-shot abort killed the whole run on purely
     // local errors, e.g. EADDRNOTAVAIL from ephemeral port exhaustion.)
     uint64_t probe_ms = 0;
     if (cfg.network.probe) {
-        uint64_t t_probe = utils::get_time_ms();
-        auto pr = network::probe_target(cfg.network);
-        probe_ms = utils::get_time_ms() - t_probe;
+        auto pr = network::ProbeResult{network::ProbeOutcome::Failed, std::nullopt};
+        uint64_t first_ms = 0;
+        auto first_outcome = pr.outcome;
 
-        if (pr.outcome != network::ProbeOutcome::Serviced) {
-            const uint64_t first_ms = probe_ms;
-            const auto first_outcome = pr.outcome;
+        for (int attempt = 1; attempt <= cfg.network.probe_attempts; ++attempt) {
+            const uint64_t t_probe = utils::get_time_ms();
+            pr = network::probe_target(cfg.network);
+            const uint64_t attempt_ms = utils::get_time_ms() - t_probe;
+            probe_ms += attempt_ms;
 
-            // First strike: classify the target before deciding anything.
+            if (attempt == 1) {
+                first_ms = attempt_ms;
+                first_outcome = pr.outcome;
+            }
+
+            if (pr.outcome == network::ProbeOutcome::Serviced) {
+                if (attempt > 1) {
+                    PROXY_LOG_INFO("probe recovered on attempt {}/{} after {} ms total",
+                                   attempt, cfg.network.probe_attempts, probe_ms);
+                }
+                break;
+            }
+
+            if (attempt == 1 && stats.probe_err.allow()) {
+                PROXY_LOG_WARN("probe connection {} after {} ms (timeout {} ms) against a live target{}{}{}",
+                               network::probe_outcome_to_string(pr.outcome), first_ms, budget_ms,
+                               pr.error ? ": " + pr.error->to_string() : std::string(),
+                               probe_exhaustion_hint(pr),
+                               log::throttle_suffix(stats.probe_err));
+            }
+
+            // Classify the target before deciding anything: if it is dead, the
+            // classification terminates the proxy with the right signal.
             auto st = process::check_target_state(child_pid, target_pidfd, cfg.cleanup.force_kill_ms);
             switch (st.kind) {
             case process::TargetState::Kind::Crashed:
@@ -411,42 +436,37 @@ void run_fuzz_iteration(const Config& cfg, pid_t child_pid, int target_pidfd,
                                    payload_buf);
                 break;
             case process::TargetState::Kind::Alive:
-                break; // transient failure, handled below (retry once)
+                break; // transient failure, handled below (retry)
             }
 
-            if (stats.probe_err.allow()) {
-                PROXY_LOG_WARN("probe connection {} after {} ms (timeout {} ms) against a live target{}{}{}",
-                               network::probe_outcome_to_string(pr.outcome), first_ms, budget_ms,
-                               pr.error ? ": " + pr.error->to_string() : std::string(),
-                               probe_exhaustion_hint(pr),
-                               log::throttle_suffix(stats.probe_err));
+            // All attempts failed: the listener is persistently unavailable,
+            // respawn via AFL.
+            if (attempt == cfg.network.probe_attempts) {
+                std::string err_detail = pr.error ? ": " + pr.error->to_string() : std::string();
+                if (cfg.network.probe_attempts == 2) {
+                    PROXY_LOG_WARN("probe connection {} twice in one iteration ({} ms total; "
+                                   "first attempt: {} after {} ms){} - target listener is gone",
+                                   network::probe_outcome_to_string(pr.outcome), probe_ms,
+                                   network::probe_outcome_to_string(first_outcome), first_ms,
+                                   err_detail);
+                } else {
+                    PROXY_LOG_WARN("probe connection {} in all {} attempts in one iteration ({} ms total; "
+                                   "first attempt: {} after {} ms){} - target listener is gone",
+                                   network::probe_outcome_to_string(pr.outcome), cfg.network.probe_attempts,
+                                   probe_ms,
+                                   network::probe_outcome_to_string(first_outcome), first_ms,
+                                   err_detail);
+                }
+                utils::abort_proxy("probe connection " + network::probe_outcome_to_string(pr.outcome)
+                                       + " in all " + std::to_string(cfg.network.probe_attempts)
+                                       + " attempts in one iteration (total " + std::to_string(probe_ms)
+                                       + " ms" + err_detail + ") - target listener is gone",
+                                   payload_buf);
             }
 
             // Apply retry delay if configured
             if (cfg.network.probe_retry_ms > 0) {
                 utils::sleep_ms(cfg.network.probe_retry_ms);
-            }
-
-            // Second strike: the same probe again. Serviced -> the first
-            // failure was transient, keep fuzzing; anything else -> the
-            // listener is persistently unavailable, respawn via AFL.
-            t_probe = utils::get_time_ms();
-            pr = network::probe_target(cfg.network);
-            probe_ms += utils::get_time_ms() - t_probe;
-
-            if (pr.outcome == network::ProbeOutcome::Serviced) {
-                PROXY_LOG_INFO("probe recovered on retry after {} ms total", probe_ms);
-            } else {
-                std::string err_detail = pr.error ? ": " + pr.error->to_string() : std::string();
-                PROXY_LOG_WARN("probe connection {} twice in one iteration ({} ms total; "
-                               "first attempt: {} after {} ms){} - target listener is gone",
-                               network::probe_outcome_to_string(pr.outcome), probe_ms,
-                               network::probe_outcome_to_string(first_outcome), first_ms,
-                               err_detail);
-                utils::abort_proxy("probe connection " + network::probe_outcome_to_string(pr.outcome)
-                                       + " twice in one iteration (total " + std::to_string(probe_ms)
-                                       + " ms" + err_detail + ") - target listener is gone",
-                                   payload_buf);
             }
         }
 

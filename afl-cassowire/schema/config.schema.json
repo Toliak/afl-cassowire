@@ -136,6 +136,13 @@
           "minimum": 0,
           "default": 0,
           "description": "Delay in milliseconds between probe retries when the first probe fails. Set to 0 for no delay (the loader default)."
+        },
+        "probe_attempts": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 10,
+          "default": 2,
+          "description": "Maximum number of quiescence-probe attempts per iteration (default 2). A failed probe never decides by itself: after each failure check_target_state() classifies the target - a dead target terminates the proxy immediately (SIGSEGV on crash, SIGABRT otherwise), a live target gets the next attempt after probe_retry_ms. Only when ALL attempts fail consecutively does the proxy abort so AFL respawns it."
         }
       }
     },

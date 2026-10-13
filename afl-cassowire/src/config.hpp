@@ -45,6 +45,12 @@ struct NetworkConfig {
     // Delay in milliseconds between probe retries when the first probe fails.
     // Set to 0 for no delay.
     int probe_retry_ms = 5;
+    // Total number of probe attempts per iteration (first attempt + retries).
+    // Must be >= 1. Default 2 preserves the historical two-strike behavior:
+    // a failed probe is retried once before the proxy aborts. Higher values
+    // tolerate flaky listeners at the cost of up to
+    // (probe_attempts - 1) * (timeout_ms + probe_retry_ms) added latency.
+    int probe_attempts = 2;
 };
 
 struct AflConfig {
