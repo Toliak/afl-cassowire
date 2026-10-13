@@ -1,3 +1,6 @@
 /*/src
 /*/out
 /*/in
+/*/data
+/*/afl-cassowire-data
+*.core

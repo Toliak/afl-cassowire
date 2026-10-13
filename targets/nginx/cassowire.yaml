@@ -1,3 +1,5 @@
+# yaml-language-server: $schema=../../afl-cassowire/schema/config.schema.json
+
 target:
   binary: "./src/install/afl-clang-fast/usr/bin/nginx"           # Path to the target binary (required)
   args: ["nginx", "-c", "/opt/workdir/targets/nginx/data/nginx.new.conf"]                     # Additional arguments (binary is added automatically)
@@ -13,14 +15,12 @@ network: &network
   initial_ms: 200              # Port detection timeout in milliseconds
 
   probe: true
+  probe_retry_ms: 10
+  probe_attempts: 3
 
-network_cmplog: 
-  host: "127.0.0.1"            # TCP host to connect to
+network_cmplog:
+  <<: *network
   port: 9080                   # Port to connect to (1-65535, required)
-  timeout_ms: 100              # Network send/recv timeout in milliseconds
-  initial_ms: 200              # Port detection timeout in milliseconds
-
-  probe: true
 
 afl:
   loop_count: 10000            # Number of __AFL_LOOP iterations
@@ -31,6 +31,8 @@ port_detection:
   # primary: "ptrace"            # Method: "procfs", "ptrace", or "seccomp"
   # primary: "seccomp"            # Method: "procfs", "ptrace", or "seccomp"
   # defork: true
+
+  verify_ownership: true    # Only if the process is single-thread single-worker. Or its bind+listen happens in the "master" worker.
 
 # cleanup:
 #   force_kill_ms: 150          # Wait time after SIGTERM before SIGKILL
