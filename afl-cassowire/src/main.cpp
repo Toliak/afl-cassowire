@@ -43,7 +43,9 @@ __AFL_FUZZ_INIT();
 // __AFL_INIT() and the first __AFL_LOOP() pass (config load, target spawn,
 // NGINX initialization) to the first fuzzed testcase - the observed low
 // stability. The startup feedback is discarded in run_proxy_mode() right
-// before the loop.
+// before the loop when afl.cov_discard_init is true (default); the
+// __AFL_COVERAGE_ON() there is unconditional, so the proxy's own coverage
+// always resumes before the loop even with the discard disabled.
 __AFL_COVERAGE();
 __AFL_COVERAGE_START_OFF();
 
@@ -624,7 +626,12 @@ int run_proxy_mode(Config cfg, bool forward_output) {
     // clean slate, and every afl-fuzz respawn re-delivers slightly different
     // startup feedback - the low stability. The discard also zeroes the
     // cmplog map (the loop's own clean slate does not).
-    __AFL_COVERAGE_DISCARD();
+    // afl.cov_discard_init (default true) gates the discard; the ON below is
+    // unconditional because __AFL_COVERAGE_START_OFF() at file scope must
+    // always be undone before the loop.
+    if (cfg.afl.cov_discard_init) {
+        __AFL_COVERAGE_DISCARD();
+    }
     // Pivot the proxy's instrumentation back to the real map after
     // __AFL_COVERAGE_START_OFF(); coverage then stays on for the whole loop
     // (the loop's own first pass re-arms the clean-slate handling).

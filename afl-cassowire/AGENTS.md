@@ -125,6 +125,19 @@ are ignored helper-anchor fields (see Important details).
    termination outside the loop or test mode). Dumps are best-effort and never fatal.
 - Payload sent over TCP is `payload.prefix + fuzz input + payload.suffix`
   (`PayloadConfig::wrap()`); values may be `!!binary`.
+- Startup-coverage fix (stability): `main.cpp` has a file-scope `__AFL_COVERAGE()` +
+  `__AFL_COVERAGE_START_OFF()` (afl-cc `-D` macros; no-op placeholders in `afl_compat.h`),
+  and `run_proxy_mode()` emits `__AFL_COVERAGE_DISCARD()` (gated by `afl.cov_discard_init`,
+  default true) + unconditional `__AFL_COVERAGE_ON()` right before the first `__AFL_LOOP()`
+  pass — the proxy and the instrumented target share one coverage map, so the discard
+  zeroes the startup feedback (NGINX init included; `__afl_coverage_discard()` also zeroes
+  the cmplog map) that would otherwise be attributed to the first testcase. The ON is
+  mandatory: with START_OFF the runtime never auto-re-enables; it only works before the
+  loop because `__afl_persistent_loop()` clears `__afl_selective_coverage_temp` on the
+  second pass. (`__AFL_COVERAGE_OFF()` around in-loop work cannot work as a probe-noise
+  filter: the macros only pivot the *proxy's* map pointer — the target is a separate
+  process writing the same map — and the runtime accepts `ON()` only until the second
+  `__AFL_LOOP()` pass.)
 - Root config keys starting with `__` (e.g. `__helpers: &anchor`) are ignored by
   `load_config()` and exempted in `config.schema.json` (root `patternProperties
   "^__"`): a reserved namespace for YAML anchor/merge (`<<`) helper fragments.
@@ -170,6 +183,7 @@ are ignored helper-anchor fields (see Important details).
   the "must use an AFL++ compiler" enforcement was moved to the `meson.build` compiler
   probe. Don't add an `#error` guard to the header.
 - Extra config keys not in the spec: `target.env`, `target.env_preserve`, `payload.*`,
+  `afl.cov_discard_init`,
   `target_cmplog.*`, `network_cmplog.*`, and the required
   `AFL_CASSOWIRE_FORCE_FINAL_LOC` env var. `target_cmplog`/`network_cmplog` are standalone
   (no key falls back to `target`/`network`) and required when `afl.enable_cmplog: true`;

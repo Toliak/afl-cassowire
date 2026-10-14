@@ -56,6 +56,12 @@ struct NetworkConfig {
 struct AflConfig {
     int loop_count = 50000;
     bool enable_cmplog = false;
+    // Discard all coverage collected before the first __AFL_LOOP() pass (proxy
+    // startup + the target's initialization, both written into the shared
+    // coverage map) via __AFL_COVERAGE_DISCARD() right before the loop, so
+    // afl-fuzz does not attribute the startup snapshot to the first fuzzed
+    // testcase (low stability).
+    bool cov_discard_init = true;
 };
 
 struct PortDetectionConfig {

@@ -472,7 +472,8 @@ std::variant<Config, ConfigError> load_config(const std::string& path) {
             YAML::Node afl_node = root["afl"];
             // --- Check for unknown keys in afl ---
             {
-                static const std::unordered_set<std::string> afl_allowed = {"loop_count", "enable_cmplog"};
+                static const std::unordered_set<std::string> afl_allowed = {"loop_count", "enable_cmplog",
+                                                                            "cov_discard_init"};
                 ConfigError err = check_unknown_keys(afl_node, afl_allowed, "afl");
                 if (!err.message.empty()) {
                     return err;
@@ -494,6 +495,13 @@ std::variant<Config, ConfigError> load_config(const std::string& path) {
                     cfg.afl.enable_cmplog = afl_node["enable_cmplog"].as<bool>();
                 } catch (const YAML::BadConversion&) {
                     return ConfigError{"afl.enable_cmplog", "Invalid type", "boolean", afl_node["enable_cmplog"].Scalar()};
+                }
+            }
+            if (afl_node["cov_discard_init"]) {
+                try {
+                    cfg.afl.cov_discard_init = afl_node["cov_discard_init"].as<bool>();
+                } catch (const YAML::BadConversion&) {
+                    return ConfigError{"afl.cov_discard_init", "Invalid type", "boolean", afl_node["cov_discard_init"].Scalar()};
                 }
             }
         }

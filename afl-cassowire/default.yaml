@@ -62,6 +62,10 @@ network: &net
 afl:
   loop_count: 50000            # Number of __AFL_LOOP iterations
   enable_cmplog: false         # Enable AFL compare log (requires __AFL_CMPLOG_SHM_ID)
+  cov_discard_init: true       # __AFL_COVERAGE_DISCARD() right before the first
+                               # __AFL_LOOP pass: drop the startup coverage (proxy +
+                               # target init, shared map) so afl-fuzz does not
+                               # attribute it to the first fuzzed testcase
 
 target_cmplog:                 # Compare-mode target (used instead of `target` when __AFL_CMPLOG_SHM_ID is set)
   binary: "./target-cmplog"    # Path to the compare-mode target binary (required)

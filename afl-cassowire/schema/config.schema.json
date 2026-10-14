@@ -160,6 +160,11 @@
           "type": "boolean",
           "default": false,
           "description": "Enable AFL compare log (requires __AFL_CMPLOG_SHM_ID). When true, the target_cmplog and network_cmplog sections become required."
+        },
+        "cov_discard_init": {
+          "type": "boolean",
+          "default": true,
+          "description": "Emit __AFL_COVERAGE_DISCARD() right before the first __AFL_LOOP pass so startup coverage (proxy init + target init in the shared map, plus the cmplog map) is not attributed to the first fuzzed testcase; the main stability knob. Requires the file-scope __AFL_COVERAGE() declaration. The following __AFL_COVERAGE_ON() (undoing __AFL_COVERAGE_START_OFF()) is unconditional, so setting this to false only keeps the startup feedback."
         }
       }
     },
