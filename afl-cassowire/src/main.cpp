@@ -34,6 +34,19 @@
 
 __AFL_FUZZ_INIT();
 
+// Selective coverage control (afl-cc injects the real macros via -D; the
+// placeholders in afl_compat.h are no-ops otherwise). __AFL_COVERAGE defines
+// the weak runtime flag the coverage control functions check and is required
+// for the feature to work; START_OFF keeps instrumentation silent from
+// process start. The proxy and the target share one coverage map, and
+// afl-fuzz would otherwise attribute everything that happens between
+// __AFL_INIT() and the first __AFL_LOOP() pass (config load, target spawn,
+// NGINX initialization) to the first fuzzed testcase - the observed low
+// stability. The startup feedback is discarded in run_proxy_mode() right
+// before the loop.
+__AFL_COVERAGE();
+__AFL_COVERAGE_START_OFF();
+
 volatile sig_atomic_t g_child_pid = 0;
 
 void kill_pgid(pid_t pgid) {
@@ -599,6 +612,23 @@ int run_proxy_mode(Config cfg, bool forward_output) {
 
     IterationStats stats;
     stats.last_heartbeat_ms = utils::get_time_ms();
+
+    // Coverage hand-off to the fuzz loop. wait_for_port() guarantees the
+    // target is fully initialized here, so the shared coverage map holds only
+    // startup feedback (the target's initialization plus whatever the proxy
+    // itself collected before __AFL_COVERAGE_ON()). __afl_coverage_discard()
+    // zeroes that map from the proxy side - within this batch the spawn code
+    // is already behind us, so this is the only point at which all of it can
+    // be dropped before afl-fuzz starts reading. Without this, the map state
+    // at the first __AFL_LOOP() pass is the startup snapshot instead of a
+    // clean slate, and every afl-fuzz respawn re-delivers slightly different
+    // startup feedback - the low stability. The discard also zeroes the
+    // cmplog map (the loop's own clean slate does not).
+    __AFL_COVERAGE_DISCARD();
+    // Pivot the proxy's instrumentation back to the real map after
+    // __AFL_COVERAGE_START_OFF(); coverage then stays on for the whole loop
+    // (the loop's own first pass re-arms the clean-slate handling).
+    __AFL_COVERAGE_ON();
 
     while (__AFL_LOOP(cfg.afl.loop_count)) {
         // One-based iteration number for the termination dumps (.msg), set
