@@ -37,9 +37,11 @@ namespace log {
      * with defaults at startup, again after parsing --log-level); each call
      * replaces the previous logger.
      *
-     * @param level Runtime log level (typically from the --log-level flag).
+     * @param console_level Runtime log level for console output (typically from the --log-level flag).
+     * @param crash_msg_level Log level for the ring buffer sink that captures messages
+     *        for crash/abort termination dumps (typically from the --crash-msg-log-level flag).
      */
-    void init(spdlog::level::level_enum level);
+    void init(spdlog::level::level_enum console_level, spdlog::level::level_enum crash_msg_level);
 
     /**
      * @brief Returns the recent warn/error messages captured by the logger.

@@ -25,6 +25,10 @@ namespace args {
             .help("Log level: trace, debug, info, warn, error, critical, off")
             .default_value(std::string("info"));
 
+        program.add_argument("--crash-msg-log-level")
+            .help("Log level for crash/abort message dumps (.msg): trace, debug, info, warn, error, critical, off")
+            .default_value(std::string("warn"));
+
         program.add_argument("--child-output")
             .help("Forward the target's stdout/stderr to the proxy's descriptors instead of /dev/null")
             .default_value(false)
@@ -57,6 +61,7 @@ namespace args {
         ParsedArgs parsed;
         parsed.config_path = program.get<std::string>("--config");
         parsed.log_level = program.get<std::string>("--log-level");
+        parsed.crash_msg_log_level = program.get<std::string>("--crash-msg-log-level");
         parsed.forward_output = program.get<bool>("--child-output");
         parsed.data_dir = program.get<std::string>("--data-dir");
         parsed.is_test_mode = program.is_subcommand_used("test");
@@ -69,6 +74,12 @@ namespace args {
         if (!log::parse_level(parsed.log_level)) {
             return ArgParseError{
                 "invalid --log-level '" + parsed.log_level +
+                    "': expected trace, debug, info, warn, error, critical, or off",
+                program.help().str()};
+        }
+        if (!log::parse_level(parsed.crash_msg_log_level)) {
+            return ArgParseError{
+                "invalid --crash-msg-log-level '" + parsed.crash_msg_log_level +
                     "': expected trace, debug, info, warn, error, critical, or off",
                 program.help().str()};
         }

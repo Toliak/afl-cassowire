@@ -25,7 +25,7 @@ namespace log {
 
     } // namespace
 
-    void init(spdlog::level::level_enum level) {
+    void init(spdlog::level::level_enum console_level, spdlog::level::level_enum crash_msg_level) {
         // The logger is constructed manually (not via the stdout_color_st
         // factory) so that init() is idempotent: the factory would try to
         // register the name "proxy" in the global registry on every call and
@@ -33,19 +33,19 @@ namespace log {
         // with defaults, once after parsing --log-level).
         if (!g_recent_sink) {
             g_recent_sink = std::make_shared<spdlog::sinks::ringbuffer_sink_st>(k_recent_capacity);
-            g_recent_sink->set_level(spdlog::level::warn);
+            g_recent_sink->set_level(crash_msg_level);
         }
         auto console_sink = std::make_shared<spdlog::sinks::stdout_color_sink_st>();
         // The console sink applies the runtime --log-level; the logger level
         // is floored at warn so that the ring sink keeps capturing warnings
         // even when the runtime level hides them from stdout (warn/error are
         // rare and throttled, so the extra formatting is negligible).
-        console_sink->set_level(level);
+        console_sink->set_level(console_level);
         auto logger = std::make_shared<spdlog::logger>(
             "proxy", spdlog::sinks_init_list{std::move(console_sink), g_recent_sink});
         logger->set_pattern("[%Y-%m-%d %H:%M:%S.%e] [%l] %v");
         logger->flush_on(spdlog::level::warn);
-        logger->set_level(std::min(level, spdlog::level::warn));
+        logger->set_level(std::min(console_level, spdlog::level::warn));
         spdlog::set_default_logger(std::move(logger));
     }
 

@@ -164,7 +164,7 @@
         "cov_discard_init": {
           "type": "boolean",
           "default": true,
-          "description": "Emit __AFL_COVERAGE_DISCARD() right before the first __AFL_LOOP pass so startup coverage (proxy init + target init in the shared map, plus the cmplog map) is not attributed to the first fuzzed testcase; the main stability knob. Requires the file-scope __AFL_COVERAGE() declaration. The following __AFL_COVERAGE_ON() (undoing __AFL_COVERAGE_START_OFF()) is unconditional, so setting this to false only keeps the startup feedback."
+          "description": "Emit __AFL_COVERAGE_DISCARD() right before the first __AFL_LOOP pass so startup coverage (proxy init + target init in the shared map, plus the cmplog map) is not attributed to the first fuzzed testcase; the main stability knob. Requires the file-scope __AFL_COVERAGE() declaration. Setting this to false keeps the startup feedback from both the proxy and the target in the shared coverage map."
         }
       }
     },
