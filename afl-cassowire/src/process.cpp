@@ -479,16 +479,7 @@ static void redirect_child_fds(SpawnMode mode, bool forward_output, int pipe_wri
 }
 
 SpawnedTarget fork_target(const Config& cfg, const TargetPrepared& prep, SpawnMode mode,
-                          bool forward_output, volatile sig_atomic_t* publish_pid) {
-    // Block SIGINT and SIGTERM in the parent to avoid the race where the handler
-    // runs before g_child_pid is set. The child will unblock these signals as its
-    // first action (after fork) so that the target receives them normally.
-    sigset_t block_mask, old_mask;
-    sigemptyset(&block_mask);
-    sigaddset(&block_mask, SIGINT);
-    sigaddset(&block_mask, SIGTERM);
-    sigprocmask(SIG_BLOCK, &block_mask, &old_mask);
-
+                          bool forward_output) {
     // Capture parent PID for the child's PDEATHSIG safety check
     const pid_t parent_pid = getpid();
 
@@ -501,7 +492,6 @@ SpawnedTarget fork_target(const Config& cfg, const TargetPrepared& prep, SpawnMo
     if (use_notif) {
         if (socketpair(AF_UNIX, SOCK_DGRAM, 0, sv) != 0) {
             PROXY_LOG_ERROR("socketpair for seccomp listener handoff failed: {}", strerror(errno));
-            sigprocmask(SIG_SETMASK, &old_mask, nullptr);
             return SpawnedTarget{-1, -1};
         }
     }
@@ -514,7 +504,6 @@ SpawnedTarget fork_target(const Config& cfg, const TargetPrepared& prep, SpawnMo
                 close(sv[1]);
             }
             PROXY_LOG_ERROR("failed to create pipe for map size extraction");
-            sigprocmask(SIG_SETMASK, &old_mask, nullptr);
             return SpawnedTarget{-1, -1};
         }
     }
@@ -530,13 +519,13 @@ SpawnedTarget fork_target(const Config& cfg, const TargetPrepared& prep, SpawnMo
             close(sv[1]);
         }
         PROXY_LOG_ERROR("fork() failed: {}", strerror(errno));
-        sigprocmask(SIG_SETMASK, &old_mask, nullptr);
         return SpawnedTarget{-1, -1};
     }
 
     if (pid == 0) {
-        // Child: restore signal mask (unblock SIGINT/SIGTERM) as the very first action
-        sigprocmask(SIG_SETMASK, &old_mask, nullptr);
+        // Child. The target inherits the proxy's signal mask unchanged; no
+        // signals are blocked around fork(). If the proxy died between fork()
+        // and the prctl below, the getppid() check catches the orphan.
 
         // Ask the Linux kernel to send SIGKILL to this child if the parent dies
         prctl(PR_SET_PDEATHSIG, SIGKILL); 
@@ -624,10 +613,6 @@ SpawnedTarget fork_target(const Config& cfg, const TargetPrepared& prep, SpawnMo
     }
 
     // Parent: we have successfully forked
-    if (publish_pid) {
-        *publish_pid = pid;
-    }
-    sigprocmask(SIG_SETMASK, &old_mask, nullptr);
 
     // Close the write end of the pipe in the parent (we only read from it)
     if (mode == SpawnMode::MapSizePass) {

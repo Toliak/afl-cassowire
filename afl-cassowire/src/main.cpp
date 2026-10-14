@@ -46,14 +46,19 @@ __AFL_FUZZ_INIT();
 // feedback from both is not attributed to the first fuzzed testcase.
 __AFL_COVERAGE();
 
-volatile sig_atomic_t g_child_pid = 0;
+// Target pid for the current mode. Plain lifecycle state: no signal handler
+// exists in the proxy, so nothing publishes or consumes this from handler
+// context. If the proxy dies for any reason, the target is killed by its
+// PR_SET_PDEATHSIG(SIGKILL) (see process::fork_target()).
+pid_t g_child_pid = 0;
 
 void kill_pgid(pid_t pgid) {
     if (pgid <= 0) return;
     kill(-pgid, SIGKILL);
 }
 
-// Async-signal-safe timed kill for process group
+// Timed kill for the target's process group (SIGTERM, wait, SIGKILL).
+// Called only from normal code paths.
 void timed_kill_pgid(pid_t pgid, int ms) {
     if (pgid <= 0) return;
 
@@ -92,7 +97,7 @@ void timed_kill_pgid(pid_t pgid, int ms) {
             break;
         }
 
-        // Short sleep to avoid busy-waiting (nanosleep is async-signal-safe)
+        // Short sleep to avoid busy-waiting
         struct timespec req = {0, 10000000}; // 10ms
         nanosleep(&req, nullptr);
     }
@@ -566,7 +571,7 @@ int run_proxy_mode(Config cfg, bool forward_output) {
         return 1;
     }
     process::SpawnedTarget spawned = process::fork_target(cfg, *prep_opt, process::SpawnMode::ProxyMode,
-                                                          forward_output, &g_child_pid);
+                                                          forward_output);
     if (spawned.pid <= 0) {
         PROXY_LOG_ERROR("failed to spawn target process.");
         return 1;
@@ -661,7 +666,7 @@ int run_test_mode(const Config& cfg, const std::string& input_path, bool forward
         return 1;
     }
     process::SpawnedTarget spawned1 = process::fork_target(cfg, *prep_opt1, process::SpawnMode::MapSizePass,
-                                                           false, nullptr);
+                                                           false);
     if (spawned1.pid <= 0) {
         PROXY_LOG_ERROR("failed to spawn target for map size extraction.");
         unsetenv("AFL_DUMP_MAP_SIZE");
@@ -740,7 +745,7 @@ int run_test_mode(const Config& cfg, const std::string& input_path, bool forward
     }
     PROXY_LOG_DEBUG("fork_target 2");
     process::SpawnedTarget spawned2 = process::fork_target(cfg, *prep_opt2, process::SpawnMode::PlainTest,
-                                                           forward_output, &g_child_pid);
+                                                           forward_output);
     if (spawned2.pid <= 0) {
         PROXY_LOG_ERROR("failed to spawn target for test iteration.");
         return 1;

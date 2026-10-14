@@ -9,7 +9,6 @@
 #include <vector>
 #include <optional>
 #include <cstdint>
-#include <csignal>
 
 namespace process {
 
@@ -111,14 +110,12 @@ namespace process {
      * @param mode selects redirection rules and other mode-specific behavior
      * @param forward_output forward the child's stdout/stderr to the proxy's
      *                       descriptors (--child-output flag) instead of /dev/null
-     * @param publish_pid if non-null, written with the child's PID before any blocking operation
-     *                    (intended for g_child_pid in main.cpp to make signal handlers safe)
      * @return SpawnedTarget containing the child PID, the map-size pipe fd for
      *         MapSizePass (caller must close it after use), and the seccomp
      *         notification listener fd in seccomp mode. On failure, pid == -1.
      */
     SpawnedTarget fork_target(const Config& cfg, const TargetPrepared& prep, SpawnMode mode,
-                              bool forward_output, volatile sig_atomic_t* publish_pid);
+                              bool forward_output);
 
     /**
      * @brief Result of wait_target_exit().
