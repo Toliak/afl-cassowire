@@ -22,6 +22,10 @@
         },
     ],
     "settings": {
+        "files.exclude": {
+            "**/.cache": true,
+            "**/.mypy_cache": true,
+        },
         "todohighlight.keywords": [
             {
                 "text": "WARN:",

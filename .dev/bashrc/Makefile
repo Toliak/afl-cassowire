@@ -13,6 +13,8 @@ bin:
 	ln -s "$(PROJECT_DIR)/aflpp/src/distrib/bin/afl-clang-lto++" ./bin/afl-clang-lto++
 	ln -s "$(PROJECT_DIR)/aflpp/src/distrib/bin/afl-clang-fast" ./bin/afl-clang-fast
 	ln -s "$(PROJECT_DIR)/aflpp/src/distrib/bin/afl-clang-fast++" ./bin/afl-clang-fast++
+	ln -s "$(PROJECT_DIR)/aflpp/src/distrib/bin/afl-qemu-trace" ./bin/afl-qemu-trace
+	ln -s "$(PROJECT_DIR)/aflpp/src/distrib/bin/afl-qemu-bridge" ./bin/afl-qemu-bridge
 	ln -s "$(PROJECT_DIR)/afl-cassowire/build/afl-cassowire" ./bin/afl-cassowire
 
 .bashrc: bin
