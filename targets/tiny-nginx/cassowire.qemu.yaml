@@ -40,26 +40,28 @@ target_cmplog:
     AFL_QEMU_MAP_SIZE: "65536"                     # <= AFL_CASSOWIRE_FORCE_FINAL_LOC
     WORKERS: "1"
 
-network:
+network: &network
   host: "127.0.0.1"
   port: 8060
   timeout_ms: 200
   initial_ms: 3000                                 # qemu + guest startup is slower
+
   probe: true
+  probe_retry_ms: 10
+  probe_attempts: 5
 
 network_cmplog:
-  host: "127.0.0.1"
+  <<: *network
   port: 9060
-  timeout_ms: 200
-  initial_ms: 3000                                 # qemu + guest startup is slower
-  probe: true
 
 afl:
   loop_count: 20000
   enable_cmplog: true
 
 port_detection:
-  primary: "procfs"                                # REQUIRED for QEMU targets
+  #primary: "procfs"                                # REQUIRED for QEMU targets
+  primary: "seccomp"
+  verify_ownership: true
 
 # cleanup:
 #   force_kill_ms: 2000

@@ -24,15 +24,12 @@ network: &network
   initial_ms: 200              # Port detection timeout in milliseconds
 
   probe: true
+  probe_retry_ms: 10
+  probe_attempts: 3
 
 network_cmplog: 
-  # <<: *network
-  host: "127.0.0.1"            # TCP host to connect to
+  <<: *network
   port: 9060                   # Port to connect to (1-65535, required)
-  timeout_ms: 100              # Network send/recv timeout in milliseconds
-  initial_ms: 200              # Port detection timeout in milliseconds
-
-  probe: true
 
 afl:
   loop_count: 20000            # Number of __AFL_LOOP iterations
@@ -43,10 +40,12 @@ port_detection:
   # primary: "ptrace"            # Method: "procfs", "ptrace", or "seccomp"
   # primary: "seccomp"            # Method: "procfs", "ptrace", or "seccomp"
   # defork: true
+  
+  verify_ownership: true
 
-cleanup:
-  force_kill_ms: 150          # Wait time after SIGTERM before SIGKILL
-  kill_pattern: "tinynginx"               # Optional: auto-kill stale target processes
+# cleanup:
+#  force_kill_ms: 150          # Wait time after SIGTERM before SIGKILL
+#  kill_pattern: "tinynginx"               # Optional: auto-kill stale target processes
     # Scalar form — matches /proc/<pid>/comm:
     # "nginx"
     #

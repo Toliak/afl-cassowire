@@ -25,9 +25,11 @@ network_cmplog:
 afl:
   loop_count: 10000            # Number of __AFL_LOOP iterations
   enable_cmplog: true         # Enable AFL compare log (requires __AFL_CMPLOG_SHM_ID)
+  cov_discard_init: true
+  # cov_discard_probe: true
 
 port_detection:
-  primary: "procfs"            # Method: "procfs", "ptrace", or "seccomp"
+  primary: "seccomp"            # Method: "procfs", "ptrace", or "seccomp"
   # primary: "ptrace"            # Method: "procfs", "ptrace", or "seccomp"
   # primary: "seccomp"            # Method: "procfs", "ptrace", or "seccomp"
   # defork: true
