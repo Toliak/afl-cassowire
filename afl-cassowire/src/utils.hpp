@@ -11,9 +11,17 @@
 #include <unistd.h>
 #include <variant>
 #include <vector>
+#include <sched.h>
 
 namespace utils {
 
+    /**
+     * @brief Gets the current CPU affinity mask as a comma-separated list of CPU numbers.
+     *
+     * @return std::string Comma-separated CPU numbers, "none" if no CPUs are set,
+     *         or "<unavailable>" if the operation fails.
+     */
+    std::string get_cpu_affinity();
     /**
      * @brief Move-only RAII wrapper around a file descriptor.
      *

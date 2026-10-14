@@ -17,6 +17,7 @@
 #include <fcntl.h>
 #include <sys/stat.h>
 #include <sys/types.h>
+#include <sched.h>
 
 namespace utils {
 
@@ -302,6 +303,30 @@ ReadResult read_stdin(size_t max_bytes) {
 
 ReadResult read_input_file(std::string_view path, size_t max_bytes) {
     return (path == "-") ? read_stdin(max_bytes) : read_file(path, max_bytes);
+}
+
+std::string get_cpu_affinity() {
+    cpu_set_t set;
+    if (sched_getaffinity(0, sizeof(cpu_set_t), &set) != 0) {
+        return "<unavailable>";
+    }
+    
+    std::string result;
+    bool first = true;
+    for (int i = 0; i < CPU_SETSIZE; ++i) {
+        if (CPU_ISSET(i, &set)) {
+            if (!first) {
+                result += ",";
+            }
+            result += std::to_string(i);
+            first = false;
+        }
+    }
+    
+    if (result.empty()) {
+        return "none";
+    }
+    return result;
 }
 
 } // namespace utils

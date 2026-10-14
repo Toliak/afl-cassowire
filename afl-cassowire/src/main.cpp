@@ -172,9 +172,10 @@ static void update_iteration_stats(IterationStats& stats, uint64_t connect_ms,
 
     const uint64_t now_ms = utils::get_time_ms();
     if (now_ms - stats.last_heartbeat_ms >= kHeartbeatMs) {
-        PROXY_LOG_INFO("heartbeat: {} iterations, max connect/send/wait/probe = {}/{}/{}/{} ms, slow={}",
+        PROXY_LOG_INFO("heartbeat: {} iterations, max connect/send/wait/probe = {}/{}/{}/{} ms, slow={}, cpu affinity: {}",
                        stats.iterations, stats.max_connect_ms, stats.max_send_ms,
-                       stats.max_wait_ms, stats.max_probe_ms, stats.slow_iters);
+                       stats.max_wait_ms, stats.max_probe_ms, stats.slow_iters,
+                       utils::get_cpu_affinity());
         spdlog::default_logger()->flush();
         stats.last_heartbeat_ms = now_ms;
     }
