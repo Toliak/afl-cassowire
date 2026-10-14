@@ -34,20 +34,17 @@
 
 __AFL_FUZZ_INIT();
 
-// Selective coverage control (afl-cc injects the real macros via -D; the
-// placeholders in afl_compat.h are no-ops otherwise). __AFL_COVERAGE defines
-// the weak runtime flag the coverage control functions check and is required
-// for the feature to work; START_OFF keeps instrumentation silent from
-// process start. The proxy and the target share one coverage map, and
-// afl-fuzz would otherwise attribute everything that happens between
-// __AFL_INIT() and the first __AFL_LOOP() pass (config load, target spawn,
-// NGINX initialization) to the first fuzzed testcase - the observed low
-// stability. The startup feedback is discarded in run_proxy_mode() right
-// before the loop when afl.cov_discard_init is true (default); the
-// __AFL_COVERAGE_ON() there is unconditional, so the proxy's own coverage
-// always resumes before the loop even with the discard disabled.
+// Coverage discard support. afl-cc injects the real macros via -D; the
+// placeholders in afl_compat.h are no-ops otherwise. __AFL_COVERAGE defines
+// the weak runtime flag that __AFL_COVERAGE_DISCARD() relies on. The binary is
+// built with the patched afl-clang-fast++ (patch/force_loc.patch), which skips
+// PC-guard edge emission for afl-cassowire, so the proxy itself writes no
+// coverage; __AFL_COVERAGE_ON() / __AFL_COVERAGE_OFF() therefore have no
+// effect here. The proxy and the target share one coverage map, and
+// __AFL_COVERAGE_DISCARD() (run_proxy_mode(), when afl.cov_discard_init is
+// true) zeroes that map before the first __AFL_LOOP() pass, so startup
+// feedback from both is not attributed to the first fuzzed testcase.
 __AFL_COVERAGE();
-__AFL_COVERAGE_START_OFF();
 
 volatile sig_atomic_t g_child_pid = 0;
 
@@ -617,25 +614,16 @@ int run_proxy_mode(Config cfg, bool forward_output) {
 
     // Coverage hand-off to the fuzz loop. wait_for_port() guarantees the
     // target is fully initialized here, so the shared coverage map holds only
-    // startup feedback (the target's initialization plus whatever the proxy
-    // itself collected before __AFL_COVERAGE_ON()). __afl_coverage_discard()
-    // zeroes that map from the proxy side - within this batch the spawn code
-    // is already behind us, so this is the only point at which all of it can
-    // be dropped before afl-fuzz starts reading. Without this, the map state
-    // at the first __AFL_LOOP() pass is the startup snapshot instead of a
-    // clean slate, and every afl-fuzz respawn re-delivers slightly different
-    // startup feedback - the low stability. The discard also zeroes the
-    // cmplog map (the loop's own clean slate does not).
-    // afl.cov_discard_init (default true) gates the discard; the ON below is
-    // unconditional because __AFL_COVERAGE_START_OFF() at file scope must
-    // always be undone before the loop.
+    // startup feedback (the target's initialization plus the proxy's startup).
+    // __AFL_COVERAGE_DISCARD() zeroes that map (and the cmplog map) right
+    // before the loop, so the first __AFL_LOOP() pass starts from a clean
+    // slate instead of the startup snapshot, which afl-fuzz would otherwise
+    // re-deliver slightly differently on every respawn (the low stability).
+    // afl.cov_discard_init (default true) gates the discard; when false the
+    // startup feedback is kept.
     if (cfg.afl.cov_discard_init) {
         __AFL_COVERAGE_DISCARD();
     }
-    // Pivot the proxy's instrumentation back to the real map after
-    // __AFL_COVERAGE_START_OFF(); coverage then stays on for the whole loop
-    // (the loop's own first pass re-arms the clean-slate handling).
-    __AFL_COVERAGE_ON();
 
     while (__AFL_LOOP(cfg.afl.loop_count)) {
         // One-based iteration number for the termination dumps (.msg), set
@@ -815,8 +803,8 @@ int run_test_mode(const Config& cfg, const std::string& input_path, bool forward
 
 int main(int argc, char* argv[]) {
     // Initialize logging first so that CLI/config errors are reported through
-    // the logger; --log-level reconfigures it after parsing.
-    log::init(spdlog::level::info);
+    // the logger; --log-level and --crash-msg-log-level reconfigures it after parsing.
+    log::init(spdlog::level::info, spdlog::level::warn);
 
     // TODO(claude): CLI vs spec. (1) Spec says `proxy` is the DEFAULT mode; with argparse subparsers and no
     //   subcommand it works only because is_subcommand_used("test") is false - but `proxy` subcommand
@@ -835,14 +823,20 @@ int main(int argc, char* argv[]) {
     }
     const auto& parsed = std::get<args::ParsedArgs>(args_res);
 
-    // parse_args() already validated the level name; this only converts it.
+    // parse_args() already validated the level names; this only converts them.
     auto log_level = log::parse_level(parsed.log_level);
     if (!log_level) {
         PROXY_LOG_ERROR("invalid --log-level '{}': expected trace, debug, info, warn, error, critical, or off",
                         parsed.log_level);
         return 1;
     }
-    log::init(*log_level);
+    auto crash_msg_log_level = log::parse_level(parsed.crash_msg_log_level);
+    if (!crash_msg_log_level) {
+        PROXY_LOG_ERROR("invalid --crash-msg-log-level '{}': expected trace, debug, info, warn, error, critical, or off",
+                        parsed.crash_msg_log_level);
+        return 1;
+    }
+    log::init(*log_level, *crash_msg_log_level);
 
     // Destination for crash/abort termination dumps (.msg/.data).
     utils::set_data_dir(parsed.data_dir);

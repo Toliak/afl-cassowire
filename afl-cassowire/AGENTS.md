@@ -125,19 +125,16 @@ are ignored helper-anchor fields (see Important details).
    termination outside the loop or test mode). Dumps are best-effort and never fatal.
 - Payload sent over TCP is `payload.prefix + fuzz input + payload.suffix`
   (`PayloadConfig::wrap()`); values may be `!!binary`.
-- Startup-coverage fix (stability): `main.cpp` has a file-scope `__AFL_COVERAGE()` +
-  `__AFL_COVERAGE_START_OFF()` (afl-cc `-D` macros; no-op placeholders in `afl_compat.h`),
-  and `run_proxy_mode()` emits `__AFL_COVERAGE_DISCARD()` (gated by `afl.cov_discard_init`,
-  default true) + unconditional `__AFL_COVERAGE_ON()` right before the first `__AFL_LOOP()`
-  pass — the proxy and the instrumented target share one coverage map, so the discard
-  zeroes the startup feedback (NGINX init included; `__afl_coverage_discard()` also zeroes
-  the cmplog map) that would otherwise be attributed to the first testcase. The ON is
-  mandatory: with START_OFF the runtime never auto-re-enables; it only works before the
-  loop because `__afl_persistent_loop()` clears `__afl_selective_coverage_temp` on the
-  second pass. (`__AFL_COVERAGE_OFF()` around in-loop work cannot work as a probe-noise
-  filter: the macros only pivot the *proxy's* map pointer — the target is a separate
-  process writing the same map — and the runtime accepts `ON()` only until the second
-  `__AFL_LOOP()` pass.)
+- Startup-coverage fix (stability): `main.cpp` has a file-scope `__AFL_COVERAGE()`
+  (afl-cc `-D` macro; no-op placeholder in `afl_compat.h`). afl-cassowire is built with
+  the patched `afl-clang-fast++` (`patch/force_loc.patch`), which skips PC-guard edge
+  emission for this binary, so the proxy writes no coverage and `__AFL_COVERAGE_ON()` /
+  `__AFL_COVERAGE_OFF()` have no effect (they are not used). `run_proxy_mode()` emits
+  `__AFL_COVERAGE_DISCARD()` right before the first `__AFL_LOOP()` pass, gated by
+  `afl.cov_discard_init` (default true). DISCARD `memset`s the shared map
+  (`__afl_coverage_discard()` zeroes `__afl_area_ptr_backup`, plus the cmplog map), so
+  startup feedback from the proxy and the instrumented target (NGINX init included) is
+  not attributed to the first testcase. With `cov_discard_init: false` nothing clears it.
 - Root config keys starting with `__` (e.g. `__helpers: &anchor`) are ignored by
   `load_config()` and exempted in `config.schema.json` (root `patternProperties
   "^__"`): a reserved namespace for YAML anchor/merge (`<<`) helper fragments.

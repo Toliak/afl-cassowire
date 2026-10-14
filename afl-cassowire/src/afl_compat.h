@@ -30,31 +30,15 @@
 
 /* Selective coverage control. afl-cc injects the real macros via -D (see
    instrumentation/README.instrument_list.md sec. 2); these are the no-ops for
-   builds without AFL++'s toolchain. __AFL_COVERAGE and __AFL_COVERAGE_START_OFF
-   expand to file-scope definitions in AFL++ builds and may be used once, at
-   file scope; the rest are function calls usable anywhere. */
+   builds without AFL++'s toolchain. __AFL_COVERAGE expands to a file-scope
+   definition in AFL++ builds and may be used once, at file scope; DISCARD is
+   a function call usable anywhere. */
 #ifndef __AFL_COVERAGE
 #define __AFL_COVERAGE()
 #endif
 
-#ifndef __AFL_COVERAGE_START_OFF
-#define __AFL_COVERAGE_START_OFF()
-#endif
-
-#ifndef __AFL_COVERAGE_ON
-#define __AFL_COVERAGE_ON()
-#endif
-
-#ifndef __AFL_COVERAGE_OFF
-#define __AFL_COVERAGE_OFF()
-#endif
-
 #ifndef __AFL_COVERAGE_DISCARD
 #define __AFL_COVERAGE_DISCARD()
-#endif
-
-#ifndef __AFL_COVERAGE_SKIP
-#define __AFL_COVERAGE_SKIP()
 #endif
 
 #endif /* AFL_COMPAT_H */
