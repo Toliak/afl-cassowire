@@ -91,13 +91,20 @@ std::string WaitError::to_string() const {
     return ss.str();
 }
 
+struct InodeOwnershipResult {
+    bool found = false;
+    bool unreadable = false;
+    int last_errno = 0;
+    pid_t last_errno_pid = 0;
+};
+
 // True if "socket:[<inode>]" is held by @p target_pid or any process in its
-// subtree (NGINX-style workers included). Sets @p fd_dir_unreadable when a
-// tree pid's /proc/<pid>/fd could not be opened for permission reasons
-// (EACCES/EPERM, e.g. a setuid target that dropped privileges): ownership
-// then cannot be proven, and the caller decides to accept or reject.
-static bool inode_owned_by_tree(pid_t target_pid, const std::string& inode,
-                                bool* fd_dir_unreadable) {
+// subtree (NGINX-style workers included). Returns detailed result including
+// whether the inode was found, whether EACCES/EPERM was encountered (e.g. a
+// setuid target that dropped privileges), and the last non-permission errno
+// (e.g. ENOENT for dead process, EMFILE/ENFILE for resource exhaustion).
+static InodeOwnershipResult check_inode_ownership(pid_t target_pid, const std::string& inode) {
+    InodeOwnershipResult result;
     const std::string want = "socket:[" + inode + "]";
     std::vector<pid_t> tree = process::collect_pid_tree(target_pid);
     for (pid_t pid : tree) {
@@ -105,28 +112,34 @@ static bool inode_owned_by_tree(pid_t target_pid, const std::string& inode,
         snprintf(dir, sizeof(dir), "/proc/%d/fd", pid);
         DIR* d = opendir(dir);
         if (!d) {
-            if ((errno == EACCES || errno == EPERM) && fd_dir_unreadable) {
-                *fd_dir_unreadable = true;
+            int err = errno;
+            if (err == EACCES || err == EPERM) {
+                result.unreadable = true;
+            } else if (err != ENOENT) {
+                // Track non-permission, non-ENOENT errors (ENOENT = process already dead)
+                result.last_errno = err;
+                result.last_errno_pid = pid;
             }
-            continue; // vanished pid or another error: skip it
+            continue;
         }
         struct dirent* e;
         while ((e = readdir(d)) != nullptr) {
-            if (e->d_name[0] < '0' || e->d_name[0] > '9') continue; // skip "." and ".."
+            if (e->d_name[0] < '0' || e->d_name[0] > '9') continue;
             char path[96];
             snprintf(path, sizeof(path), "%s/%s", dir, e->d_name);
-            char link[128]; // "socket:[" + <=20 inode digits + "]" fits easily
+            char link[128];
             ssize_t n = readlink(path, link, sizeof(link) - 1);
             if (n <= 0) continue;
             link[n] = '\0';
             if (want == link) {
                 closedir(d);
-                return true;
+                result.found = true;
+                return result;
             }
         }
         closedir(d);
     }
-    return false;
+    return result;
 }
 
 // TODO(claude): RESOLVED (was: procfs detection could not notice that the target already died - it
@@ -202,13 +215,13 @@ static DetectResult check_procfs(pid_t target_pid, int target_port, uint64_t tim
 
         // Ownership verification: the inode must be held by the target or one of
         // its descendants (NGINX-style workers included).
-        bool fd_dir_unreadable = false;
-        if (inode_owned_by_tree(target_pid, listen_inode, &fd_dir_unreadable)) {
+        auto ownership = check_inode_ownership(target_pid, listen_inode);
+        if (ownership.found) {
             PROXY_LOG_DEBUG("port {} listening via inode {} owned by target {} (procfs)",
                             target_port, listen_inode, static_cast<int>(target_pid));
             return std::monostate{};
         }
-        if (fd_dir_unreadable) {
+        if (ownership.unreadable) {
             // Cannot prove ownership (e.g. a setuid target that dropped
             // privileges): accept rather than wedge the proxy, but say so.
             if (!warned_unreadable) {
@@ -216,6 +229,17 @@ static DetectResult check_procfs(pid_t target_pid, int target_port, uint64_t tim
                                "{} or a descendant is unreadable (EACCES/EPERM, e.g. a setuid "
                                "target); accepting the port unverified",
                                target_port, listen_inode, static_cast<int>(target_pid));
+                warned_unreadable = true;
+            }
+            return std::monostate{};
+        }
+        if (ownership.last_errno != 0) {
+            if (!warned_unreadable) {
+                PROXY_LOG_WARN("port {} is listening (inode {}) but fd directory access failed "
+                               "for target {} or descendant {}: {}",
+                               target_port, listen_inode, static_cast<int>(target_pid),
+                               static_cast<int>(ownership.last_errno_pid),
+                               strerror(ownership.last_errno));
                 warned_unreadable = true;
             }
             return std::monostate{};
