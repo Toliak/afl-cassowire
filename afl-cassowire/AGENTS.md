@@ -164,7 +164,13 @@ are ignored helper-anchor fields (see Important details).
   target ends in `crash_proxy` (SIGSEGV) / `abort_proxy` (SIGABRT) as usual; a
   live target gets one probe retry (WARN includes the errno and a hint on
   `EADDRNOTAVAIL`/`EMFILE`-style resource exhaustion), and only a second
-  consecutive failure aborts the proxy for the AFL respawn.
+  consecutive failure aborts the proxy for the AFL respawn. A failed
+  `exchange_once()` connect rides the same path: after the immediate health
+  classification a live target falls through to the probe (instead of
+  returning), so a persistently unreachable listener exhausts
+  `network.probe_attempts` there and aborts for the AFL respawn;
+  `network.probe: false` is the explicit opt-out (retry with rate-limited
+  logs, visible via the heartbeat).
 - Iteration/probe sockets are armed with `SO_LINGER{1,0}`
   (`network::arm_rst_on_close()`) once their data is fully read, so `close()`
   sends RST: nothing sits in TIME_WAIT and the proxy's ephemeral port range

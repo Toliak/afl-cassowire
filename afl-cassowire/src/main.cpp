@@ -288,11 +288,13 @@ void run_fuzz_iteration(const Config& cfg, pid_t child_pid, int target_pidfd,
                             ex.connect_error->to_string(),
                             log::throttle_suffix(stats.connect_err));
         }
-        // Connection failed, target might be dead.
-        // Check health immediately.
-        // TODO(claude): a connect failure against a live target just falls through to the next loop
-        //   iteration, which keeps retrying (and logging, rate-limited) forever - AFL sees a hang instead
-        //   of a clean failure. An exited/crashed target is handled below via check_target_state.
+        // Connection failed, target might be dead. Check health immediately; a
+        // live target falls through to the quiescence probe below: it is
+        // another connect, so a persistently unreachable listener exhausts
+        // probe_attempts there and aborts the proxy for the AFL respawn, while
+        // a transient blip is serviced and the next iteration exchanges
+        // normally. (With network.probe disabled the loop keeps retrying with
+        // rate-limited logs - the explicit opt-out of the auto-respawn.)
         auto st = process::check_target_state(child_pid, target_pidfd, cfg.cleanup.force_kill_ms);
         switch (st.kind) {
         case process::TargetState::Kind::Crashed:
@@ -309,56 +311,52 @@ void run_fuzz_iteration(const Config& cfg, pid_t child_pid, int target_pidfd,
                                payload_buf);
             break;
         case process::TargetState::Kind::Alive:
-            // Transient connect failure against a live target; retry next iteration.
-            break;
-        }
-        update_iteration_stats(stats, ex.connect_ms, 0, 0, 0, budget_ms);
-        return;
-    }
-    PROXY_LOG_TRACE("successfully connected");
-
-    if (ex.connect_ms >= budget_ms) {
-        PROXY_LOG_WARN("connect to {}:{} took {} ms (>= timeout {} ms)",
-                       cfg.network.host, cfg.network.port, ex.connect_ms, budget_ms);
-    }
-
-    if (ex.send_error) {
-        if (stats.send_err.allow()) {
-            PROXY_LOG_ERROR("send failed after {} ms: {}{}",
-                            ex.send_ms, ex.send_error->to_string(),
-                            log::throttle_suffix(stats.send_err));
-        }
-    } else if (ex.send_ms >= budget_ms) {
-        PROXY_LOG_WARN("send_all of {} bytes took {} ms (>= timeout {} ms); target stopped draining the socket",
-                       ex.request_size, ex.send_ms, budget_ms);
-    }
-
-    PROXY_LOG_TRACE("Request (size={}): '{}'",
-                        ex.request_size,
-                        log::escape_bytes(payload_buf, 256));
-    if (ex.wait_error) {
-        if (stats.wait_err.allow()) {
-            std::string hint;
-            if (ex.wait_error->kind == network::WaitError::Kind::TimedOut) {
-                hint = " (no response; if the request declared a Content-Length larger than the "
-                       "body sent, or the server is keep-alive, the target may withhold its "
-                       "response even after shutdown(SHUT_WR))";
-            }
-            PROXY_LOG_ERROR("waiting for response failed after {} ms: {}{}{}",
-                            ex.wait_ms, ex.wait_error->to_string(), hint,
-                            log::throttle_suffix(stats.wait_err));
+            break; // live target: the quiescence probe below decides
         }
     } else {
-        PROXY_LOG_TRACE("Response (size={}): '{}'",
-                        ex.response.size(),
-                        log::escape_bytes(ex.response, 256));
-        if (ex.wait_ms >= budget_ms) {
-            PROXY_LOG_WARN("response took {} ms (>= timeout {} ms): {} bytes received; target kept the connection open",
-                           ex.wait_ms, budget_ms, ex.response.size());
+        PROXY_LOG_TRACE("successfully connected");
+
+        if (ex.connect_ms >= budget_ms) {
+            PROXY_LOG_WARN("connect to {}:{} took {} ms (>= timeout {} ms)",
+                           cfg.network.host, cfg.network.port, ex.connect_ms, budget_ms);
+        }
+
+        if (ex.send_error) {
+            if (stats.send_err.allow()) {
+                PROXY_LOG_ERROR("send failed after {} ms: {}{}",
+                                ex.send_ms, ex.send_error->to_string(),
+                                log::throttle_suffix(stats.send_err));
+            }
+        } else if (ex.send_ms >= budget_ms) {
+            PROXY_LOG_WARN("send_all of {} bytes took {} ms (>= timeout {} ms); target stopped draining the socket",
+                           ex.request_size, ex.send_ms, budget_ms);
+        }
+
+        PROXY_LOG_TRACE("Request (size={}): '{}'",
+                            ex.request_size,
+                            log::escape_bytes(payload_buf, 256));
+        if (ex.wait_error) {
+            if (stats.wait_err.allow()) {
+                std::string hint;
+                if (ex.wait_error->kind == network::WaitError::Kind::TimedOut) {
+                    hint = " (no response; if the request declared a Content-Length larger than the "
+                           "body sent, or the server is keep-alive, the target may withhold its "
+                           "response even after shutdown(SHUT_WR))";
+                }
+                PROXY_LOG_ERROR("waiting for response failed after {} ms: {}{}{}",
+                                ex.wait_ms, ex.wait_error->to_string(), hint,
+                                log::throttle_suffix(stats.wait_err));
+            }
+        } else {
+            PROXY_LOG_TRACE("Response (size={}): '{}'",
+                            ex.response.size(),
+                            log::escape_bytes(ex.response, 256));
+            if (ex.wait_ms >= budget_ms) {
+                PROXY_LOG_WARN("response took {} ms (>= timeout {} ms): {} bytes received; target kept the connection open",
+                               ex.wait_ms, budget_ms, ex.response.size());
+            }
         }
     }
-
-    PROXY_LOG_TRACE("one iteration done");
 
     // Post-response quiescence probe (network.probe). The target must service
     // a throwaway connection before this iteration ends; a serial server can
