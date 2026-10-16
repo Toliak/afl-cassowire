@@ -273,10 +273,6 @@ ExchangeOutcome exchange_once(const Config& cfg, const uint8_t* input, size_t in
 void run_fuzz_iteration(const Config& cfg, pid_t child_pid, int target_pidfd,
                         std::vector<uint8_t>& payload_buf, IterationStats& stats) {
     PROXY_LOG_TRACE("loop beginning");
-    // TODO(claude): __AFL_FUZZ_TESTCASE_BUF/LEN only work if the shmem testcase feature is enabled by the AFL
-    //   toolchain; `buf` is used without a null check, and len == 0 still opens a connection and sends nothing.
-    //   (The former per-iteration std::cout debug lines are now PROXY_LOG_TRACE, compiled out with
-    //   -Dstrip_low_logs=true and filtered by --log-level otherwise.)
     int len = __AFL_FUZZ_TESTCASE_LEN;
     uint8_t* buf = __AFL_FUZZ_TESTCASE_BUF;
     const uint64_t budget_ms = static_cast<uint64_t>(cfg.network.timeout_ms);
@@ -294,16 +290,9 @@ void run_fuzz_iteration(const Config& cfg, pid_t child_pid, int target_pidfd,
         }
         // Connection failed, target might be dead.
         // Check health immediately.
-        // TODO(claude): BUGS. (1) A connect failure when the target is alive falls through to the next
-        //   loop iteration, which keeps retrying (and logging) forever - AFL sees a hang instead of a
-        //   clean failure. PARTIALLY RESOLVED: an exited/unknown target is now detected via
-        //   check_target_state and aborts the proxy below; a live-but-unconnectable target still just
-        //   retries on the next iteration.
-        //   (2) RESOLVED: right after a crash waitpid(WNOHANG) used to return 0 and miss it; check_target_state
-        //       now reads /proc exit flags and waits on the pidfd, so the crash is seen in this iteration.
-        //   (3) RESOLVED: use utils::crash_proxy() ([noreturn], abort() fallback) instead of relying on a bare
-        //       raise(SIGSEGV) to kill the process.
-        //   (4) The dead target is never respawned; spec only says to crash.
+        // TODO(claude): a connect failure against a live target just falls through to the next loop
+        //   iteration, which keeps retrying (and logging, rate-limited) forever - AFL sees a hang instead
+        //   of a clean failure. An exited/crashed target is handled below via check_target_state.
         auto st = process::check_target_state(child_pid, target_pidfd, cfg.cleanup.force_kill_ms);
         switch (st.kind) {
         case process::TargetState::Kind::Crashed:
@@ -489,10 +478,10 @@ void run_fuzz_iteration(const Config& cfg, pid_t child_pid, int target_pidfd,
     // until the death materialises, so the crash is seen in THIS iteration.
     // TODO(claude): (1) still racy for a crash that happens AFTER this check
     //   returns Alive and after the probe was serviced (deferred timers / async
-    //   work) - that needs idle detection (procfs syscall whitelist) or ptrace
-    //   checkpoints, not a sleep. (2) crashes in worker children of the target
-    //   (nginx workers, not the direct child) are still not detected here - only
-    //   the direct child pid is watched (procfs/PF check is per-pid).
+    //   work) - that needs idle detection (e.g. a procfs syscall whitelist),
+    //   not a sleep. (2) crashes in worker children of the target (nginx
+    //   workers, not the direct child) are still not detected here - only the
+    //   direct child pid is watched (procfs/PF check is per-pid).
     auto st = process::check_target_state(child_pid, target_pidfd, cfg.cleanup.force_kill_ms);
     PROXY_LOG_TRACE("target state: {}", st.to_string());
     switch (st.kind) {
@@ -517,8 +506,6 @@ int run_proxy_mode(Config cfg, bool forward_output) {
         PROXY_LOG_WARN("prctl(PR_SET_DUMPABLE, 0) failed: {} (continuing)", std::strerror(errno));
     }
 
-    // TODO(claude): spec 6.1 order: cleanup -> check __AFL_SHM_ID -> __AFL_INIT -> spawn. Here cleanup runs in
-    //   main() before the env checks (ok), but see the next TODO on AFL_CASSOWIRE_FORCE_FINAL_LOC.
     // Check AFL SHM IDs
     if (!getenv("__AFL_SHM_ID")) {
         PROXY_LOG_ERROR("__AFL_SHM_ID not found in environment. Run with afl-fuzz.");
@@ -541,10 +528,9 @@ int run_proxy_mode(Config cfg, bool forward_output) {
 
     // AFL_CASSOWIRE_FORCE_FINAL_LOC is consumed by the target's AFL++ runtime to
     // force __afl_final_loc. In proxy mode it must be set and be a valid
-    // uint64 integer.
-    // TODO(claude): NOT IN SPEC. AFL_CASSOWIRE_FORCE_FINAL_LOC is a mandatory env var here (proxy refuses to start
-    //   without it) but spec 3/6.1 only requires __AFL_SHM_ID (+ __AFL_CMPLOG_SHM_ID). It is also never
-    //   forwarded to the target (see process.cpp), and value is only printed. Document in the spec or drop.
+    // uint64 integer. The proxy only validates and logs the value; it is NOT
+    // forwarded explicitly: the target sees it only with env_preserve: all, or
+    // when it is listed under target.env.
     const char* final_loc_str = getenv("AFL_CASSOWIRE_FORCE_FINAL_LOC");
     if (!final_loc_str) {
         PROXY_LOG_ERROR("AFL_CASSOWIRE_FORCE_FINAL_LOC not found in environment. Run with AFL_CASSOWIRE_FORCE_FINAL_LOC=<uint64>.");
@@ -640,9 +626,9 @@ int run_proxy_mode(Config cfg, bool forward_output) {
     }
 
     // Clean exit of AFL loop
-    // TODO(claude): spec 5.1/6.1 says SIGTERM then wait force_kill_ms then SIGKILL; this uses plain SIGKILL
-    //   (the correct call is commented out). A SIGKILL'd target leaves no chance to flush logs/coverage.
-    //   Also the child is not reaped here.
+    // TODO(claude): the loop exit uses plain SIGKILL (kill_pgid); the graceful timed_kill_pgid (SIGTERM,
+    //   wait force_kill_ms, SIGKILL) is commented out. A SIGKILL'd target leaves no chance to flush
+    //   logs/coverage. Also the child is not reaped here.
     // timed_kill_pgid(g_child_pid, cfg.cleanup.force_kill_ms);
     kill_pgid(g_child_pid);
     PROXY_LOG_TRACE("kill {}", static_cast<int>(g_child_pid));
@@ -656,8 +642,8 @@ int run_test_mode(const Config& cfg, const std::string& input_path, bool forward
     }
 
     // --- Pass 1: Map Size Extraction ---
-    // TODO(claude): setenv(AFL_DUMP_MAP_SIZE) on the PROXY's own environment is redundant (spawn_target already
-    //   adds it via set_env_var when is_map_size_pass) and, with env_preserve: all, leaks into the proxy's
+    // TODO(claude): setenv(AFL_DUMP_MAP_SIZE) on the PROXY's own environment is redundant (prepare_target()
+    //   already adds it for SpawnMode::MapSizePass) and, with env_preserve: all, leaks into the proxy's
     //   environ; if spawn fails (early return below) it is never unset.
     setenv("AFL_DUMP_MAP_SIZE", "1", 1);
     auto prep_opt1 = process::prepare_target(cfg, process::SpawnMode::MapSizePass);
@@ -676,13 +662,9 @@ int run_test_mode(const Config& cfg, const std::string& input_path, bool forward
     g_child_pid = spawned1.pid;
 
     // TODO(claude): the exit status is only logged, not acted on, and Pass 1 still proceeds to Pass 2
-    //   even when the map size was missing/invalid (see the TODO below; spec 6.2 wants a hard error).
-    //   RESOLVED (was): (1) bare blocking waitpid() with no timeout; wait_target_exit()
-    //   now bounds the wait with network.initial_ms and kills the target (SIGTERM->SIGKILL
-    //   via timed_kill_pgid) on timeout, as the spec requires (the ptrace exec-stop that
-    //   used to make a bare waitpid return early is gone with ptrace port detection).
-    //   (2) g_child_pid is set during Pass 1, so Ctrl+C kills the
-    //   target. (3) The exit status is logged.
+    //   even when the map size was missing/invalid (see the TODO below).
+    //   The wait is bounded by network.initial_ms; on timeout the target is killed
+    //   (SIGTERM->SIGKILL via timed_kill_pgid).
     PROXY_LOG_DEBUG("before waitpid");
     auto pass1 = process::wait_target_exit(spawned1.pid, cfg.network.initial_ms);
     PROXY_LOG_DEBUG("after waitpid");
@@ -704,21 +686,15 @@ int run_test_mode(const Config& cfg, const std::string& input_path, bool forward
     }
     unsetenv("AFL_DUMP_MAP_SIZE");
 
-    // TODO(claude): stale/confusing comment (hedges "OR"); also Pass 1 failure (no/invalid map size) is NOT
-    //   propagated - this always prints "completed" and goes on to Pass 2 even when the parse failed, in
-    //   violation of spec 6.2 ("return an error"). Needs a real return value from spawn_target / a
-    //   dedicated function returning std::optional<uint64_t>.
-    // Map size parsing is handled internally by process::spawn_target returning via stdout
-    // pipe which main reads, OR process::spawn_target handles it.
-    // Assuming process::spawn_target in test_mode handles the pipe and logs the map size.
+    // TODO(claude): Pass 1 failure (no/invalid map size) is NOT propagated: collect_map_size() returns
+    //   void, so this always prints "completed" and goes on to Pass 2 even when the parse failed. It
+    //   should return a std::optional<uint64_t> and abort test mode on failure.
     PROXY_LOG_INFO("Pass 1 (Map Size) completed.");
 
     // --- Pass 2: Single Iteration ---
-    // TODO(claude): ordering/stdin issue: reading the payload from stdin ("-") happens AFTER Pass 1 spawned
-    //   the child, fine, but an empty regular file is reported as "failed to read" (see
-    //   utils::read_input_file). Also spec 6.2 step 3 says the --input validation must be done BEFORE
-    //   Pass 1; it is (input_path.empty() check), but the file itself is only opened after Pass 1 -
-    //   validate readability up front to fail early.
+    // TODO(claude): the --input file is only opened after Pass 1 has spawned (and waited for) the
+    //   target; validate that it is readable up front to fail early. Also an empty regular file is
+    //   reported as "failed to read" below, although an empty input is valid.
     std::vector<uint8_t> input_data;
     if (auto input_res = utils::read_input_file(input_path);
         std::holds_alternative<std::error_code>(input_res)) {
@@ -729,7 +705,6 @@ int run_test_mode(const Config& cfg, const std::string& input_path, bool forward
         input_data = std::get<std::vector<uint8_t>>(std::move(input_res));
     }
     if (input_data.empty() && input_path != "-") {
-        // TODO: yes, empty file is a file! It is not fail!
         PROXY_LOG_ERROR("failed to read payload from {}", input_path);
         return 1;
     }
@@ -812,15 +787,12 @@ int main(int argc, char* argv[]) {
     // the logger; --log-level and --crash-msg-log-level reconfigures it after parsing.
     log::init(spdlog::level::info, spdlog::level::warn);
 
-    // TODO(claude): CLI vs spec. (1) Spec says `proxy` is the DEFAULT mode; with argparse subparsers and no
-    //   subcommand it works only because is_subcommand_used("test") is false - but `proxy` subcommand
-    //   itself is never queried, and an unknown positional is rejected. (2) `-c/--config`, `--log-level` and
-    //   `--child-output` are declared on the parent parser (src/args.cpp), so they must come BEFORE the
-    //   subcommand (`afl_proxy -c x test`); `afl_proxy test -c x` is an error, which is surprising.
-    //   `--input` is declared on the `test` subparser and must come AFTER it (`afl_proxy test --input f`).
-    //   (3) `--input` is not enforced as mandatory in test mode by the parser (checked manually later, after
-    //   config loading + stale cleanup killed processes!). (4) program name "afl_proxy" vs binary
-    //   "afl-cassowire".
+    // TODO(claude): CLI. (1) `-c/--config`, `--log-level` and `--child-output` are declared on the parent
+    //   parser (src/args.cpp), so they must come BEFORE the subcommand (`afl-cassowire -c x test`);
+    //   `afl-cassowire test -c x` is an error, which is surprising. `--input` is declared on the `test`
+    //   subparser and must come AFTER it. (2) `--input` is not enforced as mandatory in test mode by the
+    //   parser (checked manually later, after config loading + stale cleanup killed processes!).
+    //   (3) The argparse program name is "afl_proxy" (src/args.cpp) while the binary is "afl-cassowire".
     auto args_res = args::parse_args(argc, argv);
     if (const auto* parse_err = std::get_if<args::ArgParseError>(&args_res)) {
         PROXY_LOG_ERROR("{}", parse_err->message);
@@ -865,10 +837,9 @@ int main(int argc, char* argv[]) {
 
     Config cfg = std::get<Config>(config_res);
 
-    // TODO(claude): spec 6.2 says test mode validates --input BEFORE running cleanup; here cleanup (which
-    //   SIGTERM/SIGKILLs other processes and sleeps force_kill_ms) runs first and only then run_test_mode()
-    //   rejects a missing --input. Also in proxy mode the env checks (__AFL_SHM_ID) happen after the kill.
-    //   Also: `Config cfg = std::get<Config>(...)` copies instead of moving; the spec wants std::visit.
+    // TODO(claude): stale cleanup (which SIGTERM/SIGKILLs other processes and sleeps force_kill_ms)
+    //   runs before test mode rejects a missing --input and before proxy mode checks __AFL_SHM_ID, so a
+    //   misconfigured invocation still kills processes. Validate the invocation first.
     // Stale Process Cleanup
     process::cleanup_stale_processes(cfg.cleanup);
 

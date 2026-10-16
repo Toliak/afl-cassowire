@@ -5,8 +5,10 @@
 network target (e.g. NGINX), waits until the target binds its port, then loops
 connect → send fuzz buffer → recv → health-check inside `__AFL_LOOP`.
 
-`DEV_SPECIFICATION.md` is the source of truth for behavior. Where code and spec disagree,
-the spec wins (but see "Known deviations" below before "fixing" anything).
+`DEV_SPECIFICATION.md` is the original design spec and is **deprecated** (it carries a
+banner and is no longer maintained). The source of truth is the code plus this file,
+`README.md`, `default.yaml` and `schema/config.schema.json`. See "Design notes and extras"
+below before "fixing" anything that looks odd.
 
 ## Build
 Must be compiled with the AFL++ toolchain — plain g++/clang++ is rejected by a compile
@@ -139,7 +141,7 @@ are ignored helper-anchor fields (see Important details).
   `load_config()` and exempted in `config.schema.json` (root `patternProperties
   "^__"`): a reserved namespace for YAML anchor/merge (`<<`) helper fragments.
   The exemption is root-only — `__`-prefixed keys inside any section are still
-  rejected as unknown keys. Fixtures: `test/schema_validate/cases/*helper*.yaml`.
+  rejected as unknown keys. Fixtures: `tests/e2e/schema_validate/cases/*helper*.yaml`.
 - Observability (hang triage): the proxy loop emits an INFO heartbeat every ~5 s
   (iteration count + max connect/send/wait/probe stage times + slow-iteration
   count, flushed) and a WARN whenever a stage reaches `network.timeout_ms`
@@ -167,46 +169,40 @@ are ignored helper-anchor fields (see Important details).
   (`network::arm_rst_on_close()`) once their data is fully read, so `close()`
   sends RST: nothing sits in TIME_WAIT and the proxy's ephemeral port range
   cannot be exhausted by fast fuzzing.
-- `port_detection.defork` and the ptrace-based port-detection modes were REMOVED.
+- `port_detection.defork` and the ptrace-based port-detection modes were REMOVED
+  (the schema fixtures `invalid_defork_key_removed.yaml` and `invalid_primary_ptrace.yaml`
+  assert that both are rejected).
   Seccomp detection is now `SECCOMP_RET_USER_NOTIF`-based, which handles
   multi-process and multi-threaded targets correctly (all inherited-filter
-  tasks notify the same fd), so the old fork-cancelling workaround is no
-  longer needed for detection. If de-forking is ever wanted again, the clean
-  route is NOTIF on `fork`/`vfork`/`clone` with `SECCOMP_USER_NOTIF` responses
-  faking a return value of 0 — not a BPF `ERRNO|0` hack.
+  tasks notify the same fd).
 
-## Known deviations from the spec
+## Design notes and extras
 - `src/afl_compat.h` (not `.hpp`) defines *no-op* AFL++ macros instead of `#error`-ing;
-  the "must use an AFL++ compiler" enforcement was moved to the `meson.build` compiler
+  the "must use an AFL++ compiler" enforcement lives in the `meson.build` compiler
   probe. Don't add an `#error` guard to the header.
-- Extra config keys not in the spec: `target.env`, `target.env_preserve`, `payload.*`,
+- Config keys added after the original design: `target.env`, `target.env_preserve`, `payload.*`,
   `afl.cov_discard_init`,
   `target_cmplog.*`, `network_cmplog.*`, and the required
   `AFL_CASSOWIRE_FORCE_FINAL_LOC` env var. `target_cmplog`/`network_cmplog` are standalone
   (no key falls back to `target`/`network`) and required when `afl.enable_cmplog: true`;
   in cmplog mode both replace their normal counterparts in `run_proxy_mode()` before
   spawn, so port detection, connect, timeouts, and probe all use the cmplog values.
-- Port detection deviates from spec §4/5.2: there is **no ptrace at all** — the `ptrace`
-  primary and the TRACEME/`SECCOMP_RET_TRACE` realization of `seccomp` were removed in
-  favor of `SECCOMP_RET_USER_NOTIF` (listener fd handed over `SCM_RIGHTS` pre-exec,
-  polled by the proxy; readiness = `listen` notification for the configured port's fd
-  + bounded `/proc/net/tcp` confirmation, since notifications carry no syscall exit
-  value — the spec wanted readiness at `bind()` ENTRY; both are deviations). The
-  inherited filter notifies for every thread and forked child, so the old
-  "children fail bind/listen with ENOSYS" limitation is gone; QEMU-mode targets
-  work with `seccomp` now (procfs remains the default there). `PDEATHSIG` (see above)
-  replaced `PTRACE_O_EXITKILL` as the proxy-death backstop.
-- Logging/target-stdio behavior intentionally diverges from the spec (spec is deprecated
-  on these points): proxy logs go through spdlog to stdout with `--log-level` (not
-  `std::cout`/`std::cerr`); the spec's `target.log.*` config keys were removed — target
-  output defaults to `/dev/null` and is only forwarded with `--child-output` (spec said
-  test pass 2 always inherits); the test-mode response is logged as escaped text at info
-  level (spec said raw bytes on stdout). DEV_SPECIFICATION.md is NOT updated — trust
-  this file for logging/stdio behavior.
+- Port detection uses **no ptrace at all**: it is `SECCOMP_RET_USER_NOTIF`-based
+  (listener fd handed over `SCM_RIGHTS` pre-exec, polled by the proxy; readiness =
+  `listen` notification for the configured port's fd + bounded `/proc/net/tcp`
+  confirmation, since notifications carry no syscall exit value). The
+  inherited filter notifies for every thread and forked child; QEMU-mode targets
+  work with `seccomp` (procfs remains the default there). `PDEATHSIG` (see above)
+  is the proxy-death backstop for the target.
+- Logging/target-stdio: proxy logs go through spdlog to stdout with `--log-level` (not
+  `std::cout`/`std::cerr`); there are no `target.log.*` config keys — target
+  output defaults to `/dev/null` and is only forwarded with `--child-output`; the
+  test-mode response is logged as escaped text at info level.
 - Both `afl-qemu-bridge` and `afl-qemu-trace` are supported as QEMU backends for
   binary-only fuzzing. See `default.qemu.yaml` for configuration examples and instructions
   on switching between them.
 
 ## Review markers
-Existing review notes are tagged `TODO(claude): ...` (≈40 across `src/`). Preserve the
-tag when touching those lines; don't silently drop them.
+Existing review notes are tagged `TODO(claude): ...` (see `grep -rn "TODO(claude)" src/`).
+They mark real, still-open issues; resolved notes are deleted rather than kept as
+"RESOLVED". Preserve the tag when touching those lines; don't silently drop open ones.

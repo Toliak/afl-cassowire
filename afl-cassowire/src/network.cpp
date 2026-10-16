@@ -142,20 +142,14 @@ static InodeOwnershipResult check_inode_ownership(pid_t target_pid, const std::s
     return result;
 }
 
-// TODO(claude): RESOLVED (was: procfs detection could not notice that the target already died - it
-//   polled the whole initial_ms even if the child exited - and could false-positive on a port held
-//   by a stale/foreign process): the loop now polls waitpid(WNOHANG) every pass and reports
-//   TargetDied (the zombie is reaped here, like the seccomp(user-notif) death path), and with
-//   port_detection.verify_ownership (default true) the matched LISTEN line's socket inode
-//   (10th token of the /proc/net/tcp{,6} entry) must be held via a socket:[<inode>] readlink in
-//   /proc/<pid>/fd of the direct child or one of its descendants (process::collect_pid_tree). A
-//   setuid-style target with an unreadable fd dir (EACCES/EPERM) is accepted unverified with a WARN.
-//
-// TODO(claude): the ownership check races with the target itself: a LISTEN entry whose fd was
-//   already closed (socket half-torn-down) fails ownership for one poll pass and then disappears;
-//   that is benign (we keep polling), but a rebinding target (SO_REUSEADDR close->bind) can pass
-//   with the OLD inode on the very pass after its close - the next exchange would still work since
-//   the port is then genuinely listening again.
+// procfs detection. Each pass polls waitpid(WNOHANG) and reports TargetDied
+//   (the zombie is reaped here, like the seccomp(user-notif) death path), so a
+//   target that exits during startup is noticed immediately. With
+//   port_detection.verify_ownership (default true) the matched LISTEN line's
+//   socket inode (10th token of the /proc/net/tcp{,6} entry) must be held via a
+//   socket:[<inode>] readlink in /proc/<pid>/fd of the direct child or one of
+//   its descendants (process::collect_pid_tree). A setuid-style target with an
+//   unreadable fd dir (EACCES/EPERM) is accepted unverified with a WARN.
 static DetectResult check_procfs(pid_t target_pid, int target_port, uint64_t timeout_ms,
                                  bool verify_ownership) {
     uint64_t start = utils::get_time_ms();
@@ -520,15 +514,10 @@ DetectResult wait_for_port(pid_t target_pid, const Config& cfg, int notif_fd) {
 ConnectResult connect_target(const NetworkConfig& net_cfg) {
     // TODO(claude): (1) the socket is switched back to BLOCKING mode after connect, so send_all()'s timeout
     //   is not enforced: send() can block forever if the target stops reading (the EAGAIN/poll branch in
-    //   send_all is dead code). Keep O_NONBLOCK or set SO_SNDTIMEO.
-    //   (2) RESOLVED: thousands of iterations/s used to create thousands of TIME_WAIT sockets on the client
-    //       side, eventually exhausting the ephemeral port range (connect fails with EADDRNOTAVAIL). Callers
-    //       now arm SO_LINGER{1,0} via arm_rst_on_close() before dropping the socket, so close() sends RST
-    //       and nothing sits in TIME_WAIT. Also no TCP_NODELAY / SOCK_CLOEXEC.
-    //   (3) Only AF_INET + inet_pton is supported; host "localhost"/IPv6 (accepted by config.cpp) fails.
-    //   (4) poll() returning -1/EINTR is treated as a connect failure.
-    //   (5) The second fcntl() per successful connect (restore of blocking mode) is intentionally left
-    //   unchecked, matching the original behavior.
+    //   send_all is dead code). Keep O_NONBLOCK or set SO_SNDTIMEO. Also no TCP_NODELAY / SOCK_CLOEXEC.
+    //   (2) Only AF_INET + inet_pton is supported; host "localhost"/IPv6 (accepted by config.cpp) fails.
+    //   (3) poll() returning -1/EINTR is treated as a connect failure.
+    //   (The second fcntl() per successful connect, restoring blocking mode, is intentionally unchecked.)
     int sock = socket(AF_INET, SOCK_STREAM, 0);
     if (sock < 0) return ConnectError{ConnectError::Kind::SocketCreate, errno};
 
@@ -578,10 +567,8 @@ ConnectResult connect_target(const NetworkConfig& net_cfg) {
     return guard;
 }
 
-// TODO(claude): `buf` may be nullptr/len 0 (placeholder AFL macros) - harmless here (the loop simply does
-//   not run and the call reports success). The callers in main.cpp now check the returned SendResult.
-// TODO(claude): with a blocking socket (the state connect_target() leaves it in) the EAGAIN/poll branch is
-//   dead code and send() can block forever if the target stops reading - see the connect_target() TODO.
+// With a blocking socket (the state connect_target() leaves it in) the EAGAIN/poll branch below is
+// dead code and send() can block forever if the target stops reading - see the connect_target() TODO.
 SendResult send_all(int sock, const uint8_t* buf, size_t len, int timeout_ms) {
     size_t sent = 0;
     uint64_t start = utils::get_time_ms();
@@ -617,10 +604,10 @@ SendResult send_all(int sock, const uint8_t* buf, size_t len, int timeout_ms) {
     return std::monostate{};
 }
 
-// TODO(claude): reading "until EOF or timeout" against a keep-alive server (nginx) always burns the full
-//   timeout_ms per iteration, capping throughput at 1000/timeout_ms exec/s (5/s with the default 200ms).
-//   The other problems of the former bool API (contract mismatch, discarded data, debug spam, EINTR treated
-//   as EOF) were addressed by the SendResult/WaitResult conversion.
+// TODO(claude): unverified against a live server (not run, per the testing policy): reading "until EOF
+//   or timeout" against a keep-alive server (nginx) may burn the full timeout_ms per iteration if the
+//   server ignores the half-close (shutdown(SHUT_WR) in exchange_once), capping throughput at
+//   1000/timeout_ms exec/s (5/s with a 200 ms timeout).
 WaitResult wait_response(int sock, int timeout_ms) {
     std::vector<uint8_t> data;
     uint8_t buf[4096];
@@ -713,8 +700,7 @@ ProbeResult probe_target(const NetworkConfig& net_cfg) {
     // established, unaccepted socket readable by itself: readability means the
     // target app sent data, closed (EOF), or died (RST). poll() reports
     // POLLERR/POLLHUP even when not requested, so EOF/RST are covered.
-    // TODO(claude): residual gaps - deferred timers/async work after servicing,
-    //   multi-acceptor/threaded targets, banner servers (see the header contract).
+    // Residual gaps are listed in the probe_target() contract (network.hpp).
     uint64_t start = utils::get_time_ms();
     PROXY_LOG_TRACE("probe_target start={}", start);
     while (true) {

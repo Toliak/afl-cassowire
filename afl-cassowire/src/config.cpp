@@ -654,7 +654,7 @@ std::variant<Config, ConfigError> load_config(const std::string& path) {
                  // Validate regex syntax
                  try {
                      // WARN: `type: comm` objects silently ignore an extra `target` key, and the regex is
-                     //   compiled with the default ECMAScript flavour (spec only says "standard C++ regex").
+                      //   compiled with the default ECMAScript flavour.
                      //   Note: we do not validate against empty or over-broad patterns (e.g. `.*` with target argv)
                      //   as that is the user's responsibility; see the self/parent-protection TODO in process.cpp.
                      if (kp.value.empty()) {

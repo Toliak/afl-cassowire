@@ -135,7 +135,7 @@ void cleanup_stale_processes(const CleanupConfig& cleanup_cfg) {
     //   (e.g. type=regexp value=".*" target=argv) makes the proxy SIGKILL the kernel-ish set of every
     //   user process - including the session running it. (2) It never re-checks that a matched pid is still
     //   the same process after the grace period (pid reuse), and it always sleeps the full force_kill_ms even
-    //   when nothing is alive.
+    //   when nothing is alive. (3) kill() failures (e.g. EPERM for other users' processes) are ignored.
     if (!cleanup_cfg.kill_pattern) return;
 
     const KillPattern& kp = cleanup_cfg.kill_pattern.value();
@@ -167,22 +167,18 @@ void cleanup_stale_processes(const CleanupConfig& cleanup_cfg) {
         }
         if (!is_pid) continue;
 
-        // TODO(claude): the comment below mentions kernel threads but only pid<=1 is skipped (kernel threads
-        //   have /proc/<pid>/comm).
         // std::stoi was replaced by the exception-free utils::parse_u32_strict: an all-digit directory whose
         //   value exceeds the type range used to throw std::out_of_range uncaught (-> std::terminate).
         auto parsed_pid = utils::parse_u32_strict(entry->d_name);
         if (!std::holds_alternative<std::uint32_t>(parsed_pid)) continue;
         pid_t pid = static_cast<pid_t>(std::get<std::uint32_t>(parsed_pid));
-        if (pid <= 1) continue; // Skip init and kernel threads
+        if (pid <= 1) continue; // Skip init (kernel threads are filtered by the empty-cmdline TODO below)
 
         std::string proc_path = std::string("/proc/") + entry->d_name;
         bool match = false;
 
         if (kp.type == "comm" || (kp.type == "regexp" && kp.target == "comm")) {
-            // TODO(claude): reads /proc/<pid>/comm which is the *thread* name of the main thread only. A
-            //   target whose workers renamed themselves (nginx: comm="nginx", setproctitle aside) matches by
-            //   comm but the actual listener may be a child - document that this is main-thread comm only.
+            // Main-thread comm only (see default.yaml, cleanup.kill_pattern).
             std::ifstream comm_file(proc_path + "/comm");
             std::string comm;
             if (std::getline(comm_file, comm)) {
@@ -217,9 +213,7 @@ void cleanup_stale_processes(const CleanupConfig& cleanup_cfg) {
     closedir(proc_dir);
 
     for (pid_t pid : matched_pids) {
-        // TODO(claude): no EPERM handling (kill returns -1 for other users' processes and is ignored). Also
-        //   the spec (5.1) describes cleanup only in terms of the kill_pattern, but the proxy's own child
-        //   process group and its own pid are never explicitly excluded from `matched_pids`.
+        // kill() failures (EPERM, ESRCH) are ignored; see the TODO at the top of this function.
         kill(pid, SIGTERM);
     }
 
@@ -695,12 +689,10 @@ void collect_map_size(int pipe_read_fd) {
                 if (is_digit) {
                     PROXY_LOG_INFO("map size: {}", trimmed);
                 } else {
-                    // TODO(claude): spec 6.2 requires this to be a hard error ("assuming the target lacks
-                    //   proper AFL++ instrumentation" -> return an error). Here only a message is logged
-                    //   and spawn_target() still returns a pid, so main.cpp continues as if all was well.
-                    //   Also the spec says the integer must be on the first line with no extra text; the
-                    //   code silently takes the first line and ignores everything after it (e.g. a target
-                    //   that prints "MAP_SIZE: 65536" fails, but one that prints "65536\ngarbage" passes).
+                    // TODO(claude): a failed map-size parse is only logged and spawn/collect still lets
+                    //   main.cpp continue as if all was well (collect_map_size() returns void). Also only
+                    //   the first line is inspected: a target that prints "MAP_SIZE: 65536" fails, but one
+                    //   that prints "65536\ngarbage" passes.
                     PROXY_LOG_ERROR("failed to parse map size from target output. Output: '{}'", trimmed);
                 }
             }
