@@ -793,7 +793,9 @@ int run_test_mode(const Config& cfg, const std::string& input_path, bool forward
 
 int main(int argc, char* argv[]) {
     // Initialize logging first so that CLI/config errors are reported through
-    // the logger; --log-level and --crash-msg-log-level reconfigures it after parsing.
+    // the logger; --log-level reconfigures the console after parsing, and the
+    // second init() below applies --log-level plus afl.msg_log_level (from the
+    // config) once the config is loaded.
     log::init(spdlog::level::info, spdlog::level::warn);
 
     // TODO(claude): CLI. (1) `-c/--config`, `--log-level` and `--child-output` are declared on the parent
@@ -810,20 +812,14 @@ int main(int argc, char* argv[]) {
     }
     const auto& parsed = std::get<args::ParsedArgs>(args_res);
 
-    // parse_args() already validated the level names; this only converts them.
+    // parse_args() already validated the --log-level name; this only converts it.
     auto log_level = log::parse_level(parsed.log_level);
     if (!log_level) {
         PROXY_LOG_ERROR("invalid --log-level '{}': expected trace, debug, info, warn, error, critical, or off",
                         parsed.log_level);
         return 1;
     }
-    auto crash_msg_log_level = log::parse_level(parsed.crash_msg_log_level);
-    if (!crash_msg_log_level) {
-        PROXY_LOG_ERROR("invalid --crash-msg-log-level '{}': expected trace, debug, info, warn, error, critical, or off",
-                        parsed.crash_msg_log_level);
-        return 1;
-    }
-    log::init(*log_level, *crash_msg_log_level);
+    log::init(*log_level, spdlog::level::warn);
 
     // Destination for crash/abort termination dumps (.msg/.data).
     utils::set_data_dir(parsed.data_dir);
@@ -845,6 +841,18 @@ int main(int argc, char* argv[]) {
     }
 
     Config cfg = std::get<Config>(config_res);
+
+    // Reconfigure the logger with the parsed --log-level (console) and the
+    // config-provided afl.msg_log_level (ring sink feeding .msg dumps). The
+    // level name is validated here (not in load_config()) because config.cpp
+    // cannot include log.hpp (yaml-cpp's <cmath> collides with namespace log).
+    auto crash_msg_level = log::parse_level(cfg.afl.msg_log_level);
+    if (!crash_msg_level) {
+        PROXY_LOG_ERROR("invalid afl.msg_log_level '{}': expected trace, debug, info, warn, error, critical, or off",
+                        cfg.afl.msg_log_level);
+        return 1;
+    }
+    log::init(*log_level, *crash_msg_level);
 
     // Retain the last N completed payloads so a termination dump can preserve
     // the input that likely caused a deferred/async crash (see

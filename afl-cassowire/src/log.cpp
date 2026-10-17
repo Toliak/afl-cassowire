@@ -29,12 +29,16 @@ namespace log {
         // The logger is constructed manually (not via the stdout_color_st
         // factory) so that init() is idempotent: the factory would try to
         // register the name "proxy" in the global registry on every call and
-        // throw spdlog_ex on the second one (main() calls init() twice: once
-        // with defaults, once after parsing --log-level).
+        // throw spdlog_ex on the second one (main() calls init() several
+        // times: once with defaults, once after parsing --log-level, and once
+        // after the config provides afl.msg_log_level).
         if (!g_recent_sink) {
             g_recent_sink = std::make_shared<spdlog::sinks::ringbuffer_sink_st>(k_recent_capacity);
-            g_recent_sink->set_level(crash_msg_level);
         }
+        // Applied on every init(): the first call installs the default, the
+        // second (after the config is loaded) applies afl.msg_log_level. Doing
+        // this only on creation would silently ignore the configured level.
+        g_recent_sink->set_level(crash_msg_level);
         auto console_sink = std::make_shared<spdlog::sinks::stdout_color_sink_st>();
         // The console sink applies the runtime --log-level; the logger level
         // is floored at warn so that the ring sink keeps capturing warnings

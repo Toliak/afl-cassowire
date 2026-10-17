@@ -66,6 +66,20 @@ afl:
                                # __AFL_LOOP pass: drop the startup coverage (proxy +
                                # target init, shared map) so afl-fuzz does not
                                # attribute it to the first fuzzed testcase
+  dump_history: 1              # Retain the last N completed payloads (prefix +
+                               # input + suffix) and write them with every
+                               # termination dump as <stem>.-1.data (most recent
+                               # previous iteration), <stem>.-2.data, ...
+                               # A deferred/async crash is detected one iteration
+                               # late, so the current payload may not be the input
+                               # that caused it; the history preserves the likely
+                               # culprit. 0 disables the history (only <stem>.data
+                               # is written). Allowed range: 0-64.
+  msg_log_level: warn          # Log level for the warn/error ring whose captured
+                               # lines are embedded into termination .msg dumps.
+                               # Dump content only - the console level is the
+                               # --log-level CLI flag. Allowed: trace, debug,
+                               # info, warn, error, critical, off.
 
 target_cmplog:                 # Compare-mode target (used instead of `target` when __AFL_CMPLOG_SHM_ID is set)
   binary: "./target-cmplog"    # Path to the compare-mode target binary (required)
@@ -120,7 +134,11 @@ cleanup:
     # type: comm                   # or "regexp"
     # value: "nginx"
     # target: "comm"              # or "argv0", "argv"
-
+    #
+    # Notes: "comm" is the kernel's main-thread name (/proc/<pid>/comm),
+    # truncated to 15 chars; a process that renamed itself, or a worker with
+    # a different name, will not match. Matching is global (every process the
+    # proxy can see), so keep patterns narrow.
 # Optional payload wrapping: every payload sent to the target (in `proxy`
 # and `test` mode) is transmitted as: prefix + fuzz input + suffix.
 # Values may be a plain string or `!!binary` base64-encoded bytes.

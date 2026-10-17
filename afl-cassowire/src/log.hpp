@@ -34,12 +34,13 @@ namespace log {
      * Must be called before any logging takes place and before fork_target()
      * (the child inherits the logger state; no spdlog calls are allowed
      * between fork() and execve()). Safe to call multiple times (e.g. once
-     * with defaults at startup, again after parsing --log-level); each call
-     * replaces the previous logger.
+     * with defaults at startup, again after parsing --log-level, and after
+     * loading the config so afl.msg_log_level applies); each call replaces
+     * the previous logger and re-applies both levels.
      *
      * @param console_level Runtime log level for console output (typically from the --log-level flag).
      * @param crash_msg_level Log level for the ring buffer sink that captures messages
-     *        for crash/abort termination dumps (typically from the --crash-msg-log-level flag).
+     *        for crash/abort termination dumps (from the afl.msg_log_level config key).
      */
     void init(spdlog::level::level_enum console_level, spdlog::level::level_enum crash_msg_level);
 
@@ -58,7 +59,7 @@ namespace log {
     [[nodiscard]] std::vector<std::string> recent_lines();
 
     /**
-     * @brief Parses a log level name accepted by the --log-level flag.
+     * @brief Parses a log level name accepted by --log-level and afl.msg_log_level.
      *
      * Accepted (case-sensitive): trace, debug, info, warn, warning, error,
      * err, critical, off.

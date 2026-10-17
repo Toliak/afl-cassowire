@@ -473,7 +473,8 @@ std::variant<Config, ConfigError> load_config(const std::string& path) {
             // --- Check for unknown keys in afl ---
             {
                 static const std::unordered_set<std::string> afl_allowed = {"loop_count", "enable_cmplog",
-                                                                            "cov_discard_init", "dump_history"};
+                                                                            "cov_discard_init", "dump_history",
+                                                                            "msg_log_level"};
                 ConfigError err = check_unknown_keys(afl_node, afl_allowed, "afl");
                 if (!err.message.empty()) {
                     return err;
@@ -514,6 +515,16 @@ std::variant<Config, ConfigError> load_config(const std::string& path) {
                 } catch (const YAML::BadConversion&) {
                     return ConfigError{"afl.dump_history", "Invalid type", "integer", afl_node["dump_history"].Scalar()};
                 }
+            }
+            if (afl_node["msg_log_level"]) {
+                // Only the type is checked here: the level *name* is validated
+                // in main() via log::parse_level(). config.cpp cannot include
+                // log.hpp — yaml-cpp pulls in <cmath>, whose ::log collides
+                // with the `log` namespace.
+                if (!afl_node["msg_log_level"].IsScalar()) {
+                    return ConfigError{"afl.msg_log_level", "Invalid type", "log level name", "not a string"};
+                }
+                cfg.afl.msg_log_level = afl_node["msg_log_level"].as<std::string>();
             }
         }
 

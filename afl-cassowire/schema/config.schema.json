@@ -172,6 +172,12 @@
           "maximum": 64,
           "default": 1,
           "description": "Number of completed iterations whose payloads (prefix + input + suffix) are retained and written alongside a termination dump as <stem>.-1.data, <stem>.-2.data, ... (-1 = most recent previous iteration). A deferred/async crash is detected one iteration late, so the current payload may not be the input that caused it; the retained history preserves the likely culprit. 0 disables the history (only <stem>.data is written)."
+        },
+        "msg_log_level": {
+          "type": "string",
+          "enum": ["trace", "debug", "info", "warn", "error", "critical", "off"],
+          "default": "warn",
+          "description": "Log level for the warn/error ring sink whose captured lines are embedded into termination .msg dumps. Affects dump content only; the console level is the --log-level CLI flag."
         }
       }
     },

@@ -43,6 +43,12 @@ The only default verification is the documented build sequence above.
 Global options (`-c/--config`, `--log-level`, `--child-output`, `--data-dir`) must
 precede the subcommand. `--data-dir` selects where termination dumps are written
 (default `afl-cassowire-data`, created recursively if missing).
+argv/yaml split: **argv** carries logging (`--log-level`), environmental,
+fuzzing-unrelated settings (`-c/--config`, `--data-dir`, `--child-output`), and
+mode-specific extras (`test --input`; `proxy` takes none of its own). Everything
+that affects the fuzzing process itself — target, network, AFL loop, port
+detection, payload wrapping, dump *content* such as `afl.msg_log_level` — lives in
+config.yaml.
 Config reference: `default.yaml` (copy to `config.yaml`). Root `__`-prefixed keys
 are ignored helper-anchor fields (see Important details).
 
@@ -51,6 +57,9 @@ are ignored helper-anchor fields (see Important details).
 - `src/config.{hpp,cpp}` — structs + `load_config()` returning
   `std::variant<Config, ConfigError>`; **no exceptions**, strict type/range validation
   with a structured `ConfigError` (path/message/expected/actual).
+  `config.cpp` **cannot include `log.hpp`** — yaml-cpp pulls in `<cmath>`, whose `::log`
+  collides with the `log` namespace in either include order (level-name validation for
+  `afl.msg_log_level` therefore lives in `main()`).
 - `src/log.{hpp,cpp}` — namespace `log`: spdlog setup (single-threaded stdout logger,
   flush on warn+), `PROXY_LOG_*` macros gated by `SPDLOG_ACTIVE_LEVEL`
   (`-Dstrip_low_logs=true` compiles trace/debug out), `parse_level()`, `escape_bytes()`,
@@ -118,10 +127,11 @@ are ignored helper-anchor fields (see Important details).
   `main()` (`normal` | `cmplog` | `test`, via `utils::set_instance_tag()`), so dumps from
   concurrently running instances stay attributable; the `.msg` content and the
   termination log line embed it as `{kind}[{tag}]: {reason}`. The `.msg` additionally
-  embeds the last ≤16 warn/error lines (oldest first, console-style timestamps) captured
-  by the logger's ring sink (`log::recent_lines()`); capture is independent of
-  `--log-level` (logger level is floored at warn, the console sink applies the runtime
-   level), so quiet runs still produce rich dumps. The `.msg` also embeds the
+   embeds the last ≤16 warn/error lines (oldest first, console-style timestamps) captured
+   by the logger's ring sink (`log::recent_lines()`, level = `afl.msg_log_level`,
+   default `warn`); capture is independent of
+   `--log-level` (logger level is floored at warn, the console sink applies the runtime
+    level), so quiet runs still produce rich dumps. The `.msg` also embeds the
    current 1-based `__AFL_LOOP` iteration as an `iteration: N` line (set once per
    loop pass via `utils::set_current_iteration()` in `run_proxy_mode()`; `0` =
    termination outside the loop or test mode). Dumps are best-effort and never fatal.
@@ -208,7 +218,7 @@ are ignored helper-anchor fields (see Important details).
   the "must use an AFL++ compiler" enforcement lives in the `meson.build` compiler
   probe. Don't add an `#error` guard to the header.
 - Config keys added after the original design: `target.env`, `target.env_preserve`, `payload.*`,
-  `afl.cov_discard_init`, `afl.dump_history`,
+  `afl.cov_discard_init`, `afl.dump_history`, `afl.msg_log_level`,
   `target_cmplog.*`, `network_cmplog.*`, and the required
   `AFL_CASSOWIRE_FORCE_FINAL_LOC` env var. `target_cmplog`/`network_cmplog` are standalone
   (no key falls back to `target`/`network`) and required when `afl.enable_cmplog: true`;
