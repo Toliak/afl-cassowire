@@ -52,48 +52,41 @@ __AFL_COVERAGE();
 // PR_SET_PDEATHSIG(SIGKILL) (see process::fork_target()).
 pid_t g_child_pid = 0;
 
-void kill_pgid(pid_t pgid) {
+// Hard-stop the target's process group: SIGKILL to the whole group, then a
+// bounded reap of the group leader so no zombie outlives a mode function. The
+// shared coverage map is shm-backed and written on every edge hit, so nothing
+// AFL reads is lost to the SIGKILL; cleanup.force_kill_ms is not involved
+// here (it applies only to the kill_pattern stale-process cleanup). If the
+// leader is stuck in uninterruptible kernel work past the deadline, whatever
+// is left is re-parented to init when the proxy exits.
+void kill_and_reap_pgid(pid_t pgid) {
     if (pgid <= 0) return;
     kill(-pgid, SIGKILL);
-}
-
-// Timed kill for the target's process group (SIGTERM, wait, SIGKILL).
-// Called only from normal code paths.
-void timed_kill_pgid(pid_t pgid, int ms) {
-    if (pgid <= 0) return;
-
-    // Send SIGTERM to process group
-    kill(-pgid, SIGTERM);
 
     struct timespec start, now;
     clock_gettime(CLOCK_MONOTONIC, &start);
-
     while (true) {
         int status;
-        // Check if the process group leader has exited. The target is never
-        // ptraced, so waitpid(WNOHANG) without WUNTRACED reports real death
-        // only; nothing else can make this loop spin early.
+        // The target is never ptraced, so waitpid(WNOHANG) without WUNTRACED
+        // reports real death only; nothing else can make this loop spin early.
         pid_t res = waitpid(pgid, &status, WNOHANG);
         if (res == pgid) {
-            break; // Process exited
+            break; // Leader reaped
         } else if (res == -1) {
-            if (errno == ECHILD) {
-                break; // No child processes
-            } else if (errno == EINTR) {
+            if (errno == EINTR) {
                 // Try again, so do nothing and continue the loop.
             } else {
-                // Unexpected error: break out of the loop to send SIGKILL.
+                // ECHILD or unexpected error: nothing left to reap.
                 break;
             }
         }
-        // res == 0 means the process is still alive (or stopped, etc.)
+        // res == 0 means the leader is still dying.
 
         clock_gettime(CLOCK_MONOTONIC, &now);
-        long long elapsed_ms = (now.tv_sec - start.tv_sec) * 1000LL + 
+        long long elapsed_ms = (now.tv_sec - start.tv_sec) * 1000LL +
                                (now.tv_nsec - start.tv_nsec) / 1000000LL;
-                                
-        if (elapsed_ms >= ms) {
-            // Timeout reached, break to send SIGKILL
+        if (elapsed_ms >= 200) {
+            // Deadline reached; leave the zombie to init.
             break;
         }
 
@@ -101,13 +94,6 @@ void timed_kill_pgid(pid_t pgid, int ms) {
         struct timespec req = {0, 10000000}; // 10ms
         nanosleep(&req, nullptr);
     }
-
-    // Send SIGKILL to the entire process group to ensure cleanup
-    kill(-pgid, SIGKILL);
-
-    // Reap the leader to avoid zombie (if it hasn't been reaped already)
-    int status;
-    waitpid(pgid, &status, 0);
 }
 
 // NOTES: about log
@@ -575,7 +561,7 @@ int run_proxy_mode(Config cfg, bool forward_output) {
     if (target_pidfd.get() < 0) {
         PROXY_LOG_ERROR("pidfd_open failed for target pid {}: {} (requires kernel >= 5.3)",
                         static_cast<int>(spawned.pid), std::strerror(errno));
-        timed_kill_pgid(g_child_pid, cfg.cleanup.force_kill_ms);
+        kill_and_reap_pgid(g_child_pid);
         return 1;
     }
 
@@ -593,7 +579,7 @@ int run_proxy_mode(Config cfg, bool forward_output) {
 
         // TODO: make a health check here maybe?
         network::set_notif_listener(-1);
-        timed_kill_pgid(g_child_pid, cfg.cleanup.force_kill_ms);
+        kill_and_reap_pgid(g_child_pid);
         return 1;
     }
     network::set_notif_listener(spawned.notif_fd);
@@ -634,12 +620,11 @@ int run_proxy_mode(Config cfg, bool forward_output) {
         utils::record_dump_input(payload_buf);
     }
 
-    // Clean exit of AFL loop
-    // TODO(claude): the loop exit uses plain SIGKILL (kill_pgid); the graceful timed_kill_pgid (SIGTERM,
-    //   wait force_kill_ms, SIGKILL) is commented out. A SIGKILL'd target leaves no chance to flush
-    //   logs/coverage. Also the child is not reaped here.
-    // timed_kill_pgid(g_child_pid, cfg.cleanup.force_kill_ms);
-    kill_pgid(g_child_pid);
+    // Clean exit of AFL loop: hard-stop the target's process group. The
+    // coverage map is shm-backed (written on every edge hit), so a SIGKILL'd
+    // target loses nothing AFL reads; a graceful SIGTERM would only add up to
+    // cleanup.force_kill_ms of respawn latency per __AFL_LOOP exit.
+    kill_and_reap_pgid(g_child_pid);
     PROXY_LOG_TRACE("kill {}", static_cast<int>(g_child_pid));
     return 0;
 }
@@ -651,21 +636,17 @@ int run_test_mode(const Config& cfg, const std::string& input_path, bool forward
     }
 
     // --- Pass 1: Map Size Extraction ---
-    // TODO(claude): setenv(AFL_DUMP_MAP_SIZE) on the PROXY's own environment is redundant (prepare_target()
-    //   already adds it for SpawnMode::MapSizePass) and, with env_preserve: all, leaks into the proxy's
-    //   environ; if spawn fails (early return below) it is never unset.
-    setenv("AFL_DUMP_MAP_SIZE", "1", 1);
+    // prepare_target() injects AFL_DUMP_MAP_SIZE=1 into the child's envp for
+    // SpawnMode::MapSizePass; the proxy's own environment is not touched.
     auto prep_opt1 = process::prepare_target(cfg, process::SpawnMode::MapSizePass);
     if (!prep_opt1) {
         PROXY_LOG_ERROR("failed to prepare target for map size extraction.");
-        unsetenv("AFL_DUMP_MAP_SIZE");
         return 1;
     }
     process::SpawnedTarget spawned1 = process::fork_target(cfg, *prep_opt1, process::SpawnMode::MapSizePass,
                                                            false);
     if (spawned1.pid <= 0) {
         PROXY_LOG_ERROR("failed to spawn target for map size extraction.");
-        unsetenv("AFL_DUMP_MAP_SIZE");
         return 1;
     }
     g_child_pid = spawned1.pid;
@@ -673,17 +654,16 @@ int run_test_mode(const Config& cfg, const std::string& input_path, bool forward
     // TODO(claude): the exit status is only logged, not acted on, and Pass 1 still proceeds to Pass 2
     //   even when the map size was missing/invalid (see the TODO below).
     //   The wait is bounded by network.initial_ms; on timeout the target is killed
-    //   (SIGTERM->SIGKILL via timed_kill_pgid).
+    //   (SIGKILL via kill_and_reap_pgid).
     PROXY_LOG_DEBUG("before waitpid");
     auto pass1 = process::wait_target_exit(spawned1.pid, cfg.network.initial_ms);
     PROXY_LOG_DEBUG("after waitpid");
     if (!pass1.exited) {
         PROXY_LOG_ERROR("Pass 1 target did not exit within {} ms; killing it.", cfg.network.initial_ms);
-        timed_kill_pgid(g_child_pid, cfg.cleanup.force_kill_ms);
+        kill_and_reap_pgid(g_child_pid);
         if (spawned1.map_size_fd >= 0) {
             close(spawned1.map_size_fd);
         }
-        unsetenv("AFL_DUMP_MAP_SIZE");
         return 1;
     }
     PROXY_LOG_DEBUG("Pass 1 target status {:x} (exited={}, signaled={})",
@@ -693,7 +673,6 @@ int run_test_mode(const Config& cfg, const std::string& input_path, bool forward
     if (spawned1.map_size_fd >= 0) {
         process::collect_map_size(spawned1.map_size_fd);
     }
-    unsetenv("AFL_DUMP_MAP_SIZE");
 
     // TODO(claude): Pass 1 failure (no/invalid map size) is NOT propagated: collect_map_size() returns
     //   void, so this always prints "completed" and goes on to Pass 2 even when the parse failed. It
@@ -744,7 +723,7 @@ int run_test_mode(const Config& cfg, const std::string& input_path, bool forward
         PROXY_LOG_ERROR("failed to detect port {}: {}",
                         cfg.network.port, std::get<network::DetectError>(port_res2).to_string());
         network::set_notif_listener(-1);
-        timed_kill_pgid(g_child_pid, cfg.cleanup.force_kill_ms);
+        kill_and_reap_pgid(g_child_pid);
         return 1;
     }
     network::set_notif_listener(spawned2.notif_fd);
@@ -755,7 +734,7 @@ int run_test_mode(const Config& cfg, const std::string& input_path, bool forward
     if (ex.connect_error) {
         PROXY_LOG_ERROR("failed to connect to {}:{}: {}",
                         cfg.network.host, cfg.network.port, ex.connect_error->to_string());
-        timed_kill_pgid(g_child_pid, cfg.cleanup.force_kill_ms);
+        kill_and_reap_pgid(g_child_pid);
         return 1;
     }
 
@@ -787,7 +766,7 @@ int run_test_mode(const Config& cfg, const std::string& input_path, bool forward
     PROXY_LOG_INFO("waitpid res {} status {:x}, signaled={}", res, status, WIFSIGNALED(status));
     
     // Clean exit
-    timed_kill_pgid(g_child_pid, cfg.cleanup.force_kill_ms);
+    kill_and_reap_pgid(g_child_pid);
     return 0;
 }
 

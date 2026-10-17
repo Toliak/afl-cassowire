@@ -125,7 +125,9 @@ port_detection:
                                # silent initial_ms stall.
 
 cleanup:
-  force_kill_ms: 2000          # Wait time after SIGTERM before SIGKILL
+  force_kill_ms: 2000          # Wait after SIGTERM before SIGKILL; used only
+                               # by the kill_pattern stale-process cleanup
+                               # (the target itself is always SIGKILL'd)
   # kill_pattern:              # Optional: auto-kill stale target processes
     # Scalar form — matches /proc/<pid>/comm:
     # "nginx"

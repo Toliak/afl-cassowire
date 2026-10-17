@@ -137,15 +137,19 @@ are ignored helper-anchor fields (see Important details).
   between `fork()` and `execve()` — the pre-exec child reports failures with raw
   `dprintf()` to a saved, CLOEXEC stderr fd (async-signal-safety).
 - Target crash detection: `waitpid(WNOHANG)` + `WIFSIGNALED` → proxy raises `SIGSEGV` so
-  AFL registers the finding. Target is cleaned up SIGTERM → wait `cleanup.force_kill_ms`
-  → SIGKILL, on the whole process group.
+  AFL registers the finding. Target teardown is a plain SIGKILL to the whole process
+  group plus a bounded (~200 ms) reap of the group leader (`kill_and_reap_pgid()` in
+  `main.cpp`), in all modes and on every exit path — the shared coverage map is
+  shm-backed and written on every edge hit, so a SIGKILL'd target loses nothing AFL
+  reads. `cleanup.force_kill_ms` is not involved (it applies only to the
+  `cleanup.kill_pattern` stale-process cleanup).
 - Targets are spawned with `PR_SET_PDEATHSIG(SIGKILL)` plus a `getppid()` race check in
   the pre-exec child (`fork_target()`), so the kernel kills the target whenever the
   proxy dies — `abort_proxy`, `crash_proxy`, or AFL killing the
   proxy — in all modes (proxy/test) and all spawn modes, even in procfs port-detection
-  mode. Delivery is immediate SIGKILL with no `force_kill_ms` grace —
-  by design, since the proxy is already dead when it fires. It relies on the proxy
-  staying single-threaded (PDEATHSIG watches the forking thread).
+  mode. Delivery is immediate SIGKILL — by design, since the proxy is already
+  dead when it fires. It relies on the proxy staying single-threaded
+  (PDEATHSIG watches the forking thread).
 - `crash_proxy(message, payload)`/`abort_proxy(message, payload)` share `terminate_proxy()`
   and, before raising `SIGSEGV`/`SIGABRT`, write a termination pair into `--data-dir`
   (default `afl-cassowire-data`, created recursively): `{timestamp}-{tag}.msg` (reason)

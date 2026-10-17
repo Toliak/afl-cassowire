@@ -205,7 +205,7 @@
           "type": "integer",
           "exclusiveMinimum": 0,
           "default": 2000,
-          "description": "Wait time after SIGTERM before SIGKILL (whole process group)."
+          "description": "Wait time after SIGTERM before SIGKILL; used only by the kill_pattern stale-process cleanup (the fuzz target itself is always SIGKILL'd)."
         },
         "kill_pattern": {
           "$ref": "#/definitions/kill_pattern"
