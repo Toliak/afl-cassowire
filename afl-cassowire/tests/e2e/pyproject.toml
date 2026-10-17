@@ -1,0 +1,30 @@
+[project]
+name = "afl_cassowire_e2e"
+version = "0.1.0"
+description = "End-to-end tests for afl-cassowire (self-contained uv project; travels with the afl-cassowire repo)"
+requires-python = ">=3.10"
+dependencies = [
+    "jsonschema>=4.21",
+    "pyyaml>=6.0.1",
+]
+
+[dependency-groups]
+dev = [
+    "mypy==2.1.0",
+    "pytest==9.0.3",
+    "ruff==0.15.17",
+    "types-jsonschema>=4.25",
+    "types-pyyaml>=6.0.12",
+]
+
+[tool.uv]
+package = false
+
+[tool.mypy]
+strict = true
+
+[tool.ruff]
+line-length = 120
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "UP", "B", "SIM"]
