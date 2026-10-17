@@ -301,6 +301,13 @@ CASES: list[Case] = [
         lambda: base_config(network=network_block(port="8080")),
     ),
     Case(
+        "invalid_network_port_too_large",
+        False,
+        # port is required and must be 1-65535 (from the former root-level
+        # test_config_invalid_port.yaml fixture).
+        lambda: base_config(network=network_block(port=99999)),
+    ),
+    Case(
         "invalid_network_port_zero",
         False,
         # port is required and must be 1-65535.
@@ -323,6 +330,14 @@ CASES: list[Case] = [
         False,
         # Unknown key inside network.
         lambda: base_config(network=network_block(probe_timeout=5)),
+    ),
+    Case(
+        "invalid_payload_prefix_number",
+        False,
+        # Strict scalar types: a numeric payload prefix is rejected even though
+        # yaml-cpp would stringify it (from the former root-level
+        # test_config_bad.yaml fixture).
+        lambda: base_config(payload=payload_block(prefix=123, suffix="test")),
     ),
     Case(
         "invalid_payload_scalar",

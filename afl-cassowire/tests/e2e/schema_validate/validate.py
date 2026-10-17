@@ -5,10 +5,11 @@ Python objects (or raw YAML text); validate.to_document() turns them into
 parsed documents - the same text -> parse -> normalize -> validate pipeline a
 real config file goes through - and Draft7Validator checks them.
 
-Root-level example configs (default.yaml, default.qemu.yaml, test_config*.yaml)
-are validated from the repository per the EXPECTED table below
-(test_config_bad.yaml and test_config_invalid_port.yaml are intentionally
-invalid and must be rejected).
+Root-level example configs (default.yaml, default.qemu.yaml) are validated
+from the repository per the EXPECTED table below. The former root-level
+test_config*.yaml fixtures were dissolved: their distinctive content moved
+into cases.py, the rest was duplicated by existing cases, and the files
+themselves were renamed to test_config*.yaml.del at the repository root.
 
 Run the sweep with `uv run pytest` (see test_schema_validate.py); runtime
 dependencies (pyyaml, jsonschema) are declared in pyproject.toml and installed
@@ -28,13 +29,6 @@ SCHEMA_PATH = REPO_ROOT / "schema" / "config.schema.json"
 EXPECTED: dict[str, bool] = {
     "default.yaml": True,
     "default.qemu.yaml": True,
-    "test_config.yaml": True,
-    "test_config2.yaml": True,
-    "test_config_binary.yaml": True,
-    "test_config_minimal.yaml": True,
-    "test_config_default.yaml": True,
-    "test_config_bad.yaml": False,
-    "test_config_invalid_port.yaml": False,
 }
 
 
