@@ -1,0 +1,40 @@
+[project]
+name = "afl-cassowire-workspace"
+version = "0.1.0"
+description = "Python tooling for the afl-cassowire workspace (future /opt/workdir/tests harness; afl-cassowire/tests/e2e is a separate, self-contained uv project)"
+requires-python = ">=3.10"
+
+[dependency-groups]
+dev = [
+    "jsonschema>=4.21",
+    "mypy==2.1.0",
+    "pyyaml>=6.0.1",
+    "pytest==9.0.3",
+    "pytest-timeout>=2.3",
+    "ruff==0.15.17",
+    "types-jsonschema>=4.25",
+    "types-pyyaml>=6.0.12",
+]
+
+[tool.uv]
+package = false
+
+[tool.mypy]
+strict = true
+exclude = ["aflpp/", "other/", "afl-cassowire/", "targets/", "tools/"]
+
+[tool.ruff]
+line-length = 120
+extend-exclude = ["aflpp", "other", "afl-cassowire", "targets", "tools"]
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "UP", "B", "SIM"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+norecursedirs = [".*", "aflpp", "other", "afl-cassowire", "targets", "tools", "subprojects"]
+markers = [
+    "afl: requires the AFL++ toolchain (skip if unavailable)",
+    "qemu: requires the QEMU bridge (afl-qemu-trace)",
+    "slow: long-running campaign-style tests",
+]
