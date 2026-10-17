@@ -15,7 +15,7 @@ namespace args {
         std::string log_level;            ///< --log-level value (default: "info")
         bool forward_output;              ///< --child-output flag (default: false)
         std::string data_dir;             ///< --data-dir value (default: "afl-cassowire-data")
-        std::string input_path;           ///< --input value; accepted by the `test` subcommand only
+        std::string input_path;           ///< --input value; mandatory in `test` mode, rejected otherwise
         bool is_test_mode;                ///< true when the `test` subcommand was used
     };
 
@@ -40,8 +40,8 @@ namespace args {
      * Global options (-c/--config, --log-level, --child-output, --data-dir)
      * live on the parent parser and must precede the subcommand; --input
      * lives on the `test` subparser and is therefore only accepted as
-     * `afl-cassowire test --input <file>`. -h/--help and -v/--version are
-     * handled internally by argparse (print and exit).
+     * `afl-cassowire test --input <file>`, where it is mandatory. -h/--help
+     * and -v/--version are handled internally by argparse (print and exit).
      *
      * @param argc Argument count from main().
      * @param argv Argument vector from main().

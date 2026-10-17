@@ -15,7 +15,7 @@ namespace args {
     }
 
     ParseArgsResult parse_args(int argc, char* argv[]) {
-        argparse::ArgumentParser program("afl_proxy", "1.0");
+        argparse::ArgumentParser program("afl-cassowire", "1.0");
 
         program.add_argument("-c", "--config")
             .help("Path to the YAML configuration file")
@@ -41,9 +41,13 @@ namespace args {
         test_cmd.add_description("Run in test/debug mode.");
 
         // --input belongs to the `test` subcommand only: it is accepted as
-        // `afl_proxy test --input <file>` and rejected everywhere else.
+        // `afl-cassowire test --input <file>` and rejected everywhere else.
+        // required() enforces it at parse time (argparse only validates a
+        // subparser's arguments when that subcommand is used), so test mode
+        // can never run without an input.
         test_cmd.add_argument("--input")
-            .help("Input file for test mode (use '-' for stdin)");
+            .help("Input file for test mode (use '-' for stdin)")
+            .required();
 
         program.add_subparser(proxy_cmd);
         program.add_subparser(test_cmd);
@@ -60,7 +64,7 @@ namespace args {
         parsed.forward_output = program.get<bool>("--child-output");
         parsed.data_dir = program.get<std::string>("--data-dir");
         parsed.is_test_mode = program.is_subcommand_used("test");
-        if (parsed.is_test_mode && test_cmd.is_used("--input")) {
+        if (parsed.is_test_mode) {
             parsed.input_path = test_cmd.get<std::string>("--input");
         }
 

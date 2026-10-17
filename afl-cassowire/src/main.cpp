@@ -460,7 +460,7 @@ void run_fuzz_iteration(const Config& cfg, pid_t child_pid, int target_pidfd,
     // a crash and attribute it to the NEXT input. check_target_state reads the
     // kernel's PF_EXITING/PF_SIGNALED flags from /proc and blocks on the pidfd
     // until the death materialises, so the crash is seen in THIS iteration.
-    // TODO(claude): (1) still racy for a crash that happens AFTER this check
+    // (1) still racy for a crash that happens AFTER this check
     //   returns Alive and after the probe was serviced (deferred timers / async
     //   work). A top-of-iteration check would only move this window, not close
     //   it; a full fix needs idle detection (e.g. a procfs syscall whitelist).
@@ -630,10 +630,8 @@ int run_proxy_mode(Config cfg, bool forward_output) {
 }
 
 int run_test_mode(const Config& cfg, const std::string& input_path, bool forward_output) {
-    if (input_path.empty()) {
-        PROXY_LOG_ERROR("test mode requires --input <file> or '-'");
-        return 1;
-    }
+    // input_path is guaranteed non-empty: the parser makes --input mandatory
+    // for the `test` subcommand (src/args.cpp), long before this point.
 
     // --- Pass 1: Map Size Extraction ---
     // prepare_target() injects AFL_DUMP_MAP_SIZE=1 into the child's envp for
@@ -777,12 +775,9 @@ int main(int argc, char* argv[]) {
     // config) once the config is loaded.
     log::init(spdlog::level::info, spdlog::level::warn);
 
-    // TODO(claude): CLI. (1) `-c/--config`, `--log-level` and `--child-output` are declared on the parent
-    //   parser (src/args.cpp), so they must come BEFORE the subcommand (`afl-cassowire -c x test`);
-    //   `afl-cassowire test -c x` is an error, which is surprising. `--input` is declared on the `test`
-    //   subparser and must come AFTER it. (2) `--input` is not enforced as mandatory in test mode by the
-    //   parser (checked manually later, after config loading + stale cleanup killed processes!).
-    //   (3) The argparse program name is "afl_proxy" (src/args.cpp) while the binary is "afl-cassowire".
+    // Note: global options (-c/--config, --log-level, --child-output,
+    // --data-dir) must precede the subcommand; `test --input <file>` carries
+    // its option after `test`. This split is intentional (see src/args.hpp).
     auto args_res = args::parse_args(argc, argv);
     if (const auto* parse_err = std::get_if<args::ArgParseError>(&args_res)) {
         PROXY_LOG_ERROR("{}", parse_err->message);
@@ -839,8 +834,8 @@ int main(int argc, char* argv[]) {
     utils::set_dump_history_size(cfg.afl.dump_history);
 
     // TODO(claude): stale cleanup (which SIGTERM/SIGKILLs other processes and sleeps force_kill_ms)
-    //   runs before test mode rejects a missing --input and before proxy mode checks __AFL_SHM_ID, so a
-    //   misconfigured invocation still kills processes. Validate the invocation first.
+    //   runs before proxy mode checks __AFL_SHM_ID, so a misconfigured invocation still kills
+    //   processes. Validate the invocation first.
     // Stale Process Cleanup
     process::cleanup_stale_processes(cfg.cleanup);
 
