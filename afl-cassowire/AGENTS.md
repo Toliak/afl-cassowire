@@ -23,16 +23,32 @@ make build      # meson compile -C build (sets AFL_CASSOWIRE_LLVM_ONLY_FSRV=1)
 `AFLPP_DISTRIB_DIR` defaults to `../aflpp/src/distrib`; override if AFL++ lives elsewhere.
 
 ## Testing policy (strict)
-No test suite and no linter exist — verify changes by building. Do NOT improvise
-verification steps that are not explicitly described in this file or in an explicit
-user instruction. Specifically:
-- Do not invent, write, or run tests, linters, static analyzers, sanitizers, or
+There is no C++ unit-test suite and no C++ linter — verify code changes by building.
+End-to-end tests live in `tests/e2e` (a self-contained uv project):
+- `schema_validate/` — parametrized config JSON-Schema fixtures (`cases.py` +
+  `blocks.py`, engine in `validate.py`).
+- `test_mode/` — `afl-cassowire test` mode against the prebuilt instrumented
+  `tests/targets/test-target` (dump-map pass + single-iteration pass, payload
+  wrapping, stdin input, procfs/seccomp port detection). It expects the binaries
+  to be already built — `build/afl-cassowire` and the target's
+  `build/afl-clang-fast++/test-target` (override with `AFL_CASSOWIRE_BIN` /
+  `CASSOWIRE_TEST_TARGET_BIN`); it never builds them and fails when missing.
+
+Run them with (from the repository root):
+```sh
+make -C tests/e2e prepare-dev   # uv sync
+make -C tests/e2e tests         # uv run pytest (both suites)
+make -C tests/e2e lint          # ruff
+make -C tests/e2e typecheck     # mypy --strict
+```
+Do NOT improvise verification steps beyond the ones above. Specifically:
+- Do not invent, write, or run C++ tests, linters, static analyzers, sanitizers, or
   coverage tools that were not asked for.
 - Do not create ad-hoc scripts or harnesses to "verify" behavior.
 - Do not run the proxy against live targets (e.g. NGINX) or fuzz it unless the user
   explicitly requests it.
 - Do not guess test commands (`make test`, `ctest`, etc. do not exist here).
-The only default verification is the documented build sequence above.
+For C++ changes the only default verification is the documented build sequence above.
 
 ## Running
 ```sh
@@ -153,7 +169,9 @@ are ignored helper-anchor fields (see Important details).
   `load_config()` and exempted in `config.schema.json` (root `patternProperties
   "^__"`): a reserved namespace for YAML anchor/merge (`<<`) helper fragments.
   The exemption is root-only — `__`-prefixed keys inside any section are still
-  rejected as unknown keys. Fixtures: `tests/e2e/schema_validate/cases/*helper*.yaml`.
+  rejected as unknown keys. Fixtures: the `valid_helper_anchors`,
+  `invalid_single_underscore_key` and `invalid_nested_helper_key` cases in
+  `tests/e2e/schema_validate/cases.py`.
 - Observability (hang triage): the proxy loop emits an INFO heartbeat every ~5 s
   (iteration count + max connect/send/wait/probe stage times + slow-iteration
   count, flushed) and a WARN whenever a stage reaches `network.timeout_ms`
@@ -188,8 +206,8 @@ are ignored helper-anchor fields (see Important details).
   sends RST: nothing sits in TIME_WAIT and the proxy's ephemeral port range
   cannot be exhausted by fast fuzzing.
 - `port_detection.defork` and the ptrace-based port-detection modes were REMOVED
-  (the schema fixtures `invalid_defork_key_removed.yaml` and `invalid_primary_ptrace.yaml`
-  assert that both are rejected).
+  (the schema cases `invalid_defork_key_removed` and `invalid_primary_ptrace` in
+   `tests/e2e/schema_validate/cases.py` assert that both are rejected).
   Seccomp detection is now `SECCOMP_RET_USER_NOTIF`-based, which handles
   multi-process and multi-threaded targets correctly (all inherited-filter
   tasks notify the same fd).
