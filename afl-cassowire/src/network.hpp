@@ -256,7 +256,9 @@ namespace network {
      * is serviced (timers, async logging) is not covered; on multi-acceptor /
      * threaded targets the probe may be serviced while main-connection cleanup
      * still runs elsewhere; banner-sending servers report Serviced as soon as
-     * they send their greeting, before reading EOF.
+     * they send their greeting, before reading EOF. These are documented
+     * limitations (see AGENTS.md); afl.dump_history retains the last N completed
+     * payloads so a crash detected late still preserves the likely culprit.
      *
      * @param net_cfg The network configuration (host, port, timeout_ms).
      * @return ProbeResult Serviced, Refused, Timeout, or Failed with the

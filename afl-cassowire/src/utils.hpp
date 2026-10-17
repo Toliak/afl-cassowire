@@ -90,8 +90,10 @@ namespace utils {
     /**
      * @brief Sets the directory used for termination dumps.
      *
-     * crash_proxy()/abort_proxy() write a `.msg` (reason) and a `.data` (the
-     * full payload built for the failing iteration) file into this directory.
+     * crash_proxy()/abort_proxy() write a `.msg` (reason), a `.data` (the full
+     * payload built for the failing iteration) and, when
+     * set_dump_history_size() > 0, the retained previous-iteration payloads as
+     * `.-1.data`, `.-2.data`, ... into this directory.
      * The path is used as-is (relative paths resolve against the process's
      * cwd); the directory is created recursively if it does not exist.
      * Creation failure is logged but not fatal.
@@ -131,6 +133,34 @@ namespace utils {
     void set_current_iteration(uint64_t n);
 
     /**
+     * @brief Sets how many completed-iteration payloads are retained for dumps.
+     *
+     * record_dump_input() keeps the last @p n payloads (prefix + input + suffix)
+     * of completed proxy iterations. When crash_proxy()/abort_proxy() later fire,
+     * the retained payloads are written next to the current one as
+     * "<stem>.-1.data" (most recent previous iteration), "<stem>.-2.data", ...
+     * A deferred/async crash is detected one iteration late, so the current
+     * payload may not be the input that caused it; the history preserves the
+     * likely culprit. 0 disables the history (only "<stem>.data" is written).
+     * The proxy is single-threaded, so a plain non-atomic store suffices.
+     *
+     * @param n Number of previous payloads to retain (0 = disabled).
+     */
+    void set_dump_history_size(std::size_t n);
+
+    /**
+     * @brief Records one completed iteration's payload for the termination dump.
+     *
+     * Called by the proxy loop after each completed iteration (see
+     * set_dump_history_size()). No-op when the history is disabled. The payload
+     * is copied, so the caller may reuse its buffer immediately afterwards.
+     *
+     * @param input The full payload (prefix + input + suffix) of the iteration
+     *        that just completed.
+     */
+    void record_dump_input(std::span<const uint8_t> input);
+
+    /**
      * @brief Crashes the proxy intentionally (e.g., to trigger AFL respawn).
      * Raises SIGSEGV.
      *
@@ -138,6 +168,8 @@ namespace utils {
      * to the configured data directory (see set_data_dir()). The .msg file
      * also embeds the last warn/error messages captured by the proxy logger
      * (log::recent_lines()) - the context that preceded the termination.
+     * When a history is enabled (set_dump_history_size()), the retained
+     * previous-iteration payloads are dumped as .-1.data, .-2.data, ...
      *
      * @param message Human-readable reason for the crash.
      * @param input The full payload built for the failing iteration.
@@ -152,6 +184,8 @@ namespace utils {
      * to the configured data directory (see set_data_dir()). The .msg file
      * also embeds the last warn/error messages captured by the proxy logger
      * (log::recent_lines()) - the context that preceded the termination.
+     * When a history is enabled (set_dump_history_size()), the retained
+     * previous-iteration payloads are dumped as .-1.data, .-2.data, ...
      *
      * @param message Human-readable reason for the abort.
      * @param input The full payload built for the failing iteration.

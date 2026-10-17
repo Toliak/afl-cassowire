@@ -473,7 +473,7 @@ std::variant<Config, ConfigError> load_config(const std::string& path) {
             // --- Check for unknown keys in afl ---
             {
                 static const std::unordered_set<std::string> afl_allowed = {"loop_count", "enable_cmplog",
-                                                                            "cov_discard_init"};
+                                                                            "cov_discard_init", "dump_history"};
                 ConfigError err = check_unknown_keys(afl_node, afl_allowed, "afl");
                 if (!err.message.empty()) {
                     return err;
@@ -502,6 +502,17 @@ std::variant<Config, ConfigError> load_config(const std::string& path) {
                     cfg.afl.cov_discard_init = afl_node["cov_discard_init"].as<bool>();
                 } catch (const YAML::BadConversion&) {
                     return ConfigError{"afl.cov_discard_init", "Invalid type", "boolean", afl_node["cov_discard_init"].Scalar()};
+                }
+            }
+            if (afl_node["dump_history"]) {
+                try {
+                    const int v = afl_node["dump_history"].as<int>();
+                    if (v < 0 || v > 64) {
+                        return ConfigError{"afl.dump_history", "Must be 0-64", "integer 0-64", std::to_string(v)};
+                    }
+                    cfg.afl.dump_history = static_cast<std::size_t>(v);
+                } catch (const YAML::BadConversion&) {
+                    return ConfigError{"afl.dump_history", "Invalid type", "integer", afl_node["dump_history"].Scalar()};
                 }
             }
         }

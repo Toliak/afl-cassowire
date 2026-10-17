@@ -2,6 +2,7 @@
 
 #pragma once
 
+#include <cstddef>
 #include <cstdint>
 #include <string>
 #include <vector>
@@ -62,6 +63,14 @@ struct AflConfig {
     // afl-fuzz does not attribute the startup snapshot to the first fuzzed
     // testcase (low stability).
     bool cov_discard_init = true;
+    // Number of completed iterations whose payloads are retained and written
+    // alongside a termination dump (crash_proxy()/abort_proxy()) as
+    // <stem>.-1.data, <stem>.-2.data, ... (-1 = most recent previous
+    // iteration). A deferred/async crash is detected one iteration late, so the
+    // current payload may not be the input that caused it; the retained history
+    // preserves the likely culprit. 0 disables the history (only <stem>.data is
+    // written). Must be 0-64.
+    std::size_t dump_history = 1;
 };
 
 struct PortDetectionConfig {

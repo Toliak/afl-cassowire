@@ -8,6 +8,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <filesystem>
+#include <deque>
 #include <string>
 #include <utility>
 #include <unistd.h>
@@ -56,6 +57,13 @@ std::string g_instance_tag;
 // outside the loop (start-up path) or in test mode; see
 // set_current_iteration().
 uint64_t g_current_iteration = 0;
+
+// Retained payloads of the last completed iterations, oldest first. Written
+// alongside a termination dump as <stem>.-1.data (most recent), -2, ... so a
+// deferred/async crash detected one iteration late still preserves the input
+// that likely caused it. Bounded by g_dump_history_max; empty when disabled.
+std::deque<std::vector<uint8_t>> g_dump_history;
+std::size_t g_dump_history_max = 0;
 
 // Maximum number of bytes of a captured warn/error history line embedded into
 // the .msg file. History lines are short in practice (repeated per-iteration
@@ -158,6 +166,17 @@ void dump_termination_data(std::string_view kind, std::string_view message,
 
     write_all(data_fd.get(), data.data(), data.size(), stem + ".data");
 
+    // History: the payloads of the last completed iterations, newest first, as
+    // <stem>.-1.data, <stem>.-2.data, ... These are the inputs that preceded the
+    // current one, kept because a deferred/async crash is detected one iteration
+    // late and the current payload may not be the culprit.
+    std::size_t history_written = 0;
+    for (auto it = g_dump_history.rbegin(); it != g_dump_history.rend(); ++it) {
+        const std::string path = stem + ".-" + std::to_string(history_written + 1) + ".data";
+        write_named_file(path, it->data(), it->size());
+        ++history_written;
+    }
+
     std::string msg = std::string(kind);
     if (!g_instance_tag.empty()) {
         msg += "[" + g_instance_tag + "]";
@@ -168,6 +187,19 @@ void dump_termination_data(std::string_view kind, std::string_view message,
     // loop). Lets a dump be correlated with the periodic heartbeat lines,
     // which count completed iterations.
     msg += "iteration: " + std::to_string(g_current_iteration) + "\n";
+
+    // Map the retained history files to their iteration numbers so a dump can be
+    // read without knowing the file layout: .-1.data is the most recent previous
+    // iteration, .-2.data the one before that, and so on.
+    if (history_written > 0) {
+        msg += "\n--- dump history (previous iterations, same payload format as .data) ---\n";
+        for (std::size_t i = 1; i <= history_written; ++i) {
+            const uint64_t hist_iter =
+                g_current_iteration >= i ? g_current_iteration - static_cast<uint64_t>(i) : 0;
+            msg += ".-" + std::to_string(i) + ".data = iteration "
+                   + std::to_string(hist_iter) + "\n";
+        }
+    }
 
     // Embed the recent warn/error history (oldest first, captured by the
     // logger's ring sink) so the dump carries the context that preceded the
@@ -188,7 +220,12 @@ void dump_termination_data(std::string_view kind, std::string_view message,
     }
     write_named_file(stem + ".msg", msg.data(), msg.size());
 
-    PROXY_LOG_INFO("termination dump written: {}.msg / {}.data", stem, stem);
+    if (history_written > 0) {
+        PROXY_LOG_INFO("termination dump written: {}.msg / {}.data / {} history file(s) (.-1.data ... .-{}.data)",
+                       stem, stem, history_written, history_written);
+    } else {
+        PROXY_LOG_INFO("termination dump written: {}.msg / {}.data", stem, stem);
+    }
 }
 
 // Shared implementation of crash_proxy()/abort_proxy(): dump, log, then raise
@@ -221,6 +258,21 @@ void set_instance_tag(std::string tag) {
 
 void set_current_iteration(uint64_t n) {
     g_current_iteration = n;
+}
+
+void set_dump_history_size(std::size_t n) {
+    g_dump_history_max = n;
+    while (g_dump_history.size() > g_dump_history_max) {
+        g_dump_history.pop_front();
+    }
+}
+
+void record_dump_input(std::span<const uint8_t> input) {
+    if (g_dump_history_max == 0) return;
+    g_dump_history.emplace_back(input.begin(), input.end());
+    while (g_dump_history.size() > g_dump_history_max) {
+        g_dump_history.pop_front();
+    }
 }
 
 [[noreturn]] void crash_proxy(std::string_view message, std::span<const uint8_t> input) {

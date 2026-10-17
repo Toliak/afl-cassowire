@@ -125,6 +125,8 @@ are ignored helper-anchor fields (see Important details).
    current 1-based `__AFL_LOOP` iteration as an `iteration: N` line (set once per
    loop pass via `utils::set_current_iteration()` in `run_proxy_mode()`; `0` =
    termination outside the loop or test mode). Dumps are best-effort and never fatal.
+   With `afl.dump_history > 0` the dump also writes the retained previous-iteration
+   payloads as `{stem}.-1.data`, `{stem}.-2.data`, ... (see "Crash detection gaps").
 - Payload sent over TCP is `payload.prefix + fuzz input + payload.suffix`
   (`PayloadConfig::wrap()`); values may be `!!binary`.
 - Startup-coverage fix (stability): `main.cpp` has a file-scope `__AFL_COVERAGE()`
@@ -182,12 +184,31 @@ are ignored helper-anchor fields (see Important details).
   multi-process and multi-threaded targets correctly (all inherited-filter
   tasks notify the same fd).
 
+## Crash detection gaps and termination-dump history
+- The proxy's crash detection is synchronous: each iteration runs the quiescence
+  probe and a race-free `check_target_state()` (reads `PF_EXITING`/`PF_SIGNALED`,
+  blocks on the pidfd). A crash that happens *after* that check returns `Alive` —
+  deferred/async work (timers, atexit, a worker thread, a QEMU child) — is detected
+  only on the next iteration, so it is attributed to the next input and the saved
+  `.data` payload may be the wrong one. This is inherent: a top-of-iteration check
+  would only move the window, not close it; a full fix needs idle detection (e.g. a
+  procfs syscall whitelist). The proxy mitigates it with `afl.dump_history` (default
+  `1`): the last N completed payloads (prefix + input + suffix) are retained and
+  written with every termination dump as `{stem}.-1.data` (most recent previous
+  iteration), `{stem}.-2.data`, ... so the likely culprit survives alongside the
+  current input. `0` disables the history (only `{stem}.data` is written).
+- Crashes in worker children of the target (nginx workers, QEMU child processes) are
+  not detected directly: only the direct child pid is watched
+  (`process::check_target_state`). A dead worker stops servicing, so it surfaces as
+  a probe/connect timeout → `abort_proxy` → AFL respawn, not as a crash finding. The
+  dump history keeps the recent requests for triage.
+
 ## Design notes and extras
 - `src/afl_compat.h` (not `.hpp`) defines *no-op* AFL++ macros instead of `#error`-ing;
   the "must use an AFL++ compiler" enforcement lives in the `meson.build` compiler
   probe. Don't add an `#error` guard to the header.
 - Config keys added after the original design: `target.env`, `target.env_preserve`, `payload.*`,
-  `afl.cov_discard_init`,
+  `afl.cov_discard_init`, `afl.dump_history`,
   `target_cmplog.*`, `network_cmplog.*`, and the required
   `AFL_CASSOWIRE_FORCE_FINAL_LOC` env var. `target_cmplog`/`network_cmplog` are standalone
   (no key falls back to `target`/`network`) and required when `afl.enable_cmplog: true`;

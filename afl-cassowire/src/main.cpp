@@ -476,10 +476,15 @@ void run_fuzz_iteration(const Config& cfg, pid_t child_pid, int target_pidfd,
     // until the death materialises, so the crash is seen in THIS iteration.
     // TODO(claude): (1) still racy for a crash that happens AFTER this check
     //   returns Alive and after the probe was serviced (deferred timers / async
-    //   work) - that needs idle detection (e.g. a procfs syscall whitelist),
-    //   not a sleep. (2) crashes in worker children of the target (nginx
-    //   workers, not the direct child) are still not detected here - only the
-    //   direct child pid is watched (procfs/PF check is per-pid).
+    //   work). A top-of-iteration check would only move this window, not close
+    //   it; a full fix needs idle detection (e.g. a procfs syscall whitelist).
+    //   This is a known limitation, documented in AGENTS.md; afl.dump_history
+    //   retains the last N completed payloads so a crash detected one iteration
+    //   late still preserves the input that likely caused it. (2) crashes in
+    //   worker children of the target (nginx workers, not the direct child) are
+    //   still not detected here - only the direct child pid is watched
+    //   (procfs/PF check is per-pid); a dead worker surfaces as a probe/connect
+    //   timeout -> abort_proxy -> AFL respawn, not as a crash finding.
     auto st = process::check_target_state(child_pid, target_pidfd, cfg.cleanup.force_kill_ms);
     PROXY_LOG_TRACE("target state: {}", st.to_string());
     switch (st.kind) {
@@ -621,6 +626,12 @@ int run_proxy_mode(Config cfg, bool forward_output) {
         // reports the same, current iteration.
         utils::set_current_iteration(stats.iterations + 1);
         run_fuzz_iteration(cfg, g_child_pid, target_pidfd.get(), payload_buf, stats);
+        // Record this completed iteration's payload so a later termination
+        // dump can preserve it (a deferred/async crash detected on the next
+        // iteration then finds the input that likely caused it). payload_buf
+        // still holds the just-finished payload here; the next iteration
+        // overwrites it inside exchange_once().
+        utils::record_dump_input(payload_buf);
     }
 
     // Clean exit of AFL loop
@@ -834,6 +845,11 @@ int main(int argc, char* argv[]) {
     }
 
     Config cfg = std::get<Config>(config_res);
+
+    // Retain the last N completed payloads so a termination dump can preserve
+    // the input that likely caused a deferred/async crash (see
+    // afl.dump_history). 0 disables the history.
+    utils::set_dump_history_size(cfg.afl.dump_history);
 
     // TODO(claude): stale cleanup (which SIGTERM/SIGKILLs other processes and sleeps force_kill_ms)
     //   runs before test mode rejects a missing --input and before proxy mode checks __AFL_SHM_ID, so a
