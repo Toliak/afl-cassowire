@@ -9,22 +9,28 @@
             "path": "../afl-cassowire",
         },
         {
-            "name": "◙ test-target",
-            "path": "../test/test-target",
+            "name": "◙ afl-cassowire / test-target",
+            "path": "../afl-cassowire/tests/targets/test-target",
         },
         {
-            "name": "◙ http_throughput",
-            "path": "../tools/http_throughput",
+            "name": "◘ afl-cassowire / e2e",
+            "path": "../afl-cassowire/tests/e2e",
         },
         {
             "name": "• AFL++",
             "path": "../aflpp/src",
+        },
+        {
+            "name": "◙ http_throughput",
+            "path": "../tools/http_throughput",
         },
     ],
     "settings": {
         "files.exclude": {
             "**/.cache": true,
             "**/.mypy_cache": true,
+            "**/.pytest_cache": true,
+            "**/.ruff_cache": true,
         },
         "todohighlight.keywords": [
             {
@@ -68,7 +74,8 @@
             "mesonbuild.mesonbuild",
             "llvm-vs-code-extensions.vscode-clangd",
             "ms-vscode.hexeditor",
-            "redhat.vscode-yaml"
+            "redhat.vscode-yaml",
+            "OwenRumney.make-ls"
         ]
     }
 }

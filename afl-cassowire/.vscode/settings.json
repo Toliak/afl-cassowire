@@ -1,0 +1,8 @@
+{
+    "files.exclude": {
+        // Excluded due to the workspace
+        "tests/targets/test-target": true,
+        "tests/e2e": true,
+    },
+    
+}
