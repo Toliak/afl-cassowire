@@ -1,4 +1,9 @@
 
+> **DEPRECATED.** This document is the original design specification and is no longer maintained.
+> It still describes removed behavior (ptrace-based port detection, `std::cout`/`std::cerr`
+> logging, `target.log.*`, an `afl_compat.hpp` `#error` guard). For current behavior see
+> `AGENTS.md`, `README.md`, `default.yaml`, `schema/config.schema.json` and the sources in `src/`.
+
 # Development Specification: AFL++ Proxy Binary
 
 ## 1. Overview
