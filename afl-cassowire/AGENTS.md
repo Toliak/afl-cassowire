@@ -33,11 +33,22 @@ End-to-end tests live in `tests/e2e` (a self-contained uv project):
   to be already built — `build/afl-cassowire` and the target's
   `build/afl-clang-fast++/test-target` (override with `AFL_CASSOWIRE_BIN` /
   `CASSOWIRE_TEST_TARGET_BIN`); it never builds them and fails when missing.
+- `proxy_mode/` — `afl-cassowire proxy` mode driven by an AFL++ "emulator"
+  (`proxy_mode/emul.py`, a stdlib-only fake afl-fuzz: SysV shmem for the
+  coverage / fuzz-testcase / cmplog maps plus the AFL++ FS_NEW forkserver
+  protocol on fds 198/199). Runs the persistent `__AFL_LOOP` against the
+  prebuilt instrumented test-target in calc/http mode (normal + cmplog,
+  procfs + one seccomp config) and asserts the coverage and cmplog maps differ
+  between target modes and between corpora. Same prebuilt-binary contract as
+  `test_mode` plus the cmplog target variant `build/afl-clang-fast++_cmplog/`
+  (override with `AFL_CASSOWIRE_BIN`, `CASSOWIRE_TEST_TARGET_BIN`,
+  `CASSOWIRE_TEST_TARGET_CMPLOG_BIN`); fails when binaries are missing, skips
+  cmplog cases when `kernel.shmmax` < ~144 MiB (sizeof of the cmplog map).
 
 Run them with (from the repository root):
 ```sh
 make -C tests/e2e prepare-dev   # uv sync
-make -C tests/e2e tests         # uv run pytest (both suites)
+make -C tests/e2e tests         # uv run pytest (all suites)
 make -C tests/e2e lint          # ruff
 make -C tests/e2e typecheck     # mypy --strict
 ```

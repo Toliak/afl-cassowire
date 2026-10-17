@@ -20,11 +20,11 @@ build_afl-clang-fast++ \
 build_afl-clang-fast++_cmplog: AFL_LLVM_CMPLOG=1
 
 $(ALL_BUILD_SUBTARGETS): build_%:
-	export PATH="$(AFLPP_BIN_DIR):$$PATH" && \
+	@export PATH="$(AFLPP_DISTRIB_DIR)/bin:$$PATH" && \
 		export AFL_LLVM_CMPLOG="$(AFL_LLVM_CMPLOG)" && \
-		rm -rf "./build/$*"
-		mkdir -p "./build/$*"
-		CXX="$(CXX)" meson setup "./build/$*"
+		rm -rf "./build/$*" && \
+		mkdir -p "./build/$*" && \
+		CXX="$(CXX)" meson setup "./build/$*" && \
 		meson compile -C "./build/$*"
 
 build: $(ALL_BUILD_SUBTARGETS)
