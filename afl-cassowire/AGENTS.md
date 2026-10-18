@@ -92,7 +92,8 @@ are ignored helper-anchor fields (see Important details).
   (`-Dstrip_low_logs=true` compiles trace/debug out), `parse_level()`, `escape_bytes()`,
   and a warn-level ringbuffer sink (capacity 16) exposing `recent_lines()` for
   termination dumps.
-- `src/process.{hpp,cpp}` — namespace `process`: stale-process cleanup, `prepare_target()` →
+- `src/process.{hpp,cpp}` — namespace `process`: optional pre-spawn port-conflict
+  check/cleanup (`handle_port_conflict()`), `prepare_target()` →
   `fork_target()` split (prepare env/argv before `fork()`, no heap
   allocs between `fork()` and `execve()`), seccomp user-notif filter install +
   listener-fd handoff (`SpawnedTarget::notif_fd`) in the pre-exec child, stdio/pipe redirection.
@@ -141,8 +142,16 @@ are ignored helper-anchor fields (see Important details).
   group plus a bounded (~200 ms) reap of the group leader (`kill_and_reap_pgid()` in
   `main.cpp`), in all modes and on every exit path — the shared coverage map is
   shm-backed and written on every edge hit, so a SIGKILL'd target loses nothing AFL
-  reads. `cleanup.force_kill_ms` is not involved (it applies only to the
-  `cleanup.kill_pattern` stale-process cleanup).
+  reads. `cleanup` is not involved in this teardown; it is only a pre-spawn
+  port-conflict check (see below).
+- Optional pre-spawn port cleanup (`cleanup.enabled`, default `false`): resolves
+  the LISTEN socket inode for the configured port and its holders. A holder with a
+  live parent is never touched (the cmplog target, another campaign, a service);
+  the proxy refuses to start instead. `on_port_conflict: error` (default) reports an
+  orphaned holder; `kill_orphan` SIGKILLs only orphaned holders whose exe/argv[0]
+  matches the resolved target (normal vs cmplog) plus their process trees, with no
+  SIGTERM grace. Runs only in proxy mode after AFL env validation and before
+  `__AFL_INIT()`; test mode never scans `/proc` or kills anything.
 - Targets are spawned with `PR_SET_PDEATHSIG(SIGKILL)` plus a `getppid()` race check in
   the pre-exec child (`fork_target()`), so the kernel kills the target whenever the
   proxy dies — `abort_proxy`, `crash_proxy`, or AFL killing the

@@ -31,7 +31,7 @@ def port_detection_block(**overrides: Any) -> dict[str, Any]:
 
 def cleanup_block(**overrides: Any) -> dict[str, Any]:
     """Valid `cleanup:` section (all keys optional)."""
-    return {"force_kill_ms": 1000, **overrides}
+    return {"enabled": True, "on_port_conflict": "error", **overrides}
 
 
 def payload_block(**overrides: Any) -> dict[str, Any]:

@@ -43,7 +43,7 @@ class Case:
 
 
 def _build_full() -> dict[str, Any]:
-    # Every section populated, scalar kill_pattern form.
+    # Every section populated.
     return {
         "target": target_block(
             args=["./target", "-g", "daemon off;"],
@@ -59,7 +59,7 @@ def _build_full() -> dict[str, Any]:
         ),
         "afl": afl_block(loop_count=50000, enable_cmplog=False, msg_log_level="error"),
         "port_detection": port_detection_block(primary="seccomp"),
-        "cleanup": cleanup_block(force_kill_ms=2000, kill_pattern="nginx"),
+        "cleanup": cleanup_block(enabled=True, on_port_conflict="error"),
         "payload": payload_block(
             prefix="GET / HTTP/1.1\r\nHost: localhost\r\n\r\n",
             suffix=b"\r\n\r\n",
@@ -189,26 +189,16 @@ CASES: list[Case] = [
         _build_helper_anchors,
     ),
     Case(
-        "valid_kill_pattern_map",
+        "valid_cleanup_disabled",
         True,
-        # kill_pattern object form (comm) with the seccomp(user-notif) primary.
-        lambda: base_config(
-            port_detection=port_detection_block(primary="seccomp"),
-            cleanup=cleanup_block(
-                force_kill_ms=1000,
-                kill_pattern={"type": "comm", "value": "nginx"},
-            ),
-        ),
+        # Cleanup is opt-in; both keys together and disabled are valid.
+        lambda: base_config(cleanup=cleanup_block(enabled=False)),
     ),
     Case(
-        "valid_kill_pattern_regexp",
+        "valid_cleanup_kill_orphan",
         True,
-        # kill_pattern regexp object form. NOTE: the schema deliberately accepts any
-        # object here; the loader currently rejects the `target` key due to a known
-        # bug in config.cpp (fixed separately), so this case is schema-valid only.
-        lambda: base_config(
-            cleanup=cleanup_block(kill_pattern={"type": "regexp", "value": "nginx: worker", "target": "argv"})
-        ),
+        # Explicit opt-in to SIGKILLing orphaned holders of the configured port.
+        lambda: base_config(cleanup=cleanup_block(enabled=True, on_port_conflict="kill_orphan")),
     ),
     Case(
         "valid_port_detection_verify_ownership",
@@ -236,10 +226,22 @@ CASES: list[Case] = [
         lambda: base_config(afl=afl_block(msg_log_level="noisy")),
     ),
     Case(
-        "invalid_cleanup_force_kill_zero",
+        "invalid_cleanup_enabled_type",
         False,
-        # cleanup.force_kill_ms must be > 0.
-        lambda: base_config(cleanup=cleanup_block(force_kill_ms=0)),
+        # cleanup.enabled is a strict boolean.
+        lambda: base_config(cleanup=cleanup_block(enabled="yes")),
+    ),
+    Case(
+        "invalid_cleanup_port_conflict",
+        False,
+        # on_port_conflict is a closed enum.
+        lambda: base_config(cleanup=cleanup_block(on_port_conflict="kill_all")),
+    ),
+    Case(
+        "invalid_cleanup_force_kill_removed",
+        False,
+        # force_kill_ms was removed (cleanup is SIGKILL-only).
+        lambda: base_config(cleanup=cleanup_block(force_kill_ms=1000)),
     ),
     Case(
         "invalid_cmplog_sections_missing",
@@ -259,17 +261,10 @@ CASES: list[Case] = [
         lambda: base_config(port_detection=port_detection_block(primary="seccomp", defork=True)),
     ),
     Case(
-        "invalid_kill_pattern_null",
+        "invalid_kill_pattern_removed",
         False,
-        # kill_pattern must be a string or an object; null is rejected by the loader.
-        lambda: base_config(cleanup=cleanup_block(kill_pattern=None)),
-    ),
-    Case(
-        "invalid_kill_pattern_scalar_number",
-        False,
-        # Strict scalar types: a bare numeric kill_pattern is rejected even though
-        # yaml-cpp would stringify it.
-        lambda: base_config(cleanup=cleanup_block(kill_pattern=42)),
+        # kill_pattern was removed in favor of the port-scoped cleanup policy.
+        lambda: base_config(cleanup=cleanup_block(kill_pattern="nginx")),
     ),
     Case(
         "invalid_missing_network",

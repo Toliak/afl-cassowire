@@ -32,7 +32,6 @@ EMUL_PATH = Path(__file__).resolve().parent / "emul.py"
 RUN_TIMEOUT_SECONDS = 300
 NETWORK_TIMEOUT_MS = 500
 INITIAL_MS = 1000
-FORCE_KILL_MS = 1000
 LOOP_COUNT = 20
 
 NORMAL_VARIANT = "afl-clang-fast++"
@@ -118,7 +117,7 @@ def write_config(
         "network": network,
         "afl": {"loop_count": loop_count, "enable_cmplog": cmplog},
         "port_detection": {"primary": primary},
-        "cleanup": {"force_kill_ms": FORCE_KILL_MS},
+        "cleanup": {"enabled": False},
     }
     if payload is not None:
         config["payload"] = payload

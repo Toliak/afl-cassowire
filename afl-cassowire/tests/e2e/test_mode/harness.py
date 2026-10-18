@@ -25,7 +25,6 @@ REPO_ROOT = Path(__file__).resolve().parents[3]
 
 RUN_TIMEOUT_SECONDS = 60
 NETWORK_TIMEOUT_MS = 2000
-FORCE_KILL_MS = 1000
 
 
 def cassowire_bin() -> Path:
@@ -85,7 +84,7 @@ def write_config(
             "initial_ms": NETWORK_TIMEOUT_MS,
         },
         "port_detection": {"primary": primary},
-        "cleanup": {"force_kill_ms": FORCE_KILL_MS},
+        "cleanup": {"enabled": False},
     }
     if payload is not None:
         config["payload"] = payload
