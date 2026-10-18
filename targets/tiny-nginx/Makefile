@@ -67,7 +67,7 @@ fuzz-qemu:
 ifdef FUZZ_DEBUG
 	@echo "AFL++ debug mode"
 endif
-	AFL_CASSOWIRE_FORCE_FINAL_LOC=65536 $(AFL_FUZZ_ENV) afl-fuzz -b 2 -i ./in -o ./out -t 2000 -c 0 -- \
+	AFL_CASSOWIRE_FORCE_FINAL_LOC=65536 $(AFL_FUZZ_ENV) afl-fuzz -b 5 -i ./in -o ./out -t 2000 -c 0 -- \
  		"$$(which afl-cassowire)" --log-level trace --child-output --config cassowire.qemu.yaml proxy
 #  		"$$(which afl-cassowire)" --log-level error --config cassowire.qemu.yaml proxy
 

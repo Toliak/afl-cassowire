@@ -1,0 +1,30 @@
+# yaml-language-server: $schema=../../afl-cassowire/schema/config.schema.json
+
+target: &target
+  binary: "./src/build/afl-clang-fast++/test-target"
+  args: &args ["test-target", "calc", "--port", "8050", "--with-crash"]
+
+target_cmplog:
+  <<: *target
+  args: ["test-target", "calc", "--port", "9050", "--with-crash"]
+
+network: &network
+  host: 127.0.0.1
+  port: 8050
+  timeout_ms: 200
+  initial_ms: 200
+  probe: true
+  probe_retry_ms: 5
+  probe_attempts: 2
+
+network_cmplog: 
+  <<: *network
+  port: 9050
+
+afl:
+  loop_count: 20000
+  enable_cmplog: true
+
+port_detection:
+  primary: "seccomp"
+
