@@ -22,8 +22,8 @@
 #   - "test" mode is unusable: Pass 1 (AFL_DUMP_MAP_SIZE) needs the native AFL
 #     runtime, so under qemu it just runs NGINX forever and the single
 #     iteration (Pass 2) is never reached. Debug via proxy mode instead.
-#   - The whole guest (master + workers) is ONE host process, so cleanup.kill_pattern
-#     matches the qemu binary only.
+#   - The whole guest (master + workers) is ONE host process, so cleanup
+#     identifies it by the configured qemu bridge/trace binary.
 #
 # CMPLOG (afl.enable_cmplog: true) works for QEMU targets: define
 # target_cmplog/network_cmplog running the same bridge + guest on a DIFFERENT
@@ -36,7 +36,7 @@
 # To use afl-qemu-trace instead of afl-qemu-bridge:
 #   1. Replace the binary path with /path/to/afl-qemu-trace
 #   2. Add '--' as an argument before the guest argv to separate qemu-trace options
-#   3. Update cleanup.kill_pattern.value to "afl-qemu-trace"
+#   3. Point `target.binary` at afl-qemu-trace (cleanup matches that binary)
 # Example for afl-qemu-trace:
 # target:
 #   binary: /opt/workdir/aflpp/src/afl-qemu-trace
@@ -48,9 +48,6 @@
 #     - "daemon off;"
 #     - -c
 #     - /path/to/nginx.conf
-# cleanup:
-#   kill_pattern:
-#     value: "afl-qemu-trace"
 
 # yaml-language-server: $schema=./schema/config.schema.json
 
@@ -87,10 +84,8 @@ port_detection:
                                                   # (user-notification) works there too
 
 cleanup:
-  force_kill_ms: 2000
-  kill_pattern:                                   # match the qemu process, not the guest
-    type: comm
-    value: "afl-qemu-bridge"                      # /proc/<pid>/comm (15 chars max)
+  enabled: true                                   # recover a stale qemu bridge on this port
+  on_port_conflict: kill_orphan                   # only orphaned holders matching `target.binary`
 
 payload:
   prefix: "GET / HTTP/1.1\r\nHost: localhost\r\n\r\n"

@@ -52,13 +52,17 @@ __AFL_COVERAGE();
 // PR_SET_PDEATHSIG(SIGKILL) (see process::fork_target()).
 pid_t g_child_pid = 0;
 
+// Upper bound on how long check_target_state() waits for an already-dying
+// target to become waitable. poll(pidfd) returns immediately on death, so this
+// only matters when the target is wedged (e.g. stuck in a coredump pipe).
+constexpr int kTargetDeathGraceMs = 200;
+
 // Hard-stop the target's process group: SIGKILL to the whole group, then a
 // bounded reap of the group leader so no zombie outlives a mode function. The
 // shared coverage map is shm-backed and written on every edge hit, so nothing
-// AFL reads is lost to the SIGKILL; cleanup.force_kill_ms is not involved
-// here (it applies only to the kill_pattern stale-process cleanup). If the
-// leader is stuck in uninterruptible kernel work past the deadline, whatever
-// is left is re-parented to init when the proxy exits.
+// AFL reads is lost to the SIGKILL. If the leader is stuck in uninterruptible
+// kernel work past the deadline, whatever is left is re-parented to init when
+// the proxy exits.
 void kill_and_reap_pgid(pid_t pgid) {
     if (pgid <= 0) return;
     kill(-pgid, SIGKILL);
@@ -281,7 +285,7 @@ void run_fuzz_iteration(const Config& cfg, pid_t child_pid, int target_pidfd,
         // a transient blip is serviced and the next iteration exchanges
         // normally. (With network.probe disabled the loop keeps retrying with
         // rate-limited logs - the explicit opt-out of the auto-respawn.)
-        auto st = process::check_target_state(child_pid, target_pidfd, cfg.cleanup.force_kill_ms);
+        auto st = process::check_target_state(child_pid, target_pidfd, kTargetDeathGraceMs);
         switch (st.kind) {
         case process::TargetState::Kind::Crashed:
             PROXY_LOG_WARN("target {} after connect failure, crashing the proxy so AFL respawns it",
@@ -396,7 +400,7 @@ void run_fuzz_iteration(const Config& cfg, pid_t child_pid, int target_pidfd,
 
             // Classify the target before deciding anything: if it is dead, the
             // classification terminates the proxy with the right signal.
-            auto st = process::check_target_state(child_pid, target_pidfd, cfg.cleanup.force_kill_ms);
+            auto st = process::check_target_state(child_pid, target_pidfd, kTargetDeathGraceMs);
             switch (st.kind) {
             case process::TargetState::Kind::Crashed:
                 PROXY_LOG_WARN("target {} after probe failure ({}), crashing the proxy so AFL records the finding",
@@ -471,7 +475,7 @@ void run_fuzz_iteration(const Config& cfg, pid_t child_pid, int target_pidfd,
     //   still not detected here - only the direct child pid is watched
     //   (procfs/PF check is per-pid); a dead worker surfaces as a probe/connect
     //   timeout -> abort_proxy -> AFL respawn, not as a crash finding.
-    auto st = process::check_target_state(child_pid, target_pidfd, cfg.cleanup.force_kill_ms);
+    auto st = process::check_target_state(child_pid, target_pidfd, kTargetDeathGraceMs);
     PROXY_LOG_TRACE("target state: {}", st.to_string());
     switch (st.kind) {
     case process::TargetState::Kind::Crashed:
@@ -536,6 +540,12 @@ int run_proxy_mode(Config cfg, bool forward_output) {
     }
 
     PROXY_LOG_INFO("AFL_CASSOWIRE_FORCE_FINAL_LOC = {}", force_final_loc);
+
+    // Pre-spawn cleanup: only in a validated proxy invocation, against the
+    // already-selected normal/cmplog target and port.
+    if (!process::handle_port_conflict(cfg)) {
+        return 1;
+    }
 
     // Initialize AFL persistent mode
     __AFL_INIT();
@@ -622,8 +632,8 @@ int run_proxy_mode(Config cfg, bool forward_output) {
 
     // Clean exit of AFL loop: hard-stop the target's process group. The
     // coverage map is shm-backed (written on every edge hit), so a SIGKILL'd
-    // target loses nothing AFL reads; a graceful SIGTERM would only add up to
-    // cleanup.force_kill_ms of respawn latency per __AFL_LOOP exit.
+    // target loses nothing AFL reads; a graceful SIGTERM would only add
+    // respawn latency per __AFL_LOOP exit.
     kill_and_reap_pgid(g_child_pid);
     PROXY_LOG_TRACE("kill {}", static_cast<int>(g_child_pid));
     return 0;
@@ -832,12 +842,6 @@ int main(int argc, char* argv[]) {
     // the input that likely caused a deferred/async crash (see
     // afl.dump_history). 0 disables the history.
     utils::set_dump_history_size(cfg.afl.dump_history);
-
-    // TODO(claude): stale cleanup (which SIGTERM/SIGKILLs other processes and sleeps force_kill_ms)
-    //   runs before proxy mode checks __AFL_SHM_ID, so a misconfigured invocation still kills
-    //   processes. Validate the invocation first.
-    // Stale Process Cleanup
-    process::cleanup_stale_processes(cfg.cleanup);
 
     if (parsed.is_test_mode) {
         return run_test_mode(cfg, parsed.input_path, parsed.forward_output);

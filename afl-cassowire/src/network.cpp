@@ -142,6 +142,35 @@ static InodeOwnershipResult check_inode_ownership(pid_t target_pid, const std::s
     return result;
 }
 
+std::optional<std::string> find_listen_inode_for_port(uint16_t port) {
+    for (const char* path : {"/proc/net/tcp", "/proc/net/tcp6"}) {
+        std::ifstream file(path);
+        if (!file.is_open()) continue;
+
+        std::string line;
+        std::getline(file, line); // skip header
+        while (std::getline(file, line)) {
+            std::istringstream iss(line);
+            std::string idx, local_addr, rem_addr, state;
+            if (!(iss >> idx >> local_addr >> rem_addr >> state)) continue;
+            if (state != "0A") continue; // TCP_LISTEN
+            size_t colon = local_addr.find(':');
+            if (colon == std::string::npos) continue;
+            auto parsed = utils::parse_u16_strict(local_addr.substr(colon + 1), 16);
+            if (!std::holds_alternative<std::uint16_t>(parsed) ||
+                std::get<std::uint16_t>(parsed) != port) {
+                continue;
+            }
+            std::string tok;
+            for (int i = 0; i < 6; i++) {
+                if (!(iss >> tok)) { tok.clear(); break; }
+            }
+            if (!tok.empty()) return tok;
+        }
+    }
+    return std::nullopt;
+}
+
 // procfs detection. Each pass polls waitpid(WNOHANG) and reports TargetDied
 //   (the zombie is reaped here, like the seccomp(user-notif) death path), so a
 //   target that exits during startup is noticed immediately. With
@@ -171,40 +200,13 @@ static DetectResult check_procfs(pid_t target_pid, int target_port, uint64_t tim
 
         // Find a LISTEN entry on the configured port and remember its socket
         // inode (10th token: sl local rem st tx:rx tr:tm retrnsmt uid timeout inode).
-        std::string listen_inode;
-        for (const char* path : {"/proc/net/tcp", "/proc/net/tcp6"}) {
-            std::ifstream file(path);
-            if (!file.is_open()) continue;
-
-            std::string line;
-            std::getline(file, line); // skip header
-            while (std::getline(file, line)) {
-                std::istringstream iss(line);
-                std::string idx, local_addr, rem_addr, state;
-                if (!(iss >> idx >> local_addr >> rem_addr >> state)) continue;
-                if (state != "0A") continue; // TCP_LISTEN
-                size_t colon = local_addr.find(':');
-                if (colon == std::string::npos) continue;
-                auto parsed = utils::parse_u16_strict(local_addr.substr(colon + 1), 16);
-                if (!std::holds_alternative<std::uint16_t>(parsed) ||
-                    std::get<std::uint16_t>(parsed) != target_port) {
-                    continue;
-                }
-                std::string tok;
-                for (int i = 0; i < 6; i++) {
-                    if (!(iss >> tok)) { tok.clear(); break; }
-                }
-                if (!tok.empty()) {
-                    listen_inode = tok;
-                    break;
-                }
-            }
-            if (!listen_inode.empty()) break;
-        }
-        if (listen_inode.empty()) {
+        const std::optional<std::string> found_inode =
+            find_listen_inode_for_port(static_cast<uint16_t>(target_port));
+        if (!found_inode) {
             utils::sleep_ms(10);
             continue;
         }
+        const std::string& listen_inode = *found_inode;
         if (!verify_ownership) return std::monostate{};
 
         // Ownership verification: the inode must be held by the target or one of

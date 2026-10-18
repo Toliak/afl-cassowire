@@ -125,22 +125,18 @@ port_detection:
                                # silent initial_ms stall.
 
 cleanup:
-  force_kill_ms: 2000          # Wait after SIGTERM before SIGKILL; used only
-                               # by the kill_pattern stale-process cleanup
-                               # (the target itself is always SIGKILL'd)
-  # kill_pattern:              # Optional: auto-kill stale target processes
-    # Scalar form — matches /proc/<pid>/comm:
-    # "nginx"
-    #
-    # Object form — explicit match:
-    # type: comm                   # or "regexp"
-    # value: "nginx"
-    # target: "comm"              # or "argv0", "argv"
-    #
-    # Notes: "comm" is the kernel's main-thread name (/proc/<pid>/comm),
-    # truncated to 15 chars; a process that renamed itself, or a worker with
-    # a different name, will not match. Matching is global (every process the
-    # proxy can see), so keep patterns narrow.
+  enabled: false               # Pre-spawn port-conflict check/cleanup. Off by
+                               # default: no /proc scan; a busy port surfaces
+                               # through normal target/port-detection failure.
+  on_port_conflict: error      # "error": report the holder and refuse to start.
+                               # "kill_orphan": SIGKILL only an ORPHANED holder
+                               # (no live parent) of this exact port, provided it
+                               # matches the configured target binary/argv[0].
+                               # Live holders (cmplog target, another campaign,
+                               # a service) are never killed - the proxy refuses
+                               # to start instead. No SIGTERM/grace phase.
+                               # Ignored when enabled is false.
+
 # Optional payload wrapping: every payload sent to the target (in `proxy`
 # and `test` mode) is transmitted as: prefix + fuzz input + suffix.
 # Values may be a plain string or `!!binary` base64-encoded bytes.

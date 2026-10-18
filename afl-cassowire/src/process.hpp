@@ -13,14 +13,28 @@
 namespace process {
 
     /**
-     * @brief Iterates through /proc to find and kill stale processes matching the cleanup pattern.
-     * 
-     * Sends SIGTERM, waits for the configured force_kill_ms, and sends SIGKILL if the process 
-     * is still alive.
-     * 
-     * @param cleanup_cfg The cleanup configuration containing the kill pattern and timeouts.
-     * */
-    void cleanup_stale_processes(const CleanupConfig& cleanup_cfg);
+     * @brief Pre-spawn handling of a listener already bound to the configured port.
+     *
+     * No-op when cleanup.enabled is false. Otherwise resolves the LISTEN socket
+     * inode from /proc/net/tcp{,6} and the processes holding it:
+     *  - a holder with a live parent (cmplog target, another campaign, a
+     *    service) is never touched; the preflight refuses to start;
+     *  - with on_port_conflict=error, an orphaned holder is reported and the
+     *    preflight refuses to start;
+     *  - with on_port_conflict=kill_orphan, an orphaned holder that matches the
+     *    configured target binary/argv[0] is SIGKILLed together with its
+     *    process tree. There is no SIGTERM/grace phase; the port is re-checked
+     *    briefly afterwards.
+     *
+     * Called only in proxy mode, after the AFL environment has been validated
+     * and the normal/cmplog config has been selected, before __AFL_INIT().
+     *
+     * @param cfg The resolved configuration (target/network already reflect
+     *            normal vs cmplog mode).
+     * @return true if the proxy may proceed (port free or successfully freed),
+     *         false if it must not start.
+     */
+    bool handle_port_conflict(const Config& cfg);
 
     /**
      * @brief Collect @p root and all of its descendants (the "target tree").

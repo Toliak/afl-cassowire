@@ -96,15 +96,16 @@ struct PortDetectionConfig {
     bool verify_ownership = true;
 };
 
-struct KillPattern {
-    std::string type;   // "comm" or "regexp"
-    std::string value;  // Pattern or string
-    std::string target; // "comm", "argv0", "argv" (used if type == "regexp")
-};
-
 struct CleanupConfig {
-    int force_kill_ms = 2000;
-    std::optional<KillPattern> kill_pattern;
+    // Pre-spawn handling of the configured listening port. Disabled by default:
+    // the proxy then never scans /proc and any conflict surfaces through normal
+    // target/port-detection failure.
+    bool enabled = false;
+    enum class PortConflictPolicy {
+        error,      // report the conflicting listener and refuse to start
+        kill_orphan // SIGKILL orphaned holders of this port (see process.cpp)
+    };
+    PortConflictPolicy on_port_conflict = PortConflictPolicy::error;
 };
 
 // Optional prefix/suffix wrapped around every payload sent to the target

@@ -2,16 +2,18 @@
 
 #include "process.hpp"
 #include "log.hpp"
+#include "network.hpp"
 #include "utils.hpp"
 
 #include <fstream>
 #include <sstream>
 #include <string>
 #include <vector>
-#include <regex>
 #include <algorithm>
 #include <cctype>
 #include <unordered_set>
+#include <filesystem>
+#include <climits>
 #include <dirent.h>
 #include <unistd.h>
 #include <fcntl.h>
@@ -26,6 +28,7 @@
 #include <linux/audit.h>
 #include <signal.h>
 #include <cstring>
+#include <cstdio>
 #include <cstdlib>
 #include <cerrno>
 
@@ -129,104 +132,6 @@ static int recv_fd(int sock) {
     return fd;
 }
 
-void cleanup_stale_processes(const CleanupConfig& cleanup_cfg) {
-    // TODO(claude): DANGEROUS. (1) This is a global /proc scan with no protection against matching the proxy
-    //   itself, its parent (afl-fuzz / shell) or the new target just about to be spawned. A broad pattern
-    //   (e.g. type=regexp value=".*" target=argv) makes the proxy SIGKILL the kernel-ish set of every
-    //   user process - including the session running it. (2) It never re-checks that a matched pid is still
-    //   the same process after the grace period (pid reuse), and it always sleeps the full force_kill_ms even
-    //   when nothing is alive. (3) kill() failures (e.g. EPERM for other users' processes) are ignored.
-    if (!cleanup_cfg.kill_pattern) return;
-
-    const KillPattern& kp = cleanup_cfg.kill_pattern.value();
-    std::regex re;
-    if (kp.type == "regexp") {
-        try {
-            re = std::regex(kp.value);
-        } catch (const std::regex_error&) {
-            return; // Should have been caught in config validation
-        }
-    }
-
-    DIR* proc_dir = opendir("/proc");
-    if (!proc_dir) return;
-
-    struct dirent* entry;
-    std::vector<pid_t> matched_pids;
-
-    while ((entry = readdir(proc_dir)) != nullptr) {
-        if (entry->d_type != DT_DIR) continue;
-        
-        // Check if directory name is all digits (PID)
-        bool is_pid = true;
-        for (char* p = entry->d_name; *p; p++) {
-            if (!std::isdigit(static_cast<unsigned char>(*p))) { 
-                is_pid = false; 
-                break; 
-            }
-        }
-        if (!is_pid) continue;
-
-        // std::stoi was replaced by the exception-free utils::parse_u32_strict: an all-digit directory whose
-        //   value exceeds the type range used to throw std::out_of_range uncaught (-> std::terminate).
-        auto parsed_pid = utils::parse_u32_strict(entry->d_name);
-        if (!std::holds_alternative<std::uint32_t>(parsed_pid)) continue;
-        pid_t pid = static_cast<pid_t>(std::get<std::uint32_t>(parsed_pid));
-        if (pid <= 1) continue; // Skip init (kernel threads are filtered by the empty-cmdline TODO below)
-
-        std::string proc_path = std::string("/proc/") + entry->d_name;
-        bool match = false;
-
-        if (kp.type == "comm" || (kp.type == "regexp" && kp.target == "comm")) {
-            // Main-thread comm only (see default.yaml, cleanup.kill_pattern).
-            std::ifstream comm_file(proc_path + "/comm");
-            std::string comm;
-            if (std::getline(comm_file, comm)) {
-                if (kp.type == "comm") {
-                    match = (comm == kp.value);
-                } else {
-                    match = std::regex_match(comm, re);
-                }
-            }
-        } else if (kp.type == "regexp" && (kp.target == "argv0" || kp.target == "argv")) {
-            // TODO(claude): kernel threads have an EMPTY cmdline, so any regex that matches the empty string
-            //   (e.g. `.*`, `^$`) matches every kernel thread and they cannot be killed - the proxy then
-            //   "waits" for them pointlessly. Skip pids with an empty cmdline.
-            std::ifstream cmdline_file(proc_path + "/cmdline", std::ios::binary);
-            std::string cmdline((std::istreambuf_iterator<char>(cmdline_file)), std::istreambuf_iterator<char>());
-            
-            if (kp.target == "argv") {
-                std::replace(cmdline.begin(), cmdline.end(), '\0', ' ');
-                if (!cmdline.empty() && cmdline.back() == ' ') cmdline.pop_back();
-                match = std::regex_match(cmdline, re);
-            } else if (kp.target == "argv0") {
-                size_t null_pos = cmdline.find('\0');
-                std::string argv0 = (null_pos == std::string::npos) ? cmdline : cmdline.substr(0, null_pos);
-                match = std::regex_match(argv0, re);
-            }
-        }
-
-        if (match) {
-            matched_pids.push_back(pid);
-        }
-    }
-    closedir(proc_dir);
-
-    for (pid_t pid : matched_pids) {
-        // kill() failures (EPERM, ESRCH) are ignored; see the TODO at the top of this function.
-        kill(pid, SIGTERM);
-    }
-
-    if (!matched_pids.empty()) {
-        utils::sleep_ms(cleanup_cfg.force_kill_ms);
-        for (pid_t pid : matched_pids) {
-            if (kill(pid, 0) == 0) { // Still alive
-                kill(pid, SIGKILL);
-            }
-        }
-    }
-}
-
 // Parse the ppid field (whitespace field 4) out of a /proc stat buffer:
 // "pid (comm) state ppid ...". comm (field 2) may contain spaces and
 // parentheses, so the field numbering restarts after the LAST ')' (same
@@ -298,8 +203,8 @@ static void children_via_ppid_scan(pid_t pid, std::vector<pid_t>& out) {
     struct dirent* e;
     while ((e = readdir(proc)) != nullptr) {
         if (e->d_name[0] < '0' || e->d_name[0] > '9') continue;
-        // std::stoi replaced by the exception-free utils::parse_u32_strict
-        // (see cleanup_stale_processes above for the rationale).
+        // Exception-free parsing: an all-digit directory name that exceeds
+        // uint32 would make std::stoi throw std::out_of_range uncaught.
         auto parsed_pid = utils::parse_u32_strict(e->d_name);
         if (!std::holds_alternative<std::uint32_t>(parsed_pid)) continue;
         pid_t cand = static_cast<pid_t>(std::get<std::uint32_t>(parsed_pid));
@@ -337,6 +242,262 @@ std::vector<pid_t> collect_pid_tree(pid_t root) {
         }
     }
     return tree;
+}
+
+// --- Port-conflict preflight ------------------------------------------------
+
+static bool read_proc_ppid(pid_t pid, pid_t* out) {
+    char path[64];
+    snprintf(path, sizeof(path), "/proc/%d/stat", pid);
+    int fd = ::open(path, O_RDONLY | O_CLOEXEC);
+    if (fd < 0) return false;
+    char buf[512];
+    ssize_t n = ::read(fd, buf, sizeof(buf) - 1);
+    ::close(fd);
+    if (n <= 0) return false;
+    buf[n] = '\0';
+    return parse_proc_ppid(buf, static_cast<size_t>(n), out);
+}
+
+static std::string proc_comm(pid_t pid) {
+    std::ifstream file("/proc/" + std::to_string(pid) + "/comm");
+    std::string comm;
+    if (std::getline(file, comm)) return comm;
+    return "?";
+}
+
+static std::string proc_cmdline(pid_t pid) {
+    std::ifstream file("/proc/" + std::to_string(pid) + "/cmdline", std::ios::binary);
+    std::string cmdline((std::istreambuf_iterator<char>(file)),
+                        std::istreambuf_iterator<char>());
+    std::replace(cmdline.begin(), cmdline.end(), '\0', ' ');
+    if (!cmdline.empty() && cmdline.back() == ' ') cmdline.pop_back();
+    return cmdline;
+}
+
+static std::string proc_exe(pid_t pid) {
+    char path[64];
+    snprintf(path, sizeof(path), "/proc/%d/exe", pid);
+    char buf[PATH_MAX];
+    ssize_t n = readlink(path, buf, sizeof(buf) - 1);
+    if (n <= 0) return {};
+    std::string exe(buf, static_cast<size_t>(n));
+    const std::string deleted = " (deleted)";
+    if (exe.size() > deleted.size() &&
+        exe.compare(exe.size() - deleted.size(), deleted.size(), deleted) == 0) {
+        exe.resize(exe.size() - deleted.size());
+    }
+    return exe;
+}
+
+static bool is_self_or_ancestor(pid_t pid) {
+    pid_t cur = getpid();
+    while (cur > 1) {
+        if (cur == pid) return true;
+        pid_t ppid = -1;
+        if (!read_proc_ppid(cur, &ppid) || ppid <= 0) break;
+        cur = ppid;
+    }
+    return pid == getpid();
+}
+
+// True when @p pid has a live (non-zombie) parent. A process with a live
+// parent belongs to a live tree (the cmplog target under its proxy and
+// afl-fuzz included) and is never a cleanup candidate. Only a process whose
+// parent is init, gone, or a zombie is considered orphaned/stale.
+static bool has_live_parent(pid_t pid) {
+    pid_t ppid = -1;
+    if (!read_proc_ppid(pid, &ppid) || ppid <= 1) return false;
+
+    char path[64];
+    snprintf(path, sizeof(path), "/proc/%d/stat", ppid);
+    int fd = ::open(path, O_RDONLY | O_CLOEXEC);
+    if (fd < 0) return false;
+    char buf[512];
+    ssize_t n = ::read(fd, buf, sizeof(buf) - 1);
+    ::close(fd);
+    if (n <= 0) return false;
+    buf[n] = '\0';
+
+    // Field 3 (state) is the first token after the last ')'.
+    size_t rparen = 0;
+    bool found = false;
+    for (ssize_t i = 0; i < n; i++) {
+        if (buf[i] == ')') { rparen = static_cast<size_t>(i); found = true; }
+    }
+    if (!found) return false;
+    const char* p = buf + rparen + 1;
+    while (*p == ' ' || *p == '\t') p++;
+    return *p != 'Z' && *p != 'X' && *p != 'x' && *p != '\0';
+}
+
+static bool is_orphaned(pid_t pid) {
+    return !has_live_parent(pid);
+}
+
+static bool process_matches_target(pid_t pid, const TargetConfig& target) {
+    const std::string exe = proc_exe(pid);
+    if (!exe.empty()) {
+        std::error_code ec;
+        std::filesystem::path want = std::filesystem::canonical(target.binary, ec);
+        if (ec) {
+            ec.clear();
+            want = std::filesystem::absolute(target.binary, ec);
+        }
+        if (!ec && want.string() == exe) return true;
+    }
+
+    // argv[0] fallback for scripts / wrappers whose /proc/<pid>/exe is an
+    // interpreter instead of the configured binary.
+    std::ifstream file("/proc/" + std::to_string(pid) + "/cmdline", std::ios::binary);
+    std::string cmdline((std::istreambuf_iterator<char>(file)),
+                        std::istreambuf_iterator<char>());
+    const size_t nul = cmdline.find('\0');
+    const std::string argv0 = cmdline.substr(0, nul);
+    if (!target.args.empty()) return argv0 == target.args[0];
+    return argv0 == target.binary;
+}
+
+struct InodeHolders {
+    std::vector<pid_t> pids;
+    bool unreadable = false;
+};
+
+static InodeHolders find_inode_holders(const std::string& inode) {
+    InodeHolders result;
+    const std::string want = "socket:[" + inode + "]";
+
+    DIR* proc = opendir("/proc");
+    if (!proc) {
+        result.unreadable = true;
+        return result;
+    }
+    struct dirent* entry;
+    while ((entry = readdir(proc)) != nullptr) {
+        if (entry->d_name[0] < '0' || entry->d_name[0] > '9') continue;
+        auto parsed = utils::parse_u32_strict(entry->d_name);
+        if (!std::holds_alternative<std::uint32_t>(parsed)) continue;
+        const pid_t pid = static_cast<pid_t>(std::get<std::uint32_t>(parsed));
+        if (pid <= 1) continue;
+
+        const std::string fd_dir = "/proc/" + std::to_string(pid) + "/fd";
+        DIR* fds = opendir(fd_dir.c_str());
+        if (!fds) {
+            if (errno == EACCES || errno == EPERM) result.unreadable = true;
+            continue;
+        }
+        struct dirent* fd_entry;
+        bool holds = false;
+        while ((fd_entry = readdir(fds)) != nullptr) {
+            if (fd_entry->d_name[0] < '0' || fd_entry->d_name[0] > '9') continue;
+            const std::string link_path = fd_dir + "/" + fd_entry->d_name;
+            char link[128];
+            ssize_t n = readlink(link_path.c_str(), link, sizeof(link) - 1);
+            if (n <= 0) continue;
+            link[n] = '\0';
+            if (want == link) {
+                holds = true;
+                break;
+            }
+        }
+        closedir(fds);
+        if (holds) result.pids.push_back(pid);
+    }
+    closedir(proc);
+    std::sort(result.pids.begin(), result.pids.end());
+    result.pids.erase(std::unique(result.pids.begin(), result.pids.end()), result.pids.end());
+    return result;
+}
+
+static std::string describe_holder(pid_t pid) {
+    pid_t ppid = -1;
+    (void)read_proc_ppid(pid, &ppid);
+    return "pid " + std::to_string(pid) + " (comm '" + proc_comm(pid) +
+           "', ppid " + std::to_string(ppid) + ", argv '" + proc_cmdline(pid) + "')";
+}
+
+bool handle_port_conflict(const Config& cfg) {
+    if (!cfg.cleanup.enabled) return true;
+
+    const uint16_t port = static_cast<uint16_t>(cfg.network.port);
+    const std::optional<std::string> inode = network::find_listen_inode_for_port(port);
+    if (!inode) return true; // port is free
+
+    const InodeHolders holders = find_inode_holders(*inode);
+    if (holders.pids.empty()) {
+        // The LISTEN entry exists but no holder was resolvable. Re-check: the
+        // socket may have disappeared between the two scans, otherwise refuse
+        // rather than start or kill blindly.
+        if (!network::find_listen_inode_for_port(port)) return true;
+        PROXY_LOG_ERROR("cleanup: port {} is listening (inode {}) but its holder could not be "
+                        "resolved{}; refusing to start",
+                        port, *inode, holders.unreadable ? " (unreadable /proc/<pid>/fd)" : "");
+        return false;
+    }
+
+    std::vector<pid_t> orphans;
+    for (pid_t pid : holders.pids) {
+        if (is_self_or_ancestor(pid) || !is_orphaned(pid)) {
+            PROXY_LOG_ERROR("cleanup: port {} is held by a live process {}; refusing to start "
+                            "(only orphaned holders of this port are eligible)",
+                            port, describe_holder(pid));
+            return false;
+        }
+        orphans.push_back(pid);
+    }
+
+    if (cfg.cleanup.on_port_conflict == CleanupConfig::PortConflictPolicy::error) {
+        for (pid_t pid : orphans) {
+            PROXY_LOG_ERROR("cleanup: port {} is held by orphaned process {}; refusing to start "
+                            "(cleanup.on_port_conflict=error)",
+                            port, describe_holder(pid));
+        }
+        return false;
+    }
+
+    for (pid_t pid : orphans) {
+        if (!process_matches_target(pid, cfg.target)) {
+            PROXY_LOG_ERROR("cleanup: orphaned holder {} does not match target binary '{}'; "
+                            "refusing to kill it",
+                            describe_holder(pid), cfg.target.binary);
+            return false;
+        }
+    }
+
+    // SIGKILL the union of the holders' process trees. Targets stay in their
+    // own process group and do not detach, so this covers their workers too.
+    std::vector<pid_t> victims;
+    std::unordered_set<pid_t> seen;
+    for (pid_t pid : orphans) {
+        for (pid_t victim : collect_pid_tree(pid)) {
+            if (victim <= 1 || is_self_or_ancestor(victim)) continue;
+            const pid_t pgid = getpgid(victim);
+            if (pgid != -1 && pgid == getpgrp()) continue;
+            if (seen.insert(victim).second) victims.push_back(victim);
+        }
+    }
+
+    for (pid_t pid : victims) {
+        if (kill(pid, SIGKILL) != 0 && errno != ESRCH) {
+            PROXY_LOG_WARN("cleanup: SIGKILL of {} failed: {}", describe_holder(pid), strerror(errno));
+        }
+    }
+    for (pid_t pid : victims) {
+        PROXY_LOG_INFO("cleanup: SIGKILLed orphaned port holder {}", describe_holder(pid));
+    }
+
+    // SIGKILL delivery is asynchronous; give the kernel a bounded moment to
+    // release the socket before declaring failure. This is not a term/kill
+    // grace, just a confirmation wait.
+    const uint64_t deadline = utils::get_time_ms() + 200;
+    while (utils::get_time_ms() < deadline) {
+        if (!network::find_listen_inode_for_port(port)) return true;
+        utils::sleep_ms(10);
+    }
+
+    PROXY_LOG_ERROR("cleanup: port {} is still listening after SIGKILLing its orphaned holders",
+                    port);
+    return false;
 }
 
 std::optional<TargetPrepared> prepare_target(const Config& cfg, SpawnMode mode) {

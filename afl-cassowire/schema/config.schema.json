@@ -201,27 +201,18 @@
       "type": "object",
       "additionalProperties": false,
       "properties": {
-        "force_kill_ms": {
-          "type": "integer",
-          "exclusiveMinimum": 0,
-          "default": 2000,
-          "description": "Wait time after SIGTERM before SIGKILL; used only by the kill_pattern stale-process cleanup (the fuzz target itself is always SIGKILL'd)."
+        "enabled": {
+          "type": "boolean",
+          "default": false,
+          "description": "Enable the pre-spawn port-conflict check/cleanup. Disabled by default: the proxy never scans /proc and a busy port surfaces through normal target/port-detection failure."
         },
-        "kill_pattern": {
-          "$ref": "#/definitions/kill_pattern"
+        "on_port_conflict": {
+          "type": "string",
+          "enum": ["error", "kill_orphan"],
+          "default": "error",
+          "description": "Behavior when cleanup.enabled and the configured port already has a LISTEN socket. \"error\": report the holder and refuse to start. \"kill_orphan\": SIGKILL only orphaned holders (no live parent: not a cmplog target, another campaign, or a service) of this exact port, provided the process matches the configured target binary/argv[0]; their process trees are killed too. There is no SIGTERM/grace phase. Live holders are never killed; the preflight refuses to start instead. Ignored when cleanup.enabled is false."
         }
       }
-    },
-    "kill_pattern": {
-      "description": "Auto-kill stale target processes at startup. Scalar form: process name matched against /proc/<pid>/comm (the kernel truncates comm to 15 characters; a longer comm can never match). Object form: {type: \"comm\"|\"regexp\", value: <pattern>, target: \"comm\"|\"argv0\"|\"argv\" (meaningful for regexp)}. WARNING: the object form currently has a known loader bug (config.cpp parses `type` after the unknown-key check), so the `target` key is always rejected and `type: regexp` cannot load yet; the schema therefore accepts any object until that is fixed.",
-      "oneOf": [
-        {
-          "type": "string"
-        },
-        {
-          "type": "object"
-        }
-      ]
     },
     "payload_section": {
       "description": "Optional prefix/suffix wrapped around every payload sent to the target (in `proxy` and `test` mode): the transmitted data is prefix + fuzz input + suffix. Values may be plain strings or YAML `!!binary` base64-encoded bytes (a YAML tag, which JSON Schema cannot see - tagged scalars appear as plain strings here). Omit the section or a key to send the payload unmodified. A null section is accepted and treated as empty.",

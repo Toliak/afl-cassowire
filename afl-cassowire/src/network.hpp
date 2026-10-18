@@ -75,6 +75,20 @@ namespace network {
     [[nodiscard]] DetectResult wait_for_port(pid_t target_pid, const Config& cfg, int notif_fd);
 
     /**
+     * @brief Find the socket inode of a TCP LISTEN entry on @p port.
+     *
+     * Scans /proc/net/tcp and /proc/net/tcp6 for a socket in TCP_LISTEN state
+     * whose local port equals @p port, and returns the inode from the entry
+     * (10th field). Used by procfs port detection and by the pre-spawn cleanup
+     * preflight to resolve the holder of the configured port.
+     *
+     * @param port The TCP port to look for (host byte order).
+     * @return The socket inode as a decimal string, or std::nullopt if no
+     *         LISTEN entry exists (or neither proc file is readable).
+     */
+    [[nodiscard]] std::optional<std::string> find_listen_inode_for_port(uint16_t port);
+
+    /**
      * @brief Register the target's seccomp notification listener for the
      *        steady-state pump (call after successful port detection).
      *

@@ -5,7 +5,6 @@
 #include <cstdlib>
 #include <fstream>
 #include <sstream>
-#include <regex>
 #include <iostream>
 #include <filesystem>
 #include <unordered_set>
@@ -608,95 +607,42 @@ std::variant<Config, ConfigError> load_config(const std::string& path) {
                 return ConfigError{"cleanup", "Invalid 'cleanup' section", "map", "not a map"};
             }
             YAML::Node clean_node = root["cleanup"];
-        // --- Check for unknown keys in cleanup ---
-        {
-            static const std::unordered_set<std::string> cleanup_allowed = {"force_kill_ms", "kill_pattern"};
-            ConfigError err = check_unknown_keys(clean_node, cleanup_allowed, "cleanup");
-            if (!err.message.empty()) {
-                return err;
+            // --- Check for unknown keys in cleanup ---
+            {
+                static const std::unordered_set<std::string> cleanup_allowed = {"enabled", "on_port_conflict"};
+                ConfigError err = check_unknown_keys(clean_node, cleanup_allowed, "cleanup");
+                if (!err.message.empty()) {
+                    return err;
+                }
+            }
+
+            if (clean_node["enabled"]) {
+                if (!clean_node["enabled"].IsScalar()) {
+                    return ConfigError{"cleanup.enabled", "Invalid type", "boolean", "not a scalar"};
+                }
+                try {
+                    cfg.cleanup.enabled = clean_node["enabled"].as<bool>();
+                } catch (const YAML::BadConversion&) {
+                    return ConfigError{"cleanup.enabled", "Invalid type", "boolean", clean_node["enabled"].Scalar()};
+                }
+            }
+
+            if (clean_node["on_port_conflict"]) {
+                if (!clean_node["on_port_conflict"].IsScalar()) {
+                    return ConfigError{"cleanup.on_port_conflict", "Invalid type", "error or kill_orphan", "not a string"};
+                }
+                const std::string policy = clean_node["on_port_conflict"].as<std::string>();
+                if (policy == "error") {
+                    cfg.cleanup.on_port_conflict = CleanupConfig::PortConflictPolicy::error;
+                } else if (policy == "kill_orphan") {
+                    cfg.cleanup.on_port_conflict = CleanupConfig::PortConflictPolicy::kill_orphan;
+                } else {
+                    return ConfigError{"cleanup.on_port_conflict", "Invalid enum value", "error or kill_orphan", policy};
+                }
             }
         }
 
-            if (clean_node["force_kill_ms"]) {
-                try {
-                    cfg.cleanup.force_kill_ms = clean_node["force_kill_ms"].as<int>();
-                    if (cfg.cleanup.force_kill_ms <= 0) {
-                        return ConfigError{"cleanup.force_kill_ms", "Must be > 0", "integer > 0", std::to_string(cfg.cleanup.force_kill_ms)};
-                    }
-         } catch (const YAML::BadConversion&) {
-             return ConfigError{"cleanup.force_kill_ms", "Invalid type", "integer > 0", clean_node["force_kill_ms"].Scalar()};
-         }
-     }
-
-     if (clean_node["kill_pattern"]) {
-         YAML::Node kp_node = clean_node["kill_pattern"];
-         KillPattern kp;
-         if (kp_node.IsScalar()) {
-             kp.type = "comm";
-             // WARN: /proc/<pid>/comm is truncated by the kernel to 15 chars (TASK_COMM_LEN-1). A comm
-             //   value longer than 15 chars can never match; this is intentional when the user selects "comm"
-             kp.value = kp_node.as<std::string>();
-             kp.target = "comm";
-         } else if (kp_node.IsMap()) {
-
-              // --- Check for unknown keys in cleanup.kill_pattern (if it's a map) ---
-              {
-                  std::unordered_set<std::string> kp_allowed = {"type", "value"};
-                  if (kp.type == "regexp") {
-                      kp_allowed.insert("target");
-                  }
-                  ConfigError err = check_unknown_keys(kp_node, kp_allowed, "cleanup.kill_pattern");
-                  if (!err.message.empty()) {
-                      return err;
-                  }
-              }
-
-             if (!kp_node["type"] || !kp_node["value"]) {
-                 return ConfigError{"cleanup.kill_pattern", "Missing 'type' or 'value'", "object with type and value", "missing fields"};
-             }
-             if (!kp_node["type"].IsScalar() || !kp_node["value"].IsScalar()) {
-                  return ConfigError{"cleanup.kill_pattern", "Invalid type for 'type' or 'value'", "strings", "not strings"};
-             }
-             kp.type = kp_node["type"].as<std::string>();
-             kp.value = kp_node["value"].as<std::string>();
-             
-             if (kp.type == "comm") {
-                 kp.target = "comm";
-             } else if (kp.type == "regexp") {
-                 if (!kp_node["target"]) {
-                     return ConfigError{"cleanup.kill_pattern.target", "Missing 'target' for regexp", "comm, argv0, or argv", "missing"};
-                 }
-                 if (!kp_node["target"].IsScalar()) {
-                     return ConfigError{"cleanup.kill_pattern.target", "Invalid type for 'target'", "string", "not a string"};
-                 }
-                 kp.target = kp_node["target"].as<std::string>();
-                 if (kp.target != "comm" && kp.target != "argv0" && kp.target != "argv") {
-                     return ConfigError{"cleanup.kill_pattern.target", "Invalid target for regexp", "comm, argv0, or argv", kp.target};
-                 }
-                 // Validate regex syntax
-                 try {
-                     // WARN: `type: comm` objects silently ignore an extra `target` key, and the regex is
-                      //   compiled with the default ECMAScript flavour.
-                     //   Note: we do not validate against empty or over-broad patterns (e.g. `.*` with target argv)
-                     //   as that is the user's responsibility; see the self/parent-protection TODO in process.cpp.
-                     if (kp.value.empty()) {
-                         return ConfigError{"cleanup.kill_pattern.value", "Pattern must not be empty", "non-empty string", ""};
-                     }
-                     std::regex r(kp.value);
-                 } catch (const std::regex_error&) {
-                     return ConfigError{"cleanup.kill_pattern.value", "Invalid regular expression", "valid regex", kp.value};
-                 }
-             } else {
-                 return ConfigError{"cleanup.kill_pattern.type", "Invalid type", "comm or regexp", kp.type};
-             }
-         } else {
-             return ConfigError{"cleanup.kill_pattern", "Invalid type", "string or object", "other"};
-         }
-         cfg.cleanup.kill_pattern = kp;
-      }
- 
-          }
-          // --- Parse payload ---
+        // --- Parse payload ---
            if (root["payload"]) {
                if (root["payload"].IsNull()) {
                    // null payload section is treated as empty (same as omitting the section)
