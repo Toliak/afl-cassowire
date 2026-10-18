@@ -103,14 +103,23 @@ FFMPEG_COMMON    := -nostdin -loglevel error -y
 # test videos are rendered with ffmpeg. Safe to re-run (wipes ./data).
 data:
 	rm -rf ./data && cp -r ./data_template ./data && mkdir -p ./data/dav
-	sed $(call SED_EXPAND,8080,8090,8091,8092) ./data_template/nginx.conf     > ./data/nginx.conf
 	sed $(call SED_EXPAND,8080,8090,8091,8092) ./data_template/nginx.new.conf > ./data/nginx.new.conf
-	sed $(call SED_EXPAND,9080,9090,9091,9092) ./data_template/nginx.conf     > ./data/nginx.cmplog.conf
 	sed $(call SED_EXPAND,9080,9090,9091,9092) ./data_template/nginx.new.conf > ./data/nginx.new.cmplog.conf
 	ffmpeg $(FFMPEG_SRC) $(FFMPEG_ENC) $(FFMPEG_COMMON)             ./data/www/test.mp4
 	ffmpeg $(FFMPEG_SRC) $(FFMPEG_ENC) -f flv $(FFMPEG_COMMON)      ./data/www/test.flv
 
 fuzz: data
+
+CASSOWIRE_CONFIG ?= cassowire.yaml
+CASSOWIRE_LOG_ARGS := --log-level error
+
+ifdef FUZZ_DEBUG
+	CASSOWIRE_LOG_ARGS := --log-level debug --child-output
+endif
+
+# ifdef NAMESPACE_PID
+# 	NAMESPACE_ARGS := nsenter -t $(NAMESPACE_PID) -n -U -- 
+# endif
 
 fuzz:
 	mkdir -p ./out ./in
@@ -119,8 +128,8 @@ ifdef FUZZ_DEBUG
 	@echo "AFL++ debug mode"
 endif
 	export AFL_CASSOWIRE_FORCE_FINAL_LOC=70000 && \
-		$(AFL_FUZZ_ENV) afl-fuzz -b 4 -i- -o ./out -x $(FUZZ_SHARED_DIR)/dict/http.dict -t 1500 -c 0 -- \
- 		"$$(which afl-cassowire)" --log-level error --config cassowire.yaml proxy
-# 		"$$(which afl-cassowire)" --log-level debug --child-output --config cassowire.yaml proxy
+		$(AFL_FUZZ_ENV) $(NAMESPACE_ARGS) \
+			afl-fuzz -b 4 -i- -o ./out -x $(FUZZ_SHARED_DIR)/dict/http.dict -t 1500 -c 0 -- \
+			"$$(which afl-cassowire)" $(CASSOWIRE_LOG_ARGS) --config $(CASSOWIRE_CONFIG) proxy
 
 .PHONY: build data fuzz

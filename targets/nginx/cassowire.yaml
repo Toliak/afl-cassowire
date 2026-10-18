@@ -9,7 +9,7 @@ target_cmplog:
   args: ["nginx", "-c", "/opt/workdir/targets/nginx/data/nginx.new.cmplog.conf"]                     # Additional arguments (binary is added automatically)
 
 network: &network
-  host: "127.0.0.1"            # TCP host to connect to
+  host: "127.0.10.1"           # TCP host to connect to
   port: 8080                   # Port to connect to (1-65535, required)
   timeout_ms: 100              # Network send/recv timeout in milliseconds
   initial_ms: 200              # Port detection timeout in milliseconds
