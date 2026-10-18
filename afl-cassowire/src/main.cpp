@@ -659,10 +659,8 @@ int run_test_mode(const Config& cfg, const std::string& input_path, bool forward
     }
     g_child_pid = spawned1.pid;
 
-    // TODO(claude): the exit status is only logged, not acted on, and Pass 1 still proceeds to Pass 2
-    //   even when the map size was missing/invalid (see the TODO below).
-    //   The wait is bounded by network.initial_ms; on timeout the target is killed
-    //   (SIGKILL via kill_and_reap_pgid).
+    // The wait is bounded by network.initial_ms; on timeout the target is
+    // killed (SIGKILL via kill_and_reap_pgid).
     PROXY_LOG_DEBUG("before waitpid");
     auto pass1 = process::wait_target_exit(spawned1.pid, cfg.network.initial_ms);
     PROXY_LOG_DEBUG("after waitpid");
@@ -676,15 +674,25 @@ int run_test_mode(const Config& cfg, const std::string& input_path, bool forward
     }
     PROXY_LOG_DEBUG("Pass 1 target status {:x} (exited={}, signaled={})",
                     pass1.status, WIFEXITED(pass1.status), WIFSIGNALED(pass1.status));
-
-    // Collect map size from the pipe
-    if (spawned1.map_size_fd >= 0) {
-        process::collect_map_size(spawned1.map_size_fd);
+    if (WIFSIGNALED(pass1.status)) {
+        PROXY_LOG_ERROR("Pass 1 target was killed by signal {}; expected the AFL++ map-size dump.",
+                        WTERMSIG(pass1.status));
+        if (spawned1.map_size_fd >= 0) {
+            close(spawned1.map_size_fd);
+        }
+        return 1;
     }
 
-    // TODO(claude): Pass 1 failure (no/invalid map size) is NOT propagated: collect_map_size() returns
-    //   void, so this always prints "completed" and goes on to Pass 2 even when the parse failed. It
-    //   should return a std::optional<uint64_t> and abort test mode on failure.
+    // Collect map size from the pipe. A target that cannot produce a valid
+    // dump is not properly AFL-instrumented, so Pass 1 is a hard gate.
+    if (spawned1.map_size_fd < 0) {
+        PROXY_LOG_ERROR("no map-size pipe for Pass 1.");
+        return 1;
+    }
+    if (!process::collect_map_size(spawned1.map_size_fd)) {
+        PROXY_LOG_ERROR("Pass 1 (Map Size) failed.");
+        return 1;
+    }
     PROXY_LOG_INFO("Pass 1 (Map Size) completed.");
 
     // --- Pass 2: Single Iteration ---

@@ -829,38 +829,63 @@ TargetExit wait_target_exit(pid_t pid, uint64_t timeout_ms) {
     }
 }
 
-void collect_map_size(int pipe_read_fd) {
-    char buffer[1024] = {0};
-    ssize_t bytes_read = read(pipe_read_fd, buffer, sizeof(buffer) - 1);
-    close(pipe_read_fd);
-    PROXY_LOG_DEBUG("bytes read: {}", bytes_read);
+std::optional<uint64_t> collect_map_size(int pipe_read_fd) {
+    constexpr size_t kMaxMapSizeOutput = 4096;
 
-    if (bytes_read > 0) {
-        std::string output(buffer, bytes_read);
-        std::istringstream iss(output);
-        std::string line;
-        if (std::getline(iss, line)) {
-            size_t start = line.find_first_not_of(" \t\r\n");
-            size_t end = line.find_last_not_of(" \t\r\n");
-            if (start != std::string::npos) {
-                std::string trimmed = line.substr(start, end - start + 1);
-                bool is_digit = !trimmed.empty() && std::all_of(trimmed.begin(), trimmed.end(),
-                    [](unsigned char c){ return std::isdigit(c); });
-
-                if (is_digit) {
-                    PROXY_LOG_INFO("map size: {}", trimmed);
-                } else {
-                    // TODO(claude): a failed map-size parse is only logged and spawn/collect still lets
-                    //   main.cpp continue as if all was well (collect_map_size() returns void). Also only
-                    //   the first line is inspected: a target that prints "MAP_SIZE: 65536" fails, but one
-                    //   that prints "65536\ngarbage" passes.
-                    PROXY_LOG_ERROR("failed to parse map size from target output. Output: '{}'", trimmed);
-                }
-            }
-        }
-    } else {
-        PROXY_LOG_ERROR("target produced no output for map size.");
+    // Pass 1 has already exited, so every write is either buffered or the pipe
+    // is at EOF. Non-blocking reads keep a descendant that inherited the write
+    // end from hanging the proxy; EOF/EAGAIN ends the drain.
+    const int flags = fcntl(pipe_read_fd, F_GETFL);
+    if (flags >= 0) {
+        fcntl(pipe_read_fd, F_SETFL, flags | O_NONBLOCK);
     }
+
+    std::string output;
+    char buffer[512];
+    for (;;) {
+        const ssize_t bytes_read = read(pipe_read_fd, buffer, sizeof(buffer));
+        if (bytes_read > 0) {
+            if (output.size() + static_cast<size_t>(bytes_read) > kMaxMapSizeOutput) {
+                PROXY_LOG_ERROR("map size output exceeds {} bytes.", kMaxMapSizeOutput);
+                close(pipe_read_fd);
+                return std::nullopt;
+            }
+            output.append(buffer, static_cast<size_t>(bytes_read));
+        } else if (bytes_read == 0) {
+            break;
+        } else if (errno == EINTR) {
+            continue;
+        } else if (errno == EAGAIN || errno == EWOULDBLOCK) {
+            break;
+        } else {
+            PROXY_LOG_ERROR("failed to read map size from target output: {}", strerror(errno));
+            close(pipe_read_fd);
+            return std::nullopt;
+        }
+    }
+    close(pipe_read_fd);
+    PROXY_LOG_DEBUG("bytes read: {}", output.size());
+
+    // Strictly one integer: trim surrounding whitespace from the whole buffer
+    // (not just the first line) and reject any other text, a prefix, or a
+    // trailing line. The AFL++ runtime prints exactly "%u\n" and exits.
+    const size_t start = output.find_first_not_of(" \t\r\n");
+    if (start == std::string::npos) {
+        PROXY_LOG_ERROR("target produced no output for map size.");
+        return std::nullopt;
+    }
+    const size_t end = output.find_last_not_of(" \t\r\n");
+    const std::string trimmed = output.substr(start, end - start + 1);
+
+    auto parsed = utils::parse_u64_strict(trimmed);
+    if (std::holds_alternative<utils::ParseError>(parsed)) {
+        PROXY_LOG_ERROR("failed to parse map size from target output. Output: '{}'", trimmed);
+        return std::nullopt;
+    }
+
+    const uint64_t map_size = std::get<uint64_t>(parsed);
+    PROXY_LOG_INFO("map size: {}", map_size);
+    return map_size;
 }
 
 // PF_EXITING / PF_SIGNALED: task->flags bits visible as field 9 of

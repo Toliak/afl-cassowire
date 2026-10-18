@@ -157,12 +157,15 @@ namespace process {
     /**
      * @brief Read and parse the map size from the pipe created for MapSizePass.
      *
-     * Consumes exactly one line of output, expects a decimal integer, logs it.
-     * On failure logs an error but does not return an error code (matches legacy behavior).
+     * Drains the pipe after the Pass 1 target has exited, then accepts only a
+     * single decimal integer after trimming leading/trailing whitespace. A
+     * prefix, trailing text, empty output, an unreadable pipe, or an oversized
+     * dump is an error.
      *
      * @param pipe_read_fd read end of the pipe (will be closed by this function)
+     * @return The parsed map size on success, std::nullopt on failure.
      */
-    void collect_map_size(int pipe_read_fd);
+    [[nodiscard]] std::optional<uint64_t> collect_map_size(int pipe_read_fd);
 
     /**
      * @brief Open a pollable PID file descriptor for an existing process.

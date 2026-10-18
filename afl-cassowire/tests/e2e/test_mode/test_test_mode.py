@@ -12,6 +12,7 @@ harness.cassowire_bin / harness.test_target_bin for the exact paths); missing
 binaries fail instead of being built.
 """
 
+import sys
 from pathlib import Path
 
 import harness
@@ -59,6 +60,34 @@ def test_dump_map_and_single_iteration_calc(tmp_path: Path, primary: str) -> Non
     res = run_calc_case(tmp_path, primary)
     assert_dump_map_pass(res, harness.test_target_bin())
     assert_single_iteration_pass(res, CALC_RESPONSE)
+
+
+@pytest.mark.parametrize(
+    "output",
+    [b"MAP_SIZE: 65536\n", b"65536\ngarbage\n", b""],
+    ids=["prefixed", "trailing_garbage", "no_output"],
+)
+def test_dump_map_rejects_malformed_output(tmp_path: Path, output: bytes) -> None:
+    """Pass 1 is a hard gate: malformed or missing map-size output stops test mode."""
+    code = (
+        "import sys\n"
+        f"sys.stdout.buffer.write({output!r})\n"
+        "sys.stdout.buffer.flush()\n"
+        "raise SystemExit(255)\n"
+    )
+    config = harness.write_config(
+        tmp_path,
+        target_args=[sys.executable, "-c", code],
+        port=harness.free_port(),
+    )
+    input_file = tmp_path / "input.bin"
+    input_file.write_bytes(b"x")
+    res = harness.run_cassowire(config, "test", "--input", str(input_file))
+
+    assert res.returncode != 0, res.detail()
+    assert harness.error_lines(res.stdout), res.detail()
+    assert "Pass 1 (Map Size) completed." not in res.stdout, res.detail()
+    assert "Pass 2" not in res.stdout, res.detail()
 
 
 def test_single_iteration_payload_wrapping(tmp_path: Path) -> None:
