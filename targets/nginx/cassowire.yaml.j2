@@ -2,11 +2,11 @@
 
 target:
   binary: "./src/install/afl-clang-fast/usr/bin/nginx"           # Path to the target binary (required)
-  args: ["nginx", "-c", "/opt/workdir/targets/nginx/data/nginx.new.conf"]                     # Additional arguments (binary is added automatically)
+  args: ["nginx", "-c", "{{ target_dir }}/data/nginx.new.conf"]                     # Additional arguments (binary is added automatically)
 
 target_cmplog:
   binary: "./src/install/afl-clang-fast_cmplog/usr/bin/nginx"           # Path to the compare-mode target binary (required)
-  args: ["nginx", "-c", "/opt/workdir/targets/nginx/data/nginx.new.cmplog.conf"]                     # Additional arguments (binary is added automatically)
+  args: ["nginx", "-c", "{{ target_dir }}/data/nginx.new.cmplog.conf"]                     # Additional arguments (binary is added automatically)
 
 network: &network
   host: "127.0.10.1"           # TCP host to connect to

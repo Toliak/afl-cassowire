@@ -1,31 +1,60 @@
+include ../_mk/container.mk
 include ../_mk/git.mk
-include ../_mk/aflpp.mk
-include ../_mk/fuzz.mk
+include ../_mk/fuzzers/aflpp.mk
+include ../_mk/fuzzers/aflnet.mk
 
-NGINX_URL := https://github.com/nginx/nginx
+TARGET_NAME := nginx
+CTR_W       := $(CONTAINER_WORKDIR)/targets/$(TARGET_NAME)
+
+NGINX_URL    := https://github.com/nginx/nginx
 NGINX_BRANCH := release-1.31.4
 
-BUILD_MAKE_ARGS := -j$(nproc)
+# ---------------------------------------------------------------------------
+# source
+# ---------------------------------------------------------------------------
 
 src:
 	$(GIT_CLONE_CMD) $(NGINX_URL) --branch "$(NGINX_BRANCH)" $@
 
-ALL_BUILD_SUBTARGETS :=	build_clang \
-						build_afl-clang-lto \
-						build_afl-clang-lto_cmplog \
-						build_afl-clang-fast \
-						build_afl-clang-fast_cmplog
+# ---------------------------------------------------------------------------
+# build variants (run inside the toolchain container)
+# ---------------------------------------------------------------------------
 
-build_clang: CC=clang
-build_afl-clang-lto \
-	build_afl-clang-lto_cmplog: CC=afl-clang-lto
-build_afl-clang-lto_cmplog: AFL_LLVM_CMPLOG=1
-build_afl-clang-fast \
-	build_afl-clang-fast_cmplog: CC=afl-clang-fast
-build_afl-clang-fast_cmplog: AFL_LLVM_CMPLOG=1
+ALL_BUILD_SUBTARGETS := build_clang \
+	build_afl-clang-lto build_afl-clang-lto_cmplog \
+	build_afl-clang-fast build_afl-clang-fast_cmplog \
+	build_aflnet build_gcov
+
+$(ALL_BUILD_SUBTARGETS): AFL_LLVM_CMPLOG := 0
+$(ALL_BUILD_SUBTARGETS): CC_ADD_FLAGS :=
+$(ALL_BUILD_SUBTARGETS): LD_ADD_FLAGS :=
+$(ALL_BUILD_SUBTARGETS): FZ_BIN_DIR :=
+
+build_clang:                 CC := clang
+build_afl-clang-lto:         CC := afl-clang-lto
+build_afl-clang-lto_cmplog:  CC := afl-clang-lto
+build_afl-clang-fast:        CC := afl-clang-fast
+build_afl-clang-fast_cmplog: CC := afl-clang-fast
+build_aflnet:                CC := afl-clang
+build_gcov:                  CC := gcc
+
+build_afl-clang-lto:         FZ_BIN_DIR := $(AFLPP_BIN_DIR)
+build_afl-clang-lto_cmplog:  FZ_BIN_DIR := $(AFLPP_BIN_DIR)
+build_afl-clang-fast:        FZ_BIN_DIR := $(AFLPP_BIN_DIR)
+build_afl-clang-fast_cmplog: FZ_BIN_DIR := $(AFLPP_BIN_DIR)
+build_aflnet:                FZ_BIN_DIR := $(AFLNET_BIN_DIR)
+
+build_afl-clang-lto_cmplog:  AFL_LLVM_CMPLOG := 1
+build_afl-clang-fast_cmplog: AFL_LLVM_CMPLOG := 1
+
+build_gcov: CC_ADD_FLAGS := -fprofile-arcs -ftest-coverage
+build_gcov: LD_ADD_FLAGS := -fprofile-arcs -ftest-coverage
+
+build: $(ALL_BUILD_SUBTARGETS)
 
 $(ALL_BUILD_SUBTARGETS): build_%:
-	export PATH="$(AFLPP_BIN_DIR):$$PATH" && \
+	$(PODMAN_RUN) -w $(CTR_W) $(TOOLCHAIN_IMAGE) bash -lc '\
+		export PATH="$(if $(FZ_BIN_DIR),$(FZ_BIN_DIR):,)$$PATH" && \
 		export AFL_LLVM_CMPLOG="$(AFL_LLVM_CMPLOG)" && \
 		cd ./src && \
 		make clean || true && \
@@ -78,58 +107,52 @@ $(ALL_BUILD_SUBTARGETS): build_%:
 			--with-threads \
 		&& \
 		mkdir -p "./install/$*" && \
-		make -j$(nproc) && \
-		make DESTDIR="./install/$*" install
+		make -j$$(nproc) && \
+		make DESTDIR="./install/$*" install'
 
-build: $(ALL_BUILD_SUBTARGETS)
+# ---------------------------------------------------------------------------
+# data / seeds / fuzz / coverage / crashes (delegated to the orc helper)
+# ---------------------------------------------------------------------------
 
-# Ports for the generated configs. cmplog variants use 9xxx ports so the
-# main and cmplog nginx instances can run side by side.
-# Expand config templates. Supported placeholders:
-#   @PORT_MAIN@ @PORT_BACKEND@ @PORT_BACKEND2@ @PORT_BACKEND3@ @TARGET_DIR@
-SED_EXPAND       = -e 's/@PORT_MAIN@/$(1)/g' \
-                   -e 's/@PORT_BACKEND@/$(2)/g' \
-                   -e 's/@PORT_BACKEND2@/$(3)/g' \
-                   -e 's/@PORT_BACKEND3@/$(4)/g' \
-                   -e 's|@TARGET_DIR@|$(CURDIR)|g'
+prepare-data:
+	$(ORC) $(TARGET_NAME) prepare-data
+	mkdir -p ./data/dav
+	$(PODMAN_RUN) -w $(CTR_W) $(TOOLCHAIN_IMAGE) bash -lc '\
+		ffmpeg -nostdin -loglevel error -y \
+			-f lavfi -i smptebars=duration=2:size=320x240:rate=15 \
+			-pix_fmt yuv420p -c:v libx264 ./data/www/test.mp4 && \
+		ffmpeg -nostdin -loglevel error -y \
+			-f lavfi -i smptebars=duration=2:size=320x240:rate=15 \
+			-pix_fmt yuv420p -c:v libx264 -f flv ./data/www/test.flv'
 
-# Small synthetic test videos, generated instead of being committed.
-FFMPEG_SRC       := -f lavfi -i smptebars=duration=2:size=320x240:rate=15
-FFMPEG_ENC       := -pix_fmt yuv420p -c:v libx264
-FFMPEG_COMMON    := -nostdin -loglevel error -y
-
-# Expand data_template/ into ./data: payload files are copied as-is, the two
-# config templates produce the four nginx configs (normal + cmplog), and the
-# test videos are rendered with ffmpeg. Safe to re-run (wipes ./data).
-data:
-	rm -rf ./data && cp -r ./data_template ./data && mkdir -p ./data/dav
-	sed $(call SED_EXPAND,8080,8090,8091,8092) ./data_template/nginx.new.conf > ./data/nginx.new.conf
-	sed $(call SED_EXPAND,9080,9090,9091,9092) ./data_template/nginx.new.conf > ./data/nginx.new.cmplog.conf
-	ffmpeg $(FFMPEG_SRC) $(FFMPEG_ENC) $(FFMPEG_COMMON)             ./data/www/test.mp4
-	ffmpeg $(FFMPEG_SRC) $(FFMPEG_ENC) -f flv $(FFMPEG_COMMON)      ./data/www/test.flv
-
-fuzz: data
+prepare-seeds:
+	$(ORC) $(TARGET_NAME) prepare-seeds --fuzzer $(FUZZER)
 
 CASSOWIRE_CONFIG ?= cassowire.yaml
-CASSOWIRE_LOG_ARGS := --log-level error
+FUZZER           ?= aflpp
 
-ifdef FUZZ_DEBUG
-	CASSOWIRE_LOG_ARGS := --log-level debug --child-output
-endif
+fuzz: fuzz-$(FUZZER)
 
-# ifdef NAMESPACE_PID
-# 	NAMESPACE_ARGS := nsenter -t $(NAMESPACE_PID) -n -U -- 
-# endif
+fuzz-aflpp:
+	$(PODMAN_RUN_TTY) -w $(CTR_W) -e AFL_CASSOWIRE_FORCE_FINAL_LOC=70000 -e AFL_ALLOW_CORES=1 \
+		$(TOOLCHAIN_IMAGE) bash -lc '\
+		mkdir -p ./out ./in && \
+		export PATH="$(AFLPP_BIN_DIR):$$PATH" && \
+		afl-fuzz -b 4 -i ./in -o ./out -x $(CONTAINER_WORKDIR)/targets/_fuzz/dict/http.dict -t 1500 -c 0 -- \
+			$(AFLPP_CASSOWIRE) --log-level error --config $(CASSOWIRE_CONFIG) proxy'
 
-fuzz:
-	mkdir -p ./out ./in
-	cp -f $(FUZZ_SHARED_DIR)/in_http/* ./in/.
-ifdef FUZZ_DEBUG
-	@echo "AFL++ debug mode"
-endif
-	export AFL_CASSOWIRE_FORCE_FINAL_LOC=70000 && \
-		$(AFL_FUZZ_ENV) $(NAMESPACE_ARGS) \
-			afl-fuzz -b 4 -i- -o ./out -x $(FUZZ_SHARED_DIR)/dict/http.dict -t 1500 -c 0 -- \
-			"$$(which afl-cassowire)" $(CASSOWIRE_LOG_ARGS) --config $(CASSOWIRE_CONFIG) proxy
+fuzz-aflnet:
+	$(PODMAN_RUN_TTY) -w $(CTR_W) \
+		$(TOOLCHAIN_IMAGE) bash -lc '\
+		mkdir -p ./out ./in && \
+		export PATH="$(AFLNET_BIN_DIR):$$PATH" && \
+		afl-fuzz -d -i ./in -o ./out -N tcp://127.0.0.1/8080 -P HTTP -D 10000 -q 3 -s 3 -E -K -R -- \
+			./src/install/aflnet/usr/bin/nginx'
 
-.PHONY: build data fuzz
+cov:
+	$(ORC) $(TARGET_NAME) collect-cov
+
+crashes:
+	$(ORC) $(TARGET_NAME) collect-crashes
+
+.PHONY: src build prepare-data prepare-seeds fuzz fuzz-aflpp fuzz-aflnet cov crashes $(ALL_BUILD_SUBTARGETS)

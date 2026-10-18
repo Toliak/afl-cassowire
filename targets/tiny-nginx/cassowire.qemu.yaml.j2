@@ -11,9 +11,9 @@
 #      must be listed explicitly under target.env
 
 target:
-  binary: /opt/workdir/aflpp/src/distrib/bin/afl-qemu-bridge
+  binary: {{ workdir }}/aflpp/src/distrib/bin/afl-qemu-bridge
   args:                                            # full argv; argv[0] goes first
-    - /opt/workdir/aflpp/src/distrib/bin/afl-qemu-bridge
+    - {{ workdir }}/aflpp/src/distrib/bin/afl-qemu-bridge
     - ./src/build/clang/tinynginx                  # guest binary (UNinstrumented)
     - -p
     - "8060"
@@ -27,9 +27,9 @@ target_cmplog:
   # but on port 8081 (both persistent qemu guests run concurrently). The proxy
   # forwards ___AFL_EINS_ZWEI_POLIZEI___ and __AFL_CMPLOG_SHM_ID automatically;
   # AFL_QEMU_CMPLOG_NO_RTN=1 here would disable RTN logging (x86_64-only).
-  binary: /opt/workdir/aflpp/src/distrib/bin/afl-qemu-bridge
+  binary: {{ workdir }}/aflpp/src/distrib/bin/afl-qemu-bridge
   args:                                            # full argv; argv[0] goes first
-    - /opt/workdir/aflpp/src/distrib/bin/afl-qemu-bridge
+    - {{ workdir }}/aflpp/src/distrib/bin/afl-qemu-bridge
     - ./src/build/clang/tinynginx                  # guest binary (UNinstrumented)
     - -p
     - "9060"
