@@ -81,7 +81,7 @@ fuzz-aflpp:
 		mkdir -p ./out ./in && \
 		export PATH="$(AFLPP_BIN_DIR):$$PATH" && \
 		afl-fuzz -b 5 -i ./in -o ./out -t 1500 -c 0 -- \
-			$(AFLPP_CASSOWIRE) --log-level error --config cassowire.yaml proxy'
+			$(AFLPP_CASSOWIRE) --log-level error --config data/cassowire.yaml proxy'
 
 fuzz-qemu:
 	$(PODMAN_RUN_TTY) -w $(CTR_W) -e AFL_CASSOWIRE_FORCE_FINAL_LOC=65536 -e AFL_ALLOW_CORES=1 \
@@ -89,7 +89,7 @@ fuzz-qemu:
 		mkdir -p ./out ./in && \
 		export PATH="$(AFLPP_BIN_DIR):$$PATH" && \
 		afl-fuzz -b 5 -i ./in -o ./out -t 2000 -c 0 -- \
-			$(AFLPP_CASSOWIRE) --log-level error --config cassowire.qemu.yaml proxy'
+			$(AFLPP_CASSOWIRE) --log-level error --config data/cassowire.qemu.yaml proxy'
 
 cov:
 	$(ORC) $(TARGET_NAME) collect-cov

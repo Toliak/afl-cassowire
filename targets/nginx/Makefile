@@ -128,7 +128,7 @@ prepare-data:
 prepare-seeds:
 	$(ORC) $(TARGET_NAME) prepare-seeds --fuzzer $(FUZZER)
 
-CASSOWIRE_CONFIG ?= cassowire.yaml
+CASSOWIRE_CONFIG ?= data/cassowire.yaml
 FUZZER           ?= aflpp
 
 fuzz: fuzz-$(FUZZER)

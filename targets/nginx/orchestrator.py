@@ -28,7 +28,7 @@ SEED_SOURCES = {
 # lives in the Makefile (`fuzz-aflpp`, `fuzz-aflnet`); keep them in sync.
 FUZZ_VARIANTS = {
     "aflpp": {
-        "config": "cassowire.yaml",  # override with CASSOWIRE_CONFIG=<file>
+        "config": "data/cassowire.yaml",  # override with CASSOWIRE_CONFIG=<file>
         "afl_args": ["-b", "4", "-t", "1500", "-c", "0", "-x", "_fuzz/dict/http.dict"],
         "force_final_loc": 70000,  # AFL_CASSOWIRE_FORCE_FINAL_LOC
     },
