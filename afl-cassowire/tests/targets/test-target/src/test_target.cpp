@@ -12,6 +12,7 @@
 #include <vector>
 
 #include <netinet/in.h>
+#include <signal.h>
 #include <sys/socket.h>
 #include <sys/time.h>
 #include <unistd.h>
@@ -22,6 +23,12 @@ constexpr size_t kMaxRequestBytes = 64 * 1024;
 constexpr int kListenBacklog = 16;
 constexpr int kRecvTimeoutMs = 500;
 constexpr long kMaxSlowMs = 60000;
+
+volatile sig_atomic_t g_stop = 0;
+
+void request_stop(int) {
+    g_stop = 1;
+}
 
 struct Options {
     std::string mode;
@@ -41,7 +48,7 @@ struct Options {
 }
 
 void sleep_ms(long ms) {
-    while (ms > 0) {
+    while (ms > 0 && !g_stop) {
         timespec request{};
         request.tv_sec = ms / 1000;
         request.tv_nsec = (ms % 1000) * 1000000L;
@@ -49,7 +56,7 @@ void sleep_ms(long ms) {
         if (nanosleep(&request, &remain) == 0) {
             break;
         }
-        if (errno != EINTR) {
+        if (errno != EINTR || g_stop) {
             break;
         }
         ms = remain.tv_sec * 1000 + remain.tv_nsec / 1000000;
@@ -182,7 +189,7 @@ bool request_complete(const std::string& data, bool stop_at_newline) {
 std::string read_request(int fd, bool stop_at_newline) {
     std::string data;
     char buffer[4096];
-    for (;;) {
+    while (!g_stop) {
         const ssize_t received = recv(fd, buffer, sizeof(buffer), 0);
         if (received > 0) {
             data.append(buffer, static_cast<size_t>(received));
@@ -191,7 +198,7 @@ std::string read_request(int fd, bool stop_at_newline) {
             }
         } else if (received == 0) {
             break;
-        } else if (errno != EINTR) {
+        } else if (errno != EINTR || g_stop) {
             break;
         }
     }
@@ -380,10 +387,19 @@ int main(int argc, char* argv[]) {
     signal(SIGPIPE, SIG_IGN);
     if (opts.ignore_sigterm) {
         signal(SIGTERM, SIG_IGN);
+    } else {
+        struct sigaction action{};
+        action.sa_handler = request_stop;
+        sigemptyset(&action.sa_mask);
+        action.sa_flags = 0;  // no SA_RESTART: interrupt accept/recv
+        sigaction(SIGTERM, &action, nullptr);
     }
 
     if (opts.startup_delay_ms > 0) {
         sleep_ms(opts.startup_delay_ms);
+    }
+    if (g_stop) {
+        return 0;
     }
 
     std::vector<int> listeners;
@@ -397,10 +413,13 @@ int main(int argc, char* argv[]) {
     listeners.push_back(main_fd);
 
     int lingering_fd = -1;
-    for (;;) {
+    while (!g_stop) {
         const int conn = accept(main_fd, nullptr, nullptr);
         if (conn < 0) {
             if (errno == EINTR) {
+                if (g_stop) {
+                    break;
+                }
                 continue;
             }
             fatal(std::string("accept: ") + std::strerror(errno));
@@ -420,4 +439,5 @@ int main(int argc, char* argv[]) {
             close(conn);
         }
     }
+    return 0;
 }

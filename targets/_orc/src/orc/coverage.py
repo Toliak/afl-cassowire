@@ -90,23 +90,37 @@ def collect_cov(name: str, out_rel: str = "cov") -> dict[str, object]:
         "--rc",
         "lcov_branch_coverage=1",
     ]
+    include = cov.get("include", [])
+    if isinstance(include, str):
+        include = [include]
+    if not isinstance(include, (list, tuple)):
+        raise TargetError("COVERAGE['include'] must be a string or a list")
+    for pattern in include:
+        capture.extend(["--include", str(pattern)])
+    ignore_errors = cov.get("ignore_errors", [])
+    if isinstance(ignore_errors, str):
+        ignore_errors = [ignore_errors]
+    if not isinstance(ignore_errors, (list, tuple)):
+        raise TargetError("COVERAGE['ignore_errors'] must be a string or a list")
+    if ignore_errors:
+        capture.extend(["--ignore-errors", ",".join(str(e) for e in ignore_errors)])
     gcov_tool = _gcov_tool(cov, out_dir)
     if gcov_tool:
         capture.extend(["--gcov-tool", gcov_tool])
     _run(capture, target)
-    _run(
-        [
-            "genhtml",
-            str(info),
-            "--output-directory",
-            str(html),
-            "--branch-coverage",
-            "--legend",
-            "--title",
-            f"{name} coverage",
-        ],
-        target,
-    )
+    html_cmd = [
+        "genhtml",
+        str(info),
+        "--output-directory",
+        str(html),
+        "--branch-coverage",
+        "--legend",
+        "--title",
+        f"{name} coverage",
+    ]
+    if ignore_errors:
+        html_cmd.extend(["--ignore-errors", ",".join(str(e) for e in ignore_errors)])
+    _run(html_cmd, target)
 
     return {
         "target": name,
