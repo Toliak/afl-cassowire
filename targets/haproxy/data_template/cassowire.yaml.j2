@@ -1,0 +1,42 @@
+# yaml-language-server: $schema=../../afl-cassowire/schema/config.schema.json
+
+target:
+  binary: "./src/build/afl-clang-fast/haproxy"           # Path to the target binary (required)
+  args: ["haproxy", "-db", "-f", "{{ target_dir }}/data/haproxy.cfg"]
+  env:
+    # HAProxy has ~131k instrumented edges; tell the target's runtime that the
+    # shm map is larger than the 64 KiB default so it does not abort with
+    # FS_ERROR_MAP_SIZE.
+    AFL_MAP_SIZE: "262144"
+
+target_cmplog:
+  binary: "./src/build/afl-clang-fast_cmplog/haproxy"    # Path to the compare-mode target binary (required)
+  args: ["haproxy", "-db", "-f", "{{ target_dir }}/data/haproxy.cmplog.cfg"]
+  env:
+    AFL_MAP_SIZE: "262144"
+
+network: &network
+  host: "127.0.0.1"            # TCP host to connect to
+  port: 8080                   # Port to connect to (1-65535, required)
+  timeout_ms: 100              # Network send/recv timeout in milliseconds
+  initial_ms: 200              # Port detection timeout in milliseconds
+
+  probe: true
+  probe_retry_ms: 10
+  probe_attempts: 3
+
+network_cmplog:
+  <<: *network
+  port: 9080                   # Port to connect to (1-65535, required)
+
+afl:
+  loop_count: 20000            # Number of __AFL_LOOP iterations
+  enable_cmplog: true          # Enable AFL compare log (requires __AFL_CMPLOG_SHM_ID)
+  cov_discard_init: true
+
+port_detection:
+  primary: "seccomp"           # Method: "procfs", "ptrace", or "seccomp"
+  verify_ownership: true
+
+payload:
+  suffix: "\r\n\r\n"

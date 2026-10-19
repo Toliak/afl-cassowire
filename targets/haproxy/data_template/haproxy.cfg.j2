@@ -1,0 +1,115 @@
+# HAProxy config aimed at maximum coverage of the HTTP input path.
+# Entry point: 127.0.0.1:{{ port_main }} (plain HTTP/1.x and h2c).
+# Backends loop back to the same process on {{ port_backend }}, {{ port_tls }}
+# and {{ port_h2 }} so the proxy/TLS/H2 paths are exercised too.
+#
+# Keep the process in the foreground and single-threaded: afl-cassowire treats
+# the direct child as the target and detects readiness through seccomp.
+
+global
+    nbthread 1
+    maxconn 8192
+    tune.bufsize 16384
+    tune.maxrewrite 4096
+
+    ssl-default-bind-ciphers ECDHE-ECDSA-AES128-GCM-SHA256:ECDHE-RSA-AES128-GCM-SHA256:ECDHE-ECDSA-AES256-GCM-SHA384:ECDHE-RSA-AES256-GCM-SHA384
+    ssl-default-bind-ciphersuites TLS_AES_128_GCM_SHA256:TLS_AES_256_GCM_SHA384
+    ssl-default-bind-options no-sslv3 no-tlsv10 no-tlsv11
+
+userlist fuzz_users
+    user admin password admin
+
+defaults
+    mode http
+    option forwardfor except 127.0.0.0/8
+    option dontlognull
+    option http-keep-alive
+    retries 2
+    timeout connect 1s
+    timeout client 5s
+    timeout server 5s
+    timeout queue 5s
+    timeout http-request 5s
+    timeout http-keep-alive 5s
+
+# ====================================================================
+# Fuzzed frontend
+# ====================================================================
+frontend fe_main
+    bind 127.0.0.1:{{ port_main }} name main
+    maxconn 4096
+
+    stick-table type ip size 100k expire 30s store http_req_cnt
+    http-request track-sc0 src
+
+    acl is_post      method POST
+    acl is_put       method PUT
+    acl is_ok        path /ok
+    acl is_html      path_beg /html
+    acl is_deny      path_beg /deny
+    acl is_redir     path_beg /redirect
+    acl is_auth      path_beg /auth
+    acl is_tls       path_beg /tls
+    acl is_h2        path_beg /h2
+    acl is_static    path /index.html
+    acl has_sid      cook(sid) -m found
+    acl host_fuzz    hdr(host) -i fuzz.example.com
+    acl bad_ua       hdr(user-agent) -i -m sub scanner
+
+    http-request set-var(txn.mark) str(default)
+    http-request set-var(txn.mark) str(post) if is_post
+    http-request set-var(txn.mark) str(put) if is_put
+    http-request set-var(txn.mark) str(cookie) if has_sid
+    http-request set-var(txn.mark) str(host) if host_fuzz
+    http-request set-header X-Mark %[var(txn.mark)]
+    http-request set-log-level silent if bad_ua
+    http-request deny deny_status 403 if is_deny
+    http-request auth realm fuzz-users if is_auth
+    http-request redirect location /ok code 302 if is_redir
+
+    http-request return status 200 content-type text/html file {{ target_dir }}/data/www/index.html if is_static
+    http-request return status 200 content-type text/plain lf-string "ok %[var(txn.mark)]\n" if is_ok
+    http-request return status 200 content-type text/html string "<html><body>hello</body></html>\n" if is_html
+    http-request return status 204 if { path /empty }
+    http-request return status 500 content-type text/plain string "boom\n" if { path /error500 }
+
+    http-response set-header X-Resp-Mark %[var(txn.mark)]
+    http-after-response set-header X-After yes
+
+    stats enable
+    stats uri /__stats
+    stats show-legends
+    stats refresh 5s
+
+    use_backend be_tls if is_tls
+    use_backend be_h2 if is_h2
+    default_backend be_http
+
+# ====================================================================
+# Loopback backend: canned HTTP responses from the same process
+# ====================================================================
+frontend fe_http
+    bind 127.0.0.1:{{ port_backend }} name backend_http
+    http-request return status 200 content-type text/plain lf-string "backend %[path]\n"
+
+frontend fe_tls
+    bind 127.0.0.1:{{ port_tls }} name backend_tls ssl crt {{ target_dir }}/data/certs/haproxy.pem alpn h2,http/1.1
+    http-request return status 200 content-type text/plain lf-string "tls %[path]\n"
+
+frontend fe_h2
+    bind 127.0.0.1:{{ port_h2 }} name backend_h2 proto h2
+    http-request return status 200 content-type text/plain lf-string "h2 %[path]\n"
+
+backend be_http
+    balance roundrobin
+    http-reuse safe
+    server s_http 127.0.0.1:{{ port_backend }}
+
+backend be_tls
+    balance roundrobin
+    http-reuse never
+    server s_tls 127.0.0.1:{{ port_tls }} ssl verify none
+
+backend be_h2
+    balance roundrobin
+    server s_h2 127.0.0.1:{{ port_h2 }} proto h2
