@@ -36,6 +36,7 @@ COVERAGE = {
     "gcov_dir": "src/src",  # .gcno/.gcda are emitted next to the objects
     "gcov_tool": "llvm-cov gcov",  # build_gcov uses clang --coverage
     "binary": "src/build/gcov/tinynginx",
+    "env": {"WORKERS": "1"},
     "args": ["-p", "8060"],
     "host": "127.0.0.1",
     "port": 8060,

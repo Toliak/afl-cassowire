@@ -105,7 +105,7 @@ $(ALL_BUILD_SUBTARGETS): build_%:
 			--with-threads \
 		&& \
 		mkdir -p "./install/$*" && \
-		make -j$$(nproc) && \
+		make -j$(NUM_CORES) && \
 		make DESTDIR="./install/$*" install
 
 # ---------------------------------------------------------------------------
