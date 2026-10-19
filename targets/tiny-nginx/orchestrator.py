@@ -10,8 +10,19 @@ BUILD_VARIANTS = [
     "afl-clang-fast_cmplog",
 ]
 
-SEED_SOURCES = {
-    "aflpp": ["_fuzz/in_http"],
+DEFAULT_PROFILE = "http"
+
+# tiny-nginx exposes one plain-HTTP mode. QEMU is selected with the fuzzer
+# commands (`fuzz-qemu`), not with PROFILE.
+PROFILES = {
+    "http": {
+        "seeds": {"aflpp": ["_fuzz/in_http"]},
+        "coverage": {
+            "args": ["-p", "8060"],
+            "payload_suffix": "\r\n\r\n",
+            "corpus": ["in/http", "out/http/*/queue"],
+        },
+    },
 }
 
 # Config variants are selected with CASSOWIRE_CONFIG=data/cassowire.yaml (normal)
@@ -37,11 +48,8 @@ COVERAGE = {
     "gcov_tool": "llvm-cov gcov",  # build_gcov uses clang --coverage
     "binary": "src/build/gcov/tinynginx",
     "env": {"WORKERS": "1"},
-    "args": ["-p", "8060"],
     "host": "127.0.0.1",
     "port": 8060,
     "timeout_ms": 200,
     "startup_ms": 5000,
-    "payload_suffix": "\r\n\r\n",
-    "corpus": ["in", "out/*/queue"],
 }

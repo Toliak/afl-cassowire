@@ -17,11 +17,25 @@ BUILD_VARIANTS = [
     "gcov",
 ]
 
-# Seed sources per fuzzer. Paths are resolved relative to targets/, the target
-# dir, then the repo root (see orc.common.resolve_source_path).
-SEED_SOURCES = {
-    "aflpp": ["_fuzz/in_http"],
-    "aflnet": ["_fuzz/in_http"],
+DEFAULT_PROFILE = "http"
+
+# A profile selects the target mode plus its seed corpus and coverage framing.
+# nginx currently exposes plain HTTP only; the Makefile mirrors this profile
+# for config/dictionary selection.
+PROFILES = {
+    "http": {
+        # Paths are resolved relative to targets/, the target dir, then the
+        # repo root (see orc.common.resolve_source_path).
+        "seeds": {
+            "aflpp": ["_fuzz/in_http"],
+            "aflnet": ["_fuzz/in_http"],
+        },
+        "coverage": {
+            "args": ["-c", "{target_dir}/data/nginx.new.conf"],
+            "payload_suffix": "\r\n\r\n",
+            "corpus": ["in/http", "out/http/*/queue"],
+        },
+    },
 }
 
 # Reference documentation of the fuzz command per fuzzer. The executable form
@@ -66,11 +80,10 @@ COVERAGE = {
     "build_variant": "gcov",
     "gcov_dir": "src/objs",  # nginx keeps objects (and .gcno/.gcda) here
     "binary": "src/install/gcov/usr/bin/nginx",
-    "args": ["-c", "{target_dir}/data/nginx.new.conf"],
     "host": "127.0.10.1",
     "port": 8080,
     "timeout_ms": 200,
     "startup_ms": 5000,
-    "payload_suffix": "\r\n\r\n",
-    "corpus": ["in", "out/*/queue"],
+    # OpenSSL/Python headers leave branch records lcov considers inconsistent.
+    "ignore_errors": ["inconsistent", "corrupt"],
 }

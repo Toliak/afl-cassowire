@@ -8,6 +8,25 @@ TINY_NGINX_URL    := https://github.com/gd-arnold/tiny-nginx
 TINY_NGINX_COMMIT := 0a4900630457ede33abdb836f54a4d2aee6a6c3b
 
 # ---------------------------------------------------------------------------
+# profile selection (keep in sync with PROFILES in orchestrator.py)
+# ---------------------------------------------------------------------------
+
+DEFAULT_PROFILE := http
+PROFILES := http
+
+# Coverage/triage goals without an explicit profile aggregate every profile;
+# seed/fuzz goals default to the target's primary profile.
+ifeq ($(filter cov replay-cov collect-cov crashes,$(MAKECMDGOALS)),)
+PROFILE ?= $(DEFAULT_PROFILE)
+endif
+ifneq ($(filter-out $(PROFILES),$(PROFILE)),)
+$(error invalid PROFILE '$(PROFILE)'; valid: $(PROFILES) or empty for all profiles)
+endif
+
+PROFILE_ARG  = $(if $(PROFILE),--profile $(PROFILE))
+FUZZ_PROFILE = $(or $(PROFILE),$(DEFAULT_PROFILE))
+
+# ---------------------------------------------------------------------------
 # source + patches
 # ---------------------------------------------------------------------------
 
@@ -67,36 +86,39 @@ prepare-data:
 	$(ORC) $(TARGET_NAME) prepare-data
 
 prepare-seeds:
-	$(ORC) $(TARGET_NAME) prepare-seeds --fuzzer $(FUZZER)
+	$(ORC) $(TARGET_NAME) prepare-seeds --fuzzer $(FUZZER) $(PROFILE_ARG) --out $(AFL_IN_DIR)
 
 FUZZER ?= aflpp
 AFL_FUZZ_CPU ?= 0
+AFL_IN_DIR ?= in/$(FUZZ_PROFILE)
+AFL_OUT_DIR ?= out/$(FUZZ_PROFILE)
+COVERAGE_OUT ?= $(if $(PROFILE),cov/$(PROFILE),cov)
 
 fuzz: fuzz-aflpp
 
 fuzz-aflpp:
-	mkdir -p ./out ./in
+	mkdir -p "$(AFL_IN_DIR)" "$(AFL_OUT_DIR)"
 	PATH="$(AFLPP_BIN_DIR):$$PATH" \
 	AFL_CASSOWIRE_FORCE_FINAL_LOC=4096 AFL_ALLOW_CORES=1 \
-		afl-fuzz -b $(AFL_FUZZ_CPU) -i ./in -o ./out -t 1500 -c 0 -- \
+		afl-fuzz -b $(AFL_FUZZ_CPU) -i "$(AFL_IN_DIR)" -o "$(AFL_OUT_DIR)" -t 1500 -c 0 -- \
 			$(AFLPP_CASSOWIRE) --log-level error --config data/cassowire.yaml proxy
 
 fuzz-qemu:
-	mkdir -p ./out ./in
+	mkdir -p "$(AFL_IN_DIR)" "$(AFL_OUT_DIR)"
 	PATH="$(AFLPP_BIN_DIR):$$PATH" \
 	AFL_CASSOWIRE_FORCE_FINAL_LOC=65536 AFL_ALLOW_CORES=1 \
-		afl-fuzz -b $(AFL_FUZZ_CPU) -i ./in -o ./out -t 2000 -c 0 -- \
+		afl-fuzz -b $(AFL_FUZZ_CPU) -i "$(AFL_IN_DIR)" -o "$(AFL_OUT_DIR)" -t 2000 -c 0 -- \
 			$(AFLPP_CASSOWIRE) --log-level error --config data/cassowire.qemu.yaml proxy
 
 cov: replay-cov collect-cov
 
 replay-cov:
-	$(ORC) $(TARGET_NAME) replay-cov
+	$(ORC) $(TARGET_NAME) replay-cov $(PROFILE_ARG)
 
 collect-cov:
-	$(ORC) $(TARGET_NAME) collect-cov
+	$(ORC) $(TARGET_NAME) collect-cov --out $(COVERAGE_OUT)
 
 crashes:
-	$(ORC) $(TARGET_NAME) collect-crashes
+	$(ORC) $(TARGET_NAME) collect-crashes $(PROFILE_ARG)
 
 .PHONY: src prepare build prepare-data prepare-seeds fuzz fuzz-aflpp fuzz-qemu cov replay-cov collect-cov crashes $(ALL_BUILD_SUBTARGETS)
