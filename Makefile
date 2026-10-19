@@ -12,7 +12,7 @@
 #   RUN_IN_CONTAINER=0 make TARGET=nginx build
 #   cd targets/nginx && make build
 #
-# Converted per-target Makefiles (nginx, tiny-nginx, cassowire-test-target) are
+# Converted per-target Makefiles (nginx, tiny-nginx, haproxy, h2o, cassowire-test-target) are
 # plain make: they never invoke podman themselves. Unconverted targets still use
 # their own container recipes and are forwarded unchanged on the host.
 #
@@ -27,7 +27,7 @@ RUN_IN_CONTAINER ?= 1
 PODMAN           ?= podman
 
 # Targets whose Makefiles are container-local (no podman).
-CONTAINER_TARGETS := nginx tiny-nginx cassowire-test-target
+CONTAINER_TARGETS := nginx tiny-nginx haproxy h2o cassowire-test-target
 
 PODMAN_RUN     = $(PODMAN) run --rm --userns=keep-id \
 	-v "$(REPO_ROOT):$(CONTAINER_WORKDIR):Z"
@@ -61,11 +61,13 @@ else
 endif
 
 PASSTHROUGH_VARS := \
+	$(if $(PROFILE),PROFILE=$(PROFILE)) \
 	$(if $(FUZZER),FUZZER=$(FUZZER)) \
 	$(if $(VARIANT),VARIANT=$(VARIANT)) \
 	$(if $(CASSOWIRE_CONFIG),CASSOWIRE_CONFIG=$(CASSOWIRE_CONFIG)) \
 	$(if $(AFL_FUZZ_TIMEOUT),AFL_FUZZ_TIMEOUT=$(AFL_FUZZ_TIMEOUT)) \
 	$(if $(AFL_FUZZ_CPU),AFL_FUZZ_CPU=$(AFL_FUZZ_CPU)) \
+	$(if $(COVERAGE_OUT),COVERAGE_OUT=$(COVERAGE_OUT)) \
 	$(if $(FUZZ_DEBUG),FUZZ_DEBUG=$(FUZZ_DEBUG))
 
 .PHONY: help check-target toolchain aflpp aflnet shell run \
@@ -76,7 +78,7 @@ help:
 		'Goals: toolchain aflpp aflnet shell run' \
 		'       build prepare-data prepare-seeds fuzz fuzz-qemu cov replay-cov collect-cov crashes' \
 		'Required: TARGET=<name> (except toolchain/aflpp/aflnet/shell/run)' \
-		'Optional: FUZZER=aflpp|aflnet  VARIANT=<build-variant>' \
+		'Optional: PROFILE=<mode>  FUZZER=aflpp|aflnet  VARIANT=<build-variant>' \
 		'          AFL_FUZZ_CPU=<n> (afl-fuzz -b, default 0)' \
 		'          RUN_IN_CONTAINER=1|0 (default 1; 0 runs targets directly)' \
 		'' \
@@ -86,6 +88,8 @@ help:
 		'  make TARGET=nginx FUZZER=aflpp prepare-seeds' \
 		'  make TARGET=nginx FUZZER=aflpp fuzz' \
 		'  make TARGET=nginx FUZZER=aflnet fuzz' \
+		'  make TARGET=cassowire-test-target PROFILE=calc FUZZER=aflpp fuzz' \
+		'  make TARGET=cassowire-test-target PROFILE=calc cov' \
 		'  make TARGET=nginx replay-cov' \
 		'  make TARGET=nginx collect-cov' \
 		'  make TARGET=nginx cov' \

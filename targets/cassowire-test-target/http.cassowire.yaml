@@ -14,8 +14,8 @@ network: &network
   timeout_ms: 100
   initial_ms: 400
   probe: true
-  probe_retry_ms: 5
-  probe_attempts: 2
+  probe_retry_ms: 10
+  probe_attempts: 5
 
 network_cmplog: 
   <<: *network
