@@ -2,7 +2,7 @@
 #
 # Built once (`podman build`); every target build/fuzz/assist step then runs via
 # `podman run` against this image (incremental builds live on the host volume,
-# mounted at /work).
+# mounted at /opt/workdir).
 
 ARG BASE_IMAGE="debian:trixie-20260610"
 FROM ${BASE_IMAGE} AS target
@@ -40,9 +40,12 @@ RUN --mount=type=cache,sharing=locked,target=/var/cache/apt \
 # Python deps for the orc helper (also declared in the root uv workspace).
 RUN pip3 install --break-system-packages jinja2 pyyaml
 
-# The repo is mounted at /work; orc package lives under targets/_orc/src.
-ENV PYTHONPATH=/work/targets/_orc/src
-ENV ORC_WORKDIR=/work
+# The repo is mounted at /opt/workdir; orc package lives under targets/_orc/src.
+ENV PYTHONPATH=/opt/workdir/targets/_orc/src
+ENV ORC_WORKDIR=/opt/workdir
 
-WORKDIR /work
-ENTRYPOINT ["bash"]
+WORKDIR /opt/workdir
+
+# Command runner by default: `podman run <image> <cmd>` executes <cmd>;
+# `podman run -it <image>` drops into bash.
+CMD ["bash"]

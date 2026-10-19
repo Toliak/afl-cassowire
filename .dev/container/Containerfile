@@ -138,11 +138,15 @@ RUN --mount=type=cache,sharing=locked,target=/var/cache/apt \
         gdb \
         net-tools \
         ffmpeg \
-        iproute2
+        iproute2 \
+        lcov \
+        libclang-rt-dev
 
 # gcc-14-plugin-dev \
 
-RUN pip3 install --break-system-packages git+https://github.com/Toliak/sloppatch@v1.0.0
+RUN pip3 install --break-system-packages \
+        "git+https://github.com/Toliak/sloppatch@v1.0.0" \
+        "uv==0.13.1"
 
 RUN sed -i -e 's/# en_US.UTF-8 UTF-8/en_US.UTF-8 UTF-8/' /etc/locale.gen && \
     locale-gen

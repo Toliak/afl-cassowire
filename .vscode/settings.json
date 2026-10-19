@@ -2,10 +2,9 @@
     "files.exclude": {
         // Excluded due to the workspace
         "afl-cassowire": true,
-        "test/test-target": true,
+        "aflpp/src": true,
+        "tools/http_throughput": true,
         // Not related to the codebase
         // ".dev/container": true,
-
     },
-    
 }
