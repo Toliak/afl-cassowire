@@ -7,3 +7,4 @@
 /*/seeds
 /*/afl-cassowire-data
 *.core
+!/_*/src

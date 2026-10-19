@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import json
 import shutil
+import socket
+import stat
 from pathlib import Path
 
 import pytest
@@ -115,3 +117,116 @@ def test_collect_crashes(repo: Path) -> None:
     stored = target / "crashes" / "summary.json"
     assert json.loads(stored.read_text())["count"] == 1
     shutil.rmtree(target / "crashes")
+
+
+def test_collect_cov_uses_explicit_gcov_dir(repo: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    from orc import coverage
+
+    target = _make_target(repo, "fake")
+    _write(
+        target / "orchestrator.py",
+        'TARGET_NAME = "fake"\n'
+        'COVERAGE = {"build_variant": "gcov", "gcov_dir": "src/objs",\n'
+        '            "gcov_tool": "llvm-cov gcov"}\n',
+    )
+    _write(target / "src" / "objs" / "a.gcda", "counters")
+    _write(target / "src" / "objs" / "a.gcno", "notes")
+
+    calls: list[list[str]] = []
+
+    def fake_run(cmd: list[str], cwd: Path) -> str:
+        calls.append(cmd)
+        return ""
+
+    monkeypatch.setattr(coverage, "_run", fake_run)
+
+    result = coverage.collect_cov("fake")
+
+    assert result["coverage_info"] == (target / "cov" / "coverage.info").as_posix()
+    assert "--directory" in calls[0]
+    assert str(target / "src" / "objs") in calls[0]
+    assert "--gcov-tool" in calls[0]
+    assert (target / "cov" / ".gcov-tool").is_file()
+    assert calls[1][0] == "genhtml"
+
+
+def test_collect_cov_requires_gcda(repo: Path) -> None:
+    from orc import coverage
+    from orc.common import TargetError
+
+    target = _make_target(repo, "fake")
+    _write(
+        target / "orchestrator.py",
+        'TARGET_NAME = "fake"\n'
+        'COVERAGE = {"build_variant": "gcov", "gcov_dir": "src/objs"}\n',
+    )
+    (target / "src" / "objs").mkdir(parents=True)
+
+    with pytest.raises(TargetError, match="replay-cov"):
+        coverage.collect_cov("fake")
+
+
+def test_replay_cov_feeds_corpus(repo: Path) -> None:
+    from orc.replay import replay_cov
+
+    with socket.socket() as probe:
+        probe.bind(("127.0.0.1", 0))
+        port = probe.getsockname()[1]
+
+    target = _make_target(repo, "fake")
+    server = target / "fake_server.py"
+    server.write_text(
+        "#!/usr/bin/env python3\n"
+        "import socket, sys\n"
+        "port = int(sys.argv[sys.argv.index('--port') + 1])\n"
+        "srv = socket.socket()\n"
+        "srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)\n"
+        "srv.bind(('127.0.0.1', port))\n"
+        "srv.listen()\n"
+        "while True:\n"
+        "    conn, _ = srv.accept()\n"
+        "    conn.settimeout(0.5)\n"
+        "    data = b''\n"
+        "    while True:\n"
+        "        try:\n"
+        "            chunk = conn.recv(4096)\n"
+        "        except OSError:\n"
+        "            break\n"
+        "        if not chunk:\n"
+        "            break\n"
+        "        data += chunk\n"
+        "        if data.endswith(b'\\r\\n\\r\\n'):\n"
+        "            break\n"
+        "    conn.sendall(b'HTTP/1.1 200 OK\\r\\nContent-Length: 0\\r\\n\\r\\n')\n"
+        "    conn.close()\n"
+    )
+    server.chmod(server.stat().st_mode | stat.S_IXUSR)
+    _write(
+        target / "orchestrator.py",
+        'TARGET_NAME = "fake"\n'
+        "COVERAGE = {\n"
+        '    "build_variant": "gcov",\n'
+        '    "gcov_dir": "src/objs",\n'
+        '    "binary": "fake_server.py",\n'
+        f'    "args": ["--port", "{port}"],\n'
+        '    "host": "127.0.0.1",\n'
+        f'    "port": {port},\n'
+        '    "timeout_ms": 200,\n'
+        '    "startup_ms": 5000,\n'
+        '    "payload_suffix": "\\r\\n\\r\\n",\n'
+        '    "corpus": ["in", "out/*/queue"],\n'
+        "}\n",
+    )
+    _write(target / "src" / "objs" / "stale.gcda", "old")
+    _write(target / "in" / "one.txt", "GET /one\\r\\n\\r\\n")
+    _write(target / "in" / "two.txt", "GET /two\\r\\n\\r\\n")
+    _write(target / "out" / "default" / "queue" / "id:000001", "GET /q\\r\\n\\r\\n")
+    _write(target / "out" / "other" / "queue" / "id:000002", "GET /other\\r\\n\\r\\n")
+
+    result = replay_cov("fake")
+
+    assert result["corpus"] == 4
+    assert result["gcda_removed"] == 1
+    assert result["restarts"] == 0
+    assert result["errors"] == []
+    assert (target / "cov" / "replay-target.log").is_file()
