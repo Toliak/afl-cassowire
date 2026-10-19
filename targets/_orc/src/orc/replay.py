@@ -14,7 +14,7 @@ import subprocess
 import time
 from pathlib import Path
 
-from .common import TargetError, load_target_module, target_dir
+from .common import TargetError, load_target_module, resolve_source_path, target_dir
 
 DEFAULT_HOST = "127.0.0.1"
 DEFAULT_STARTUP_MS = 5000
@@ -50,7 +50,7 @@ def _has_glob(spec: str) -> bool:
     return any(ch in spec for ch in "*?[")
 
 
-def _expand_corpus(target: Path, specs: object) -> list[Path]:
+def _expand_corpus(name: str, target: Path, specs: object) -> list[Path]:
     if isinstance(specs, str):
         specs = [specs]
     if not isinstance(specs, (list, tuple)):
@@ -60,7 +60,13 @@ def _expand_corpus(target: Path, specs: object) -> list[Path]:
     seen: set[Path] = set()
     for spec in specs:
         raw = str(spec)
-        matches = sorted(target.glob(raw)) if _has_glob(raw) else [_target_path(target, raw)]
+        if _has_glob(raw):
+            matches = sorted(target.glob(raw))
+        else:
+            match = _target_path(target, raw)
+            if not match.exists():
+                match = resolve_source_path(name, raw)
+            matches = [match]
         for match in matches:
             candidates = (
                 sorted(p for p in match.iterdir() if p.is_file()) if match.is_dir() else [match]
@@ -173,16 +179,50 @@ def _stop(proc: subprocess.Popen[bytes]) -> None:
         proc.wait(timeout=2)
 
 
-def replay_cov(name: str) -> dict[str, object]:
-    """Replay the target corpus into the gcov build's ``.gcda`` counters."""
-    mod = load_target_module(name)
-    cov = getattr(mod, "COVERAGE", None)
-    if not isinstance(cov, dict):
-        raise TargetError(f"{name}: COVERAGE must be a dict")
+def _coverage_profiles(
+    name: str, mod: object, cov: dict[str, object], profile: str | None
+) -> list[tuple[str, dict[str, object]]]:
+    """Merge shared ``COVERAGE`` defaults with each selected profile."""
+    raw = getattr(mod, "PROFILES", None)
+    if raw is None:
+        if profile:
+            raise TargetError(f"{name}: target has no PROFILES; cannot select {profile!r}")
+        return [("default", cov)]
 
-    target = target_dir(name)
-    gcov_dir = _resolve_gcov_dir(target, cov)
-    corpus = _expand_corpus(target, cov.get("corpus", []))
+    if not isinstance(raw, dict) or not raw:
+        raise TargetError(f"{name}: PROFILES must be a non-empty dict")
+    if profile:
+        if profile not in raw:
+            available = ", ".join(sorted(raw))
+            raise TargetError(f"{name}: unknown profile {profile!r} (available: {available})")
+        selected = [profile]
+    else:
+        selected = list(raw)
+
+    profiles: list[tuple[str, dict[str, object]]] = []
+    for profile_name in selected:
+        entry = raw[profile_name]
+        if not isinstance(entry, dict):
+            raise TargetError(f"{name}: PROFILES[{profile_name!r}] must be a dict")
+        override = entry.get("coverage")
+        if not isinstance(override, dict):
+            raise TargetError(
+                f"{name}: PROFILES[{profile_name!r}]['coverage'] must be a dict"
+            )
+        merged = dict(cov)
+        merged.update(override)
+        profiles.append((str(profile_name), merged))
+    return profiles
+
+
+def _replay_profile(
+    name: str,
+    target: Path,
+    profile_name: str,
+    cov: dict[str, object],
+    log: Path,
+) -> dict[str, object]:
+    corpus = _expand_corpus(name, target, cov.get("corpus", []))
     host = str(cov.get("host", DEFAULT_HOST))
     port = int(cov.get("port", 0))
     if not 1 <= port <= 65535:
@@ -191,15 +231,6 @@ def replay_cov(name: str) -> dict[str, object]:
     timeout_ms = int(cov.get("timeout_ms", DEFAULT_TIMEOUT_MS))
     prefix = _as_bytes(cov.get("payload_prefix"), "payload_prefix")
     suffix = _as_bytes(cov.get("payload_suffix"), "payload_suffix")
-
-    removed = 0
-    for stale in gcov_dir.rglob("*.gcda"):
-        stale.unlink()
-        removed += 1
-
-    log = target / "cov" / "replay-target.log"
-    if log.exists():
-        log.unlink()
 
     proc = _spawn(cov, target, log)
     restarts = 0
@@ -221,12 +252,60 @@ def replay_cov(name: str) -> dict[str, object]:
         _stop(proc)
 
     return {
-        "target": name,
-        "gcov_dir": gcov_dir.as_posix(),
+        "profile": profile_name,
         "corpus": len(corpus),
-        "gcda_removed": removed,
         "restarts": restarts,
         "bytes_received": bytes_received,
+        "errors": errors,
+    }
+
+
+def replay_cov(name: str, profile: str | None = None) -> dict[str, object]:
+    """Replay the selected profile corpora into the gcov build's counters.
+
+    Without *profile*, every declared profile is replayed in order. ``.gcda``
+    files are cleared once before the first profile, so counters accumulate
+    across profiles and a single ``collect-cov`` yields a combined report.
+    """
+    mod = load_target_module(name)
+    cov = getattr(mod, "COVERAGE", None)
+    if not isinstance(cov, dict):
+        raise TargetError(f"{name}: COVERAGE must be a dict")
+
+    profiles = _coverage_profiles(name, mod, cov, profile)
+    target = target_dir(name)
+    gcov_dir = _resolve_gcov_dir(target, cov)
+
+    removed = 0
+    for stale in gcov_dir.rglob("*.gcda"):
+        stale.unlink()
+        removed += 1
+
+    log = target / "cov" / "replay-target.log"
+    if log.exists():
+        log.unlink()
+
+    results = [
+        _replay_profile(name, target, profile_name, profile_cov, log)
+        for profile_name, profile_cov in profiles
+    ]
+
+    errors: list[str] = []
+    for result in results:
+        profile_errors = result["errors"]
+        if not isinstance(profile_errors, list):
+            continue
+        for error in profile_errors:
+            errors.append(str(error) if len(results) == 1 else f"{result['profile']}: {error}")
+
+    return {
+        "target": name,
+        "gcov_dir": gcov_dir.as_posix(),
+        "profiles": results,
+        "corpus": sum(int(result["corpus"]) for result in results),
+        "gcda_removed": removed,
+        "restarts": sum(int(result["restarts"]) for result in results),
+        "bytes_received": sum(int(result["bytes_received"]) for result in results),
         "errors": errors,
         "target_log": log.as_posix(),
     }

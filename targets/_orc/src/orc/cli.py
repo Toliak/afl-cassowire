@@ -27,11 +27,30 @@ def _build_parser() -> argparse.ArgumentParser:
     sub.add_parser("prepare-data", help="render data_template/*.j2 -> data/")
     p_seeds = sub.add_parser("prepare-seeds", help="merge seed sources into in/")
     p_seeds.add_argument("--fuzzer", default="aflpp", help="fuzzer key in SEED_SOURCES")
-    p_seeds.add_argument("--out", default="in", help="destination dir relative to target")
+    p_seeds.add_argument(
+        "--profile",
+        default=None,
+        help="profile name for targets that define PROFILES (default: DEFAULT_PROFILE)",
+    )
+    p_seeds.add_argument(
+        "--out",
+        default=None,
+        help="destination dir relative to target (default: in/<profile> or in)",
+    )
     p_cov = sub.add_parser("collect-cov", help="lcov capture + genhtml from existing .gcda")
     p_cov.add_argument("--out", default="cov", help="output dir relative to target")
-    sub.add_parser("replay-cov", help="replay corpus against the gcov build")
-    sub.add_parser("collect-crashes", help="collect AFL crash files into crashes/")
+    p_replay = sub.add_parser("replay-cov", help="replay corpus against the gcov build")
+    p_replay.add_argument(
+        "--profile",
+        default=None,
+        help="profile to replay (default: all profiles; legacy targets: default)",
+    )
+    p_crashes = sub.add_parser("collect-crashes", help="collect AFL crash files into crashes/")
+    p_crashes.add_argument(
+        "--profile",
+        default=None,
+        help="restrict triage to out/<profile> (default: all profiles)",
+    )
 
     return parser
 
@@ -57,7 +76,7 @@ def main(argv: list[str] | None = None) -> int:
         elif args.command == "prepare-seeds":
             from .seeds import prepare_seeds
 
-            result = prepare_seeds(target, args.fuzzer, args.out)
+            result = prepare_seeds(target, args.fuzzer, args.out, args.profile)
             print(f"prepare-seeds[{target}/{args.fuzzer}]: {len(result)} seed(s)")
             for r in result:
                 print(f"  {r}")
@@ -71,13 +90,13 @@ def main(argv: list[str] | None = None) -> int:
         elif args.command == "replay-cov":
             from .replay import replay_cov
 
-            result = replay_cov(target)
+            result = replay_cov(target, args.profile)
             print(json.dumps(result, indent=2))
 
         elif args.command == "collect-crashes":
             from .crashes import collect_crashes
 
-            result = collect_crashes(target)
+            result = collect_crashes(target, args.profile)
             print(json.dumps(result, indent=2))
 
         else:  # pragma: no cover - argparse enforces this

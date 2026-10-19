@@ -16,20 +16,32 @@ BUILD_VARIANTS = [
     "gcov",
 ]
 
-SEED_SOURCES = {
-    "aflpp": ["_fuzz/in_calc", "_fuzz/in_http"],
-}
+DEFAULT_PROFILE = "http"
 
-FUZZ_VARIANTS = {
-    "aflpp": {
-        "config": "http.cassowire.yaml",  # or calc.cassowire.yaml
-        "afl_args": ["-b", "3", "-t", "1500", "-c", "0", "-x", "_fuzz/dict/http.dict"],
-        "force_final_loc": 70000,
+# A profile selects the target mode plus its seed corpus and coverage framing.
+# The Makefile mirrors this mapping for config/dictionary selection.
+PROFILES = {
+    "http": {
+        "seeds": {"aflpp": ["_fuzz/in_http"]},
+        "coverage": {
+            "args": ["http", "--port", "8050", "--startup-delay-ms", "100"],
+            "payload_suffix": "\r\n\r\n",
+            "corpus": ["in/http", "out/http/*/queue"],
+        },
+    },
+    "calc": {
+        "seeds": {"aflpp": ["_fuzz/in_calc"]},
+        "coverage": {
+            "args": ["calc", "--port", "8050"],
+            "payload_suffix": "\n",
+            "corpus": ["in/calc", "out/calc/*/queue"],
+        },
     },
 }
 
 # No data_template/ -> no RENDER.
 
+# Shared coverage defaults; per-profile entries override args/framing/corpus.
 COVERAGE = {
     "build_variant": "gcov",
     "gcov_dir": "src/build/gcov",
@@ -38,11 +50,8 @@ COVERAGE = {
     # clang gcov branch data is inconsistent for libstdc++ headers.
     "include": ["*/test_target.cpp"],
     "ignore_errors": ["inconsistent"],
-    "args": ["http", "--port", "8050", "--startup-delay-ms", "100"],
     "host": "127.0.0.1",
     "port": 8050,
     "timeout_ms": 200,
     "startup_ms": 5000,
-    "payload_suffix": "\r\n\r\n",
-    "corpus": ["in", "out/*/queue"],
 }

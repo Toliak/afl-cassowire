@@ -99,6 +99,38 @@ def test_prepare_seeds(repo: Path) -> None:
     assert (target / "in" / "PUT.txt").read_text() == "PUT /\n"
 
 
+def test_prepare_seeds_uses_selected_profile(repo: Path) -> None:
+    from orc.common import TargetError
+    from orc.seeds import prepare_seeds
+
+    target = _make_target(repo, "fake")
+    _write(
+        target / "orchestrator.py",
+        'TARGET_NAME = "fake"\n'
+        'DEFAULT_PROFILE = "http"\n'
+        "PROFILES = {\n"
+        '    "http": {"seeds": {"aflpp": ["_fuzz/in_http"]}},\n'
+        '    "calc": {"seeds": {"aflpp": ["_fuzz/in_calc"]}},\n'
+        "}\n",
+    )
+    _write(repo / "targets" / "_fuzz" / "in_http" / "GET.txt", "GET /\r\n\r\n")
+    _write(repo / "targets" / "_fuzz" / "in_calc" / "plus.txt", "10 + 50")
+
+    copied = prepare_seeds("fake", "aflpp", profile="calc")
+
+    assert copied == [(target / "in" / "calc" / "plus.txt").as_posix()]
+    assert (target / "in" / "calc" / "plus.txt").read_text() == "10 + 50"
+    assert not (target / "in" / "http").exists()
+    assert not (target / "in" / "GET.txt").exists()
+
+    copied = prepare_seeds("fake", "aflpp")
+
+    assert copied == [(target / "in" / "http" / "GET.txt").as_posix()]
+
+    with pytest.raises(TargetError, match="unknown profile"):
+        prepare_seeds("fake", "aflpp", profile="missing")
+
+
 def test_collect_crashes(repo: Path) -> None:
     from orc.crashes import collect_crashes
 
@@ -230,3 +262,144 @@ def test_replay_cov_feeds_corpus(repo: Path) -> None:
     assert result["restarts"] == 0
     assert result["errors"] == []
     assert (target / "cov" / "replay-target.log").is_file()
+
+
+def test_replay_cov_runs_all_profiles(repo: Path) -> None:
+    from orc.common import TargetError
+    from orc.replay import replay_cov
+
+    with socket.socket() as probe:
+        probe.bind(("127.0.0.1", 0))
+        port = probe.getsockname()[1]
+
+    target = _make_target(repo, "fake")
+    log = target / "payloads.log"
+    server = target / "fake_server.py"
+    server.write_text(
+        "#!/usr/bin/env python3\n"
+        "import socket, sys\n"
+        "port = int(sys.argv[sys.argv.index('--port') + 1])\n"
+        "tag = sys.argv[sys.argv.index('--tag') + 1]\n"
+        "log = sys.argv[sys.argv.index('--log') + 1]\n"
+        "srv = socket.socket()\n"
+        "srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)\n"
+        "srv.bind(('127.0.0.1', port))\n"
+        "srv.listen()\n"
+        "while True:\n"
+        "    conn, _ = srv.accept()\n"
+        "    conn.settimeout(0.5)\n"
+        "    data = b''\n"
+        "    while True:\n"
+        "        try:\n"
+        "            chunk = conn.recv(4096)\n"
+        "        except OSError:\n"
+        "            break\n"
+        "        if not chunk:\n"
+        "            break\n"
+        "        data += chunk\n"
+        "    with open(log, 'ab') as out:\n"
+        "        out.write(tag.encode() + b' ' + data.hex().encode() + b'\\n')\n"
+        "    try:\n"
+        "        conn.sendall(b'OK')\n"
+        "    except OSError:\n"
+        "        pass\n"
+        "    conn.close()\n"
+    )
+    server.chmod(server.stat().st_mode | stat.S_IXUSR)
+
+    def profile(tag: str, suffix: str, corpus: list[str]) -> str:
+        return (
+            "        {\n"
+            '            "coverage": {\n'
+            '                "args": ["--port", "%d", "--tag", "%s", "--log", "%s"],\n'
+            '                "payload_suffix": "%s",\n'
+            '                "corpus": %r,\n'
+            "            },\n"
+            "        }\n"
+        ) % (port, tag, log.as_posix(), suffix, corpus)
+
+    _write(
+        target / "orchestrator.py",
+        'TARGET_NAME = "fake"\n'
+        "COVERAGE = {\n"
+        '    "build_variant": "gcov",\n'
+        '    "gcov_dir": "src/objs",\n'
+        '    "binary": "fake_server.py",\n'
+        '    "host": "127.0.0.1",\n'
+        f'    "port": {port},\n'
+        '    "timeout_ms": 200,\n'
+        '    "startup_ms": 5000,\n'
+        "}\n"
+        "PROFILES = {\n"
+        '    "http": '
+        + profile("http", "\\r\\n\\r\\n", ["in/http", "out/http/*/queue"]).rstrip()
+        + ",\n"
+        '    "calc": '
+        + profile("calc", "\\n", ["in/calc", "out/calc/*/queue"]).rstrip()
+        + ",\n"
+        "}\n",
+    )
+    _write(target / "src" / "objs" / "stale.gcda", "old")
+    _write(target / "in" / "http" / "one.txt", "GET /one HTTP/1.1")
+    _write(target / "out" / "http" / "default" / "queue" / "id:000001", "GET /q HTTP/1.1")
+    _write(target / "in" / "calc" / "plus.txt", "10 + 50")
+    _write(target / "out" / "calc" / "default" / "queue" / "id:000002", "7 * 6")
+
+    result = replay_cov("fake")
+
+    assert result["corpus"] == 4
+    assert result["gcda_removed"] == 1
+    assert result["restarts"] == 0
+    assert result["errors"] == []
+    assert [p["profile"] for p in result["profiles"]] == ["http", "calc"]
+
+    def payloads(tag: str) -> list[bytes]:
+        found = []
+        for line in log.read_text().splitlines():
+            name, _, encoded = line.partition(" ")
+            if name == tag and encoded:
+                found.append(bytes.fromhex(encoded))
+        return found
+
+    http_payloads = payloads("http")
+    calc_payloads = payloads("calc")
+    assert len(http_payloads) == 2
+    assert len(calc_payloads) == 2
+    assert all(p.endswith(b"\r\n\r\n") for p in http_payloads)
+    assert all(p.endswith(b"\n") and not p.endswith(b"\r\n\r\n") for p in calc_payloads)
+
+    log.unlink()
+    result = replay_cov("fake", "calc")
+
+    assert result["corpus"] == 2
+    assert [p["profile"] for p in result["profiles"]] == ["calc"]
+    assert payloads("http") == []
+    assert len(payloads("calc")) == 2
+
+    with pytest.raises(TargetError, match="unknown profile"):
+        replay_cov("fake", "missing")
+
+
+def test_collect_crashes_uses_profile(repo: Path) -> None:
+    from orc.crashes import collect_crashes
+
+    target = _make_target(repo, "fake")
+    _write(
+        target / "orchestrator.py",
+        'TARGET_NAME = "fake"\n'
+        "PROFILES = {\n"
+        '    "http": {},\n'
+        '    "calc": {},\n'
+        "}\n",
+    )
+    crash = "id:000000,sig:11,src:000042,time:12345,execs:999,op:havoc,rep:1"
+    _write(target / "out" / "calc" / "default" / "crashes" / crash, "boom")
+    _write(target / "out" / "http" / "default" / "crashes" / "id:000001,sig:6", "boom")
+
+    report = collect_crashes("fake", "calc")
+
+    assert report["count"] == 1
+    found = report["crashes"][0]
+    assert found["campaign"] == "calc/default"
+    assert Path(found["dest"]).name == f"calc__default__{crash}"
+    assert Path(found["dest"]).is_file()

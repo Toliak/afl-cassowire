@@ -5,9 +5,8 @@ from __future__ import annotations
 import json
 import shutil
 from datetime import datetime, timezone
-from pathlib import Path
 
-from .common import load_target_module, target_dir
+from .common import TargetError, load_target_module, target_dir
 
 
 def _parse_afl_name(name: str) -> dict[str, str]:
@@ -19,28 +18,44 @@ def _parse_afl_name(name: str) -> dict[str, str]:
     return meta
 
 
-def collect_crashes(name: str) -> dict[str, object]:
-    """Scan ``<target>/out/**/crashes/id:*`` and copy into ``<target>/crashes/``.
+def collect_crashes(name: str, profile: str | None = None) -> dict[str, object]:
+    """Scan crash dirs and copy them into ``<target>/crashes/``.
 
-    Each crash is copied as ``<campaign>__<original-name>`` where *campaign* is
-    the AFL output-directory name (e.g. ``default``, ``default-qemu-cmplog``).
-    A ``summary.json`` is written alongside describing every finding.
+    Without *profile*, every ``<target>/out/**/crashes/id:*`` is collected.
+    With one, only ``<target>/out/<profile>/**/crashes/id:*`` is scanned.
+
+    Each crash is copied as ``<campaign-path>__<original-name>`` where the
+    campaign path joins the AFL output directories below ``out/`` (for example
+    ``default`` or ``calc__default``). A ``summary.json`` is written alongside
+    describing every finding.
     """
+    mod = load_target_module(name)
+    profiles = getattr(mod, "PROFILES", None)
+    if profile:
+        if not isinstance(profiles, dict) or not profiles:
+            raise TargetError(f"{name}: target has no PROFILES; cannot select {profile!r}")
+        if profile not in profiles:
+            available = ", ".join(sorted(profiles))
+            raise TargetError(f"{name}: unknown profile {profile!r} (available: {available})")
+
     target = target_dir(name)
     out_root = target / "out"
+    scan_root = out_root / profile if profile else out_root
     dst_root = target / "crashes"
     dst_root.mkdir(parents=True, exist_ok=True)
 
     findings: list[dict[str, str]] = []
-    if out_root.is_dir():
-        for crash in sorted(out_root.rglob("id:*")):
-            parts = crash.parts
-            crash_idx = next((i for i, p in enumerate(parts) if p.startswith("crashes")), None)
-            if crash_idx is None or crash_idx == 0:
+    if scan_root.is_dir():
+        for crash in sorted(scan_root.rglob("id:*")):
+            rel_parts = crash.relative_to(out_root).parent.parts
+            if not rel_parts or rel_parts[-1] != "crashes":
                 continue
-            campaign = parts[crash_idx - 1]
+            campaign_parts = rel_parts[:-1]
+            if not campaign_parts:
+                continue
+            campaign = "/".join(campaign_parts)
             meta = _parse_afl_name(crash.name)
-            dst_name = f"{campaign}__{crash.name}"
+            dst_name = "__".join(campaign_parts) + f"__{crash.name}"
             dst = dst_root / dst_name
             shutil.copy2(crash, dst)
             findings.append(
