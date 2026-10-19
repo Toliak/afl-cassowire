@@ -1,0 +1,38 @@
+# Default afl-cassowire configuration for h2o.
+#
+# Normal and cmplog targets are started concurrently by the proxy, so they use
+# different front/backend port pairs (8070/8071 and 9070/9071).
+
+target:
+  binary: "./src/build/afl-clang-fast/h2o"          # Path to the target binary (required)
+  args: ["h2o", "-c", "{{ target_dir }}/data/h2o.conf"]  # Additional arguments (binary is added automatically)
+
+target_cmplog:
+  binary: "./src/build/afl-clang-fast_cmplog/h2o"   # Path to the compare-mode target binary (required)
+  args: ["h2o", "-c", "{{ target_dir }}/data/h2o.cmplog.conf"]
+
+network: &network
+  host: "127.0.0.1"            # TCP host to connect to
+  port: 8070                   # Port to connect to (1-65535, required)
+  timeout_ms: 100              # Network send/recv timeout in milliseconds
+  initial_ms: 1000             # Port detection timeout in milliseconds
+
+  probe: true
+  probe_retry_ms: 10
+  probe_attempts: 3
+
+network_cmplog:
+  <<: *network
+  port: 9070                   # Port to connect to (1-65535, required)
+
+afl:
+  loop_count: 10000            # Number of __AFL_LOOP iterations
+  enable_cmplog: true          # Enable AFL compare log (requires __AFL_CMPLOG_SHM_ID)
+  cov_discard_init: true
+
+port_detection:
+  primary: "seccomp"           # h2o binds from its single event-loop thread
+  verify_ownership: true
+
+payload:
+  suffix: "\r\n\r\n"

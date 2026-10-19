@@ -1,0 +1,31 @@
+# Generated from data_template/h2o.conf.j2 by `orc h2o prepare-data`.
+# Entry point: 127.0.0.1:{{ port_main }} (HTTP/1.x and h2c).
+# The backend listener on {{ port_backend }} is self-looped to exercise the
+# proxy handler inside the same process. Fixtures live in {{ target_dir }}/data.
+
+num-threads: 1
+max-connections: 1024
+http1-request-timeout: 10
+http2-idle-timeout: 10
+
+listen:
+  - host: 127.0.0.1
+    port: {{ port_main }}
+  - host: 127.0.0.1
+    port: {{ port_backend }}
+
+hosts:
+  default:
+    paths:
+      /:
+        file.dir: {{ target_dir }}/data/www
+      /redirect:
+        redirect: /index.html
+      /status:
+        status: ON
+      /proxy:
+        proxy.reverse.url: http://127.0.0.1:{{ port_backend }}
+  "127.0.0.1:{{ port_backend }}":
+    paths:
+      /:
+        file.dir: {{ target_dir }}/data/www

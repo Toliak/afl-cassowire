@@ -1,0 +1,58 @@
+# afl-cassowire QEMU (binary-only) config for h2o.
+# The "target" is afl-qemu-bridge; the GUEST is the uninstrumented clang build
+# (src/build/clang/h2o). Guest coverage flows into the same __AFL_SHM_ID map
+# afl-fuzz gave the proxy.
+#
+# Invariants (violating these silently corrupts coverage):
+#   1. AFL_QEMU_MAP_SIZE <= AFL_CASSOWIRE_FORCE_FINAL_LOC (set by `make fuzz-qemu`)
+#   2. port_detection.primary MUST be "seccomp" (or procfs) with the qemu process
+#   3. env_preserve: afl_only drops AFL_QEMU_MAP_SIZE from the parent env, so it
+#      must be listed explicitly under target.env
+
+target:
+  binary: {{ workdir }}/aflpp/src/distrib/bin/afl-qemu-bridge
+  args:                                            # full argv; argv[0] goes first
+    - {{ workdir }}/aflpp/src/distrib/bin/afl-qemu-bridge
+    - ./src/build/clang/h2o                        # guest binary (UNinstrumented)
+    - -c
+    - {{ target_dir }}/data/h2o.conf
+  env_preserve: afl_only
+  env:
+    AFL_QEMU_MAP_SIZE: "65536"                     # <= AFL_CASSOWIRE_FORCE_FINAL_LOC
+
+target_cmplog:
+  binary: {{ workdir }}/aflpp/src/distrib/bin/afl-qemu-bridge
+  args:                                            # full argv; argv[0] goes first
+    - {{ workdir }}/aflpp/src/distrib/bin/afl-qemu-bridge
+    - ./src/build/clang/h2o                        # guest binary (UNinstrumented)
+    - -c
+    - {{ target_dir }}/data/h2o.cmplog.conf
+  env_preserve: afl_only
+  env:
+    AFL_QEMU_MAP_SIZE: "65536"                     # <= AFL_CASSOWIRE_FORCE_FINAL_LOC
+
+network: &network
+  host: "127.0.0.1"
+  port: 8070
+  timeout_ms: 200
+  initial_ms: 3000                                 # qemu + guest startup is slower
+
+  probe: true
+  probe_retry_ms: 10
+  probe_attempts: 5
+
+network_cmplog:
+  <<: *network
+  port: 9070
+
+afl:
+  loop_count: 10000
+  enable_cmplog: true
+  cov_discard_init: true
+
+port_detection:
+  primary: "seccomp"
+  verify_ownership: true
+
+payload:
+  suffix: "\r\n\r\n"

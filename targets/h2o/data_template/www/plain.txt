@@ -1,0 +1,1 @@
+plain text fixture for the h2o static-file handler
