@@ -1,9 +1,8 @@
-include ../_mk/container.mk
+include ../_mk/env.mk
 include ../_mk/git.mk
 include ../_mk/fuzzers/aflpp.mk
 
 TARGET_NAME := tiny-nginx
-CTR_W       := $(CONTAINER_WORKDIR)/targets/$(TARGET_NAME)
 
 TINY_NGINX_URL    := https://github.com/gd-arnold/tiny-nginx
 TINY_NGINX_COMMIT := 0a4900630457ede33abdb836f54a4d2aee6a6c3b
@@ -26,7 +25,7 @@ prepare: src
 		done
 
 # ---------------------------------------------------------------------------
-# build variants (run inside the toolchain container)
+# build variants (run inside the toolchain/dev container)
 # ---------------------------------------------------------------------------
 
 ALL_BUILD_SUBTARGETS := build_clang \
@@ -42,7 +41,7 @@ build_afl-clang-lto:         CC := afl-clang-lto
 build_afl-clang-lto_cmplog:  CC := afl-clang-lto
 build_afl-clang-fast:        CC := afl-clang-fast
 build_afl-clang-fast_cmplog: CC := afl-clang-fast
-build_gcov:                  CC := gcc --coverage
+build_gcov:                  CC := clang --coverage
 
 build_afl-clang-lto:         FZ_BIN_DIR := $(AFLPP_BIN_DIR)
 build_afl-clang-lto_cmplog:  FZ_BIN_DIR := $(AFLPP_BIN_DIR)
@@ -55,11 +54,10 @@ build_afl-clang-fast_cmplog: AFL_LLVM_CMPLOG := 1
 build: $(ALL_BUILD_SUBTARGETS)
 
 $(ALL_BUILD_SUBTARGETS): build_%:
-	$(PODMAN_RUN) -w $(CTR_W) $(TOOLCHAIN_IMAGE) bash -lc '\
-		export PATH="$(if $(FZ_BIN_DIR),$(FZ_BIN_DIR):,)$$PATH" && \
-		export AFL_LLVM_CMPLOG="$(AFL_LLVM_CMPLOG)" && \
-		make -C src clean && \
-		make -C src CC="$(CC)" BUILD_DIR="build/$*"'
+	export PATH="$(if $(FZ_BIN_DIR),$(FZ_BIN_DIR):,)$$PATH"; \
+	export AFL_LLVM_CMPLOG="$(AFL_LLVM_CMPLOG)"; \
+	make -C src clean && \
+	make -C src CC="$(CC)" BUILD_DIR="build/$*"
 
 # ---------------------------------------------------------------------------
 # data / seeds / fuzz / coverage / crashes
@@ -72,29 +70,33 @@ prepare-seeds:
 	$(ORC) $(TARGET_NAME) prepare-seeds --fuzzer $(FUZZER)
 
 FUZZER ?= aflpp
+AFL_FUZZ_CPU ?= 0
 
 fuzz: fuzz-aflpp
 
 fuzz-aflpp:
-	$(PODMAN_RUN_TTY) -w $(CTR_W) -e AFL_CASSOWIRE_FORCE_FINAL_LOC=4096 -e AFL_ALLOW_CORES=1 \
-		$(TOOLCHAIN_IMAGE) bash -lc '\
-		mkdir -p ./out ./in && \
-		export PATH="$(AFLPP_BIN_DIR):$$PATH" && \
-		afl-fuzz -b 5 -i ./in -o ./out -t 1500 -c 0 -- \
-			$(AFLPP_CASSOWIRE) --log-level error --config data/cassowire.yaml proxy'
+	mkdir -p ./out ./in
+	PATH="$(AFLPP_BIN_DIR):$$PATH" \
+	AFL_CASSOWIRE_FORCE_FINAL_LOC=4096 AFL_ALLOW_CORES=1 \
+		afl-fuzz -b $(AFL_FUZZ_CPU) -i ./in -o ./out -t 1500 -c 0 -- \
+			$(AFLPP_CASSOWIRE) --log-level error --config data/cassowire.yaml proxy
 
 fuzz-qemu:
-	$(PODMAN_RUN_TTY) -w $(CTR_W) -e AFL_CASSOWIRE_FORCE_FINAL_LOC=65536 -e AFL_ALLOW_CORES=1 \
-		$(TOOLCHAIN_IMAGE) bash -lc '\
-		mkdir -p ./out ./in && \
-		export PATH="$(AFLPP_BIN_DIR):$$PATH" && \
-		afl-fuzz -b 5 -i ./in -o ./out -t 2000 -c 0 -- \
-			$(AFLPP_CASSOWIRE) --log-level error --config data/cassowire.qemu.yaml proxy'
+	mkdir -p ./out ./in
+	PATH="$(AFLPP_BIN_DIR):$$PATH" \
+	AFL_CASSOWIRE_FORCE_FINAL_LOC=65536 AFL_ALLOW_CORES=1 \
+		afl-fuzz -b $(AFL_FUZZ_CPU) -i ./in -o ./out -t 2000 -c 0 -- \
+			$(AFLPP_CASSOWIRE) --log-level error --config data/cassowire.qemu.yaml proxy
 
-cov:
+cov: replay-cov collect-cov
+
+replay-cov:
+	$(ORC) $(TARGET_NAME) replay-cov
+
+collect-cov:
 	$(ORC) $(TARGET_NAME) collect-cov
 
 crashes:
 	$(ORC) $(TARGET_NAME) collect-crashes
 
-.PHONY: src prepare build prepare-data prepare-seeds fuzz fuzz-aflpp fuzz-qemu cov crashes $(ALL_BUILD_SUBTARGETS)
+.PHONY: src prepare build prepare-data prepare-seeds fuzz fuzz-aflpp fuzz-qemu cov replay-cov collect-cov crashes $(ALL_BUILD_SUBTARGETS)

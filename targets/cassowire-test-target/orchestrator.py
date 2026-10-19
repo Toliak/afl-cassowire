@@ -9,7 +9,7 @@ from typing import List
 
 TARGET_NAME = "cassowire-test-target"
 
-BUILD_VARIANTS: List[] = []  # copy target; see Makefile `build`
+BUILD_VARIANTS: List[str] = []  # copy target; see Makefile `build`
 
 SEED_SOURCES = {
     "aflpp": ["_fuzz/in_calc", "_fuzz/in_http"],
@@ -27,6 +27,14 @@ FUZZ_VARIANTS = {
 
 COVERAGE = {
     "build_variant": "gcov",
+    "gcov_dir": "src/build/gcov",  # must contain a coverage-instrumented build
+    "gcov_tool": "llvm-cov gcov",  # test-target is C++/clang
     "binary": "src/build/gcov/test-target",
-    "corpus": ["data/seeds", "out/default/queue"],
+    "args": ["http", "--port", "8050", "--startup-delay-ms", "100"],
+    "host": "127.0.0.1",
+    "port": 8050,
+    "timeout_ms": 200,
+    "startup_ms": 5000,
+    "payload_suffix": "\r\n\r\n",
+    "corpus": ["in", "out/*/queue"],
 }

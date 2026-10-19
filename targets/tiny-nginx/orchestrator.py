@@ -33,6 +33,14 @@ FUZZ_VARIANTS = {
 
 COVERAGE = {
     "build_variant": "gcov",
+    "gcov_dir": "src/src",  # .gcno/.gcda are emitted next to the objects
+    "gcov_tool": "llvm-cov gcov",  # build_gcov uses clang --coverage
     "binary": "src/build/gcov/tinynginx",
-    "corpus": ["data/seeds", "out/default/queue"],
+    "args": ["-p", "8060"],
+    "host": "127.0.0.1",
+    "port": 8060,
+    "timeout_ms": 200,
+    "startup_ms": 5000,
+    "payload_suffix": "\r\n\r\n",
+    "corpus": ["in", "out/*/queue"],
 }

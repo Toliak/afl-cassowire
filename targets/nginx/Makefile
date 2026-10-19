@@ -1,10 +1,9 @@
-include ../_mk/container.mk
+include ../_mk/env.mk
 include ../_mk/git.mk
 include ../_mk/fuzzers/aflpp.mk
 include ../_mk/fuzzers/aflnet.mk
 
 TARGET_NAME := nginx
-CTR_W       := $(CONTAINER_WORKDIR)/targets/$(TARGET_NAME)
 
 NGINX_URL    := https://github.com/nginx/nginx
 NGINX_BRANCH := release-1.31.4
@@ -17,7 +16,7 @@ src:
 	$(GIT_CLONE_CMD) $(NGINX_URL) --branch "$(NGINX_BRANCH)" $@
 
 # ---------------------------------------------------------------------------
-# build variants (run inside the toolchain container)
+# build variants (run inside the toolchain/dev container)
 # ---------------------------------------------------------------------------
 
 ALL_BUILD_SUBTARGETS := build_clang \
@@ -53,11 +52,10 @@ build_gcov: LD_ADD_FLAGS := -fprofile-arcs -ftest-coverage
 build: $(ALL_BUILD_SUBTARGETS)
 
 $(ALL_BUILD_SUBTARGETS): build_%:
-	$(PODMAN_RUN) -w $(CTR_W) $(TOOLCHAIN_IMAGE) bash -lc '\
-		export PATH="$(if $(FZ_BIN_DIR),$(FZ_BIN_DIR):,)$$PATH" && \
-		export AFL_LLVM_CMPLOG="$(AFL_LLVM_CMPLOG)" && \
+	export PATH="$(if $(FZ_BIN_DIR),$(FZ_BIN_DIR):,)$$PATH"; \
+		export AFL_LLVM_CMPLOG="$(AFL_LLVM_CMPLOG)"; \
 		cd ./src && \
-		make clean || true && \
+		{ make clean || true; } && \
 		./auto/configure \
 			--prefix=/etc/nginx \
 			--conf-path=/etc/nginx/nginx.conf \
@@ -108,7 +106,7 @@ $(ALL_BUILD_SUBTARGETS): build_%:
 		&& \
 		mkdir -p "./install/$*" && \
 		make -j$$(nproc) && \
-		make DESTDIR="./install/$*" install'
+		make DESTDIR="./install/$*" install
 
 # ---------------------------------------------------------------------------
 # data / seeds / fuzz / coverage / crashes (delegated to the orc helper)
@@ -117,42 +115,45 @@ $(ALL_BUILD_SUBTARGETS): build_%:
 prepare-data:
 	$(ORC) $(TARGET_NAME) prepare-data
 	mkdir -p ./data/dav
-	$(PODMAN_RUN) -w $(CTR_W) $(TOOLCHAIN_IMAGE) bash -lc '\
-		ffmpeg -nostdin -loglevel error -y \
-			-f lavfi -i smptebars=duration=2:size=320x240:rate=15 \
-			-pix_fmt yuv420p -c:v libx264 ./data/www/test.mp4 && \
-		ffmpeg -nostdin -loglevel error -y \
-			-f lavfi -i smptebars=duration=2:size=320x240:rate=15 \
-			-pix_fmt yuv420p -c:v libx264 -f flv ./data/www/test.flv'
+	ffmpeg -nostdin -loglevel error -y \
+		-f lavfi -i smptebars=duration=2:size=320x240:rate=15 \
+		-pix_fmt yuv420p -c:v libx264 ./data/www/test.mp4
+	ffmpeg -nostdin -loglevel error -y \
+		-f lavfi -i smptebars=duration=2:size=320x240:rate=15 \
+		-pix_fmt yuv420p -c:v libx264 -f flv ./data/www/test.flv
 
 prepare-seeds:
 	$(ORC) $(TARGET_NAME) prepare-seeds --fuzzer $(FUZZER)
 
 CASSOWIRE_CONFIG ?= data/cassowire.yaml
 FUZZER           ?= aflpp
+AFL_FUZZ_CPU     ?= 0
 
 fuzz: fuzz-$(FUZZER)
 
 fuzz-aflpp:
-	$(PODMAN_RUN_TTY) -w $(CTR_W) -e AFL_CASSOWIRE_FORCE_FINAL_LOC=70000 -e AFL_ALLOW_CORES=1 \
-		$(TOOLCHAIN_IMAGE) bash -lc '\
-		mkdir -p ./out ./in && \
-		export PATH="$(AFLPP_BIN_DIR):$$PATH" && \
-		afl-fuzz -b 4 -i ./in -o ./out -x $(CONTAINER_WORKDIR)/targets/_fuzz/dict/http.dict -t 1500 -c 0 -- \
-			$(AFLPP_CASSOWIRE) --log-level error --config $(CASSOWIRE_CONFIG) proxy'
+	mkdir -p ./out ./in
+	PATH="$(AFLPP_BIN_DIR):$$PATH" \
+	AFL_CASSOWIRE_FORCE_FINAL_LOC=70000 AFL_ALLOW_CORES=1 \
+		afl-fuzz -b $(AFL_FUZZ_CPU) -i ./in -o ./out \
+			-x $(REPO_ROOT)/targets/_fuzz/dict/http.dict -t 1500 -c 0 -- \
+			$(AFLPP_CASSOWIRE) --log-level error --config $(CASSOWIRE_CONFIG) proxy
 
 fuzz-aflnet:
-	$(PODMAN_RUN_TTY) -w $(CTR_W) \
-		$(TOOLCHAIN_IMAGE) bash -lc '\
-		mkdir -p ./out ./in && \
-		export PATH="$(AFLNET_BIN_DIR):$$PATH" && \
+	mkdir -p ./out ./in
+	PATH="$(AFLNET_BIN_DIR):$$PATH" \
 		afl-fuzz -d -i ./in -o ./out -N tcp://127.0.0.1/8080 -P HTTP -D 10000 -q 3 -s 3 -E -K -R -- \
-			./src/install/aflnet/usr/bin/nginx'
+			./src/install/aflnet/usr/bin/nginx
 
-cov:
+cov: replay-cov collect-cov
+
+replay-cov:
+	$(ORC) $(TARGET_NAME) replay-cov
+
+collect-cov:
 	$(ORC) $(TARGET_NAME) collect-cov
 
 crashes:
 	$(ORC) $(TARGET_NAME) collect-crashes
 
-.PHONY: src build prepare-data prepare-seeds fuzz fuzz-aflpp fuzz-aflnet cov crashes $(ALL_BUILD_SUBTARGETS)
+.PHONY: src build prepare-data prepare-seeds fuzz fuzz-aflpp fuzz-aflnet cov replay-cov collect-cov crashes $(ALL_BUILD_SUBTARGETS)

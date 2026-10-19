@@ -64,6 +64,13 @@ RENDER = {
 # lcov coverage on the gcov build variant.
 COVERAGE = {
     "build_variant": "gcov",
+    "gcov_dir": "src/objs",  # nginx keeps objects (and .gcno/.gcda) here
     "binary": "src/install/gcov/usr/bin/nginx",
-    "corpus": ["data/seeds", "out/default/queue"],
+    "args": ["-c", "{target_dir}/data/nginx.new.conf"],
+    "host": "127.0.10.1",
+    "port": 8080,
+    "timeout_ms": 200,
+    "startup_ms": 5000,
+    "payload_suffix": "\r\n\r\n",
+    "corpus": ["in", "out/*/queue"],
 }

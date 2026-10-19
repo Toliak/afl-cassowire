@@ -1,6 +1,7 @@
-# Shared podman wrapper for running targets' build/fuzz/assist steps in the
-# toolchain container. Include this from a per-target Makefile to get PODMAN_RUN,
-# PODMAN_RUN_TTY and ORC.
+# Legacy podman wrapper for not-yet-converted targets (e.g. fasthttp-with-bug).
+# Include this from a per-target Makefile to get PODMAN_RUN, PODMAN_RUN_TTY and
+# ORC. Converted targets use ../_mk/env.mk instead; the root Makefile is the
+# container boundary for them.
 #
 # Rootless podman provides user-mode networking by default, so each `podman run`
 # fuzz step is network-isolated (no explicit --network needed).
@@ -10,7 +11,7 @@ _ORC_ROOT      := $(realpath $(__MAKEFILE_DIR)/..)
 _REPO_ROOT     := $(realpath $(_ORC_ROOT)/..)
 
 TOOLCHAIN_IMAGE   ?= localhost/afl-cassowire-toolchain:latest
-CONTAINER_WORKDIR ?= /work
+CONTAINER_WORKDIR ?= /opt/workdir
 
 # Base non-interactive run.
 PODMAN_RUN = podman run --rm --userns=keep-id \
