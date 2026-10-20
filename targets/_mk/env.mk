@@ -14,11 +14,12 @@ REPO_ROOT    := $(realpath $(__ENV_MK_DIR)/../..)
 TARGETS_DIR  := $(REPO_ROOT)/targets
 TARGET_DIR    = $(TARGETS_DIR)/$(TARGET_NAME)
 
-NUM_CORES    := $(shell nproc 2>/dev/null || sysctl -n hw.ncpu 2>/dev/null || echo 1)
-
 # The orc helper renders container-absolute paths into generated configs.
 ORC_WORKDIR ?= $(REPO_ROOT)
 ORC_PYTHON  ?= $(if $(wildcard $(REPO_ROOT)/.venv/bin/python),$(REPO_ROOT)/.venv/bin/python,python3)
 
 ORC = ORC_WORKDIR=$(ORC_WORKDIR) PYTHONPATH=$(REPO_ROOT)/targets/_orc/src \
 	$(ORC_PYTHON) -m orc
+
+
+include ../../mk/env.mk
