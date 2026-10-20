@@ -21,9 +21,15 @@ RUN --mount=type=cache,sharing=locked,target=/var/cache/apt \
         # build system
         make cmake meson ninja-build git patch autoconf automake libtool pkg-config \
         # compilers / LLVM
-        clang lld llvm-dev gcc g++ build-essential flex bison \
+        lld gcc g++ build-essential flex bison \
+        # LLVM 
+        clang-22 clang-tools-22 libclang-rt-22-dev llvm-22-dev \
+        clang-19 clang-tools-19 libclang-rt-19-dev llvm-19-dev \
+        clang-17 clang-tools-17 libclang-rt-17-dev llvm-17-dev \
         # AFL++ / QEMU deps
         libglib2.0-dev libpixman-1-dev qemu-user qemu-user-static \
+        # honggfuzz deps
+        binutils-dev libunwind-dev libblocksruntime-dev \
         # AFLNet deps
         libpcap-dev libcap-dev graphviz-dev \
         # NGINX / HAProxy deps
@@ -32,13 +38,20 @@ RUN --mount=type=cache,sharing=locked,target=/var/cache/apt \
         # coverage + python
         lcov python3 python3-pip python3-venv python3-dev \
         # languages
-        golang \
+        golang rustc cargo \
         # utils
         curl ca-certificates bash jq procps psmisc xxd netcat-openbsd \
         iproute2 net-tools tree wget ffmpeg tcpdump
 
 # Python deps for the orc helper (also declared in the root uv workspace).
 RUN pip3 install --break-system-packages jinja2 pyyaml
+
+# LLVM 15 is the last release with the old pass manager; AFLNet's llvm_mode and
+# Nyx's packer need clang-15/llvm-config-15, which Debian trixie no longer ships.
+# The deb is built on the host by `make -C container/clang deb`.
+RUN --mount=type=cache,sharing=locked,target=/var/cache/apt \
+    --mount=type=bind,source=clang/pkg/llvm-15_15.0.7-1_amd64.deb,target=/tmp/llvm-15.deb \
+    apt-get install -y --no-install-recommends /tmp/llvm-15.deb
 
 # The repo is mounted at /opt/workdir; orc package lives under targets/_orc/src.
 ENV PYTHONPATH=/opt/workdir/targets/_orc/src
