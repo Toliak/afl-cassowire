@@ -1,25 +1,24 @@
-AFLPP_URL := https://github.com/aflplusplus/aflplusplus
-AFLPP_TAG := v5.02c
+include ../mk/env.mk
+include ../mk/git.mk
 
-AFLPP_MAKE_ARGS := -j$(nproc)
-AFLPP_MAKE_ARGS_ADD :=
+GIT_URL := https://github.com/aflplusplus/aflplusplus
+GIT_TAG := v5.03c
 
-GIT_ARGS := --progress --depth 1
+MAKE_ARGS := -j$(NUM_CORES)
+MAKE_ARGS_ADD :=
 
 help:
 	@echo "prepare -- git clone the AFL++ repo"
 
 src/.cloned:
-	git clone $(AFLPP_URL) $(GIT_ARGS) --branch=$(AFLPP_TAG) ./src
-	touch $@
+	$(call GIT_SRC_TAG_TARGET_CMD,$(GIT_URL),$(GIT_TAG))
 
-src: src/.cloned
+src/.submodules: src/.cloned
+	$(call GIT_SUBMODULES_TARGET_CMD,qemu_mode/qemuafl qemu_bridge/qemu-libafl-bridge)
 
-prepare: src/.cloned
+src: src/.submodules
 
-PATCH_TARGETS := src/.patched
-
-src/.patched: src/.cloned
+src/.patched: src/.submodules
 	cd "./src" && \
 		for F in "../patch"/*.patch; do \
 			patch -p1 -i "$$F" || exit 1; \
@@ -28,15 +27,9 @@ src/.patched: src/.cloned
 
 patch: src/.patched
 
-src/.submodules: src/.cloned
-	git -C ./src submodule update --init $(GIT_ARGS) qemu_mode/qemuafl qemu_bridge/qemu-libafl-bridge
-	touch $@
-
-submodules: src/.submodules
-
-build: $(PATCH_TARGETS) src/.submodules
+build: src/.patched
 	cd "./src" && \
-		make $(AFLPP_MAKE_ARGS) $(AFLPP_MAKE_ARGS_ADD) \
+		make $(MAKE_ARGS) $(MAKE_ARGS_ADD) \
 			distrib \
 			PERFORMANCE=1 \
 			NO_PYTHON=0 \
@@ -47,7 +40,7 @@ build: $(PATCH_TARGETS) src/.submodules
 
 install:
 	cd "./src" && \
-		make $(AFLPP_MAKE_ARGS) $(AFLPP_MAKE_ARGS_ADD) \
+		make $(MAKE_ARGS) $(MAKE_ARGS_ADD) \
 			PREFIX=distrib install
 
-.PHONY: help prepare patch submodules build install
+.PHONY: help src patch build install

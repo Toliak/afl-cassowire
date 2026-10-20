@@ -1,0 +1,66 @@
+--- a/qemu_bridge/qemu-libafl-bridge/linux-user/signal.c
++++ b/qemu_bridge/qemu-libafl-bridge/linux-user/signal.c
+@@ -54,6 +54,21 @@ static struct target_sigaction sigact_table[TARGET_NSIG];
+ //// --- Begin LibAFL code ---
+ /* static */
+ //// --- End LibAFL code ---
++
++//// --- Begin AFL++ crash propagation ---
++/*
++ * When AFL_QEMU_PROPAGATE_CRASH is set, a fatal signal taken by any guest
++ * process is propagated to the top-level afl-qemu-bridge so that a crash in a
++ * forked worker (a separate QEMU host process) is not silently confined to
++ * that one process. afl_crash_root_pid is recorded once in signal_init() and
++ * inherited by guest forks; a crashing child signals it with the same signal.
++ */
++#ifdef CONFIG_AFL
++static pid_t afl_crash_root_pid;
++static int afl_crash_propagate;
++#endif
++//// --- End AFL++ crash propagation ---
++
+ void host_signal_handler(int host_signum, siginfo_t *info,
+                                 void *puc);
+ 
+@@ -710,6 +725,18 @@ void signal_init(const char *rtsig_map)
+     }
+ 
+     sigaction(host_interrupt_signal, &act, NULL);
++
++//// --- Begin AFL++ crash propagation ---
++#ifdef CONFIG_AFL
++    /* Remember the top-level bridge pid; guest forks inherit it. See
++     * dump_core_and_abort(). */
++    afl_crash_root_pid = getpid();
++    {
++        char *e = getenv("AFL_QEMU_PROPAGATE_CRASH");
++        afl_crash_propagate = (e && *e && strcmp(e, "0") != 0);
++    }
++#endif
++//// --- End AFL++ crash propagation ---
+ }
+ 
+ /* Force a synchronously taken signal. The kernel force_sig() function
+@@ -872,6 +899,22 @@ void dump_core_and_abort(CPUArchState *env, int target_sig)
+             target_sig, strsignal(host_sig), "core dumped" );
+     }
+ 
++    //// --- Begin AFL++ crash propagation ---
++#ifdef CONFIG_AFL
++    /*
++     * Propagate the fatal signal to the top-level afl-qemu-bridge. Placed
++     * after the (optional) target core dump so the core is still written, and
++     * outside the core_dumped check so it fires for any fatal signal. The
++     * self-check avoids re-signalling when the top-level process is the one
++     * crashing (it then just terminates below).
++     */
++    if (afl_crash_propagate && afl_crash_root_pid > 0 &&
++        afl_crash_root_pid != getpid()) {
++        kill(afl_crash_root_pid, host_sig);
++    }
++#endif
++    //// --- End AFL++ crash propagation ---
++
+     preexit_cleanup(env, 128 + target_sig);
+     die_with_signal(host_sig);
+ }
