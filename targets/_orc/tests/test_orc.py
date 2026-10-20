@@ -151,6 +151,27 @@ def test_collect_crashes(repo: Path) -> None:
     shutil.rmtree(target / "crashes")
 
 
+def test_collect_crashes_libfuzzer_artifacts(repo: Path) -> None:
+    from orc.crashes import collect_crashes
+
+    target = _make_target(repo, "fake")
+    _write(target / "orchestrator.py", 'TARGET_NAME = "fake"\n')
+    _write(target / "out" / "sgfuzz" / "crash-deadbeef", "boom")
+    _write(target / "out" / "sgfuzz" / "timeout-cafebabe", "slow")
+    _write(target / "out" / "sgfuzz" / "README.txt", "ignore")
+
+    report = collect_crashes("fake")
+
+    assert report["count"] == 2
+    crashes = {Path(c["dest"]).name: c for c in report["crashes"]}
+    assert "sgfuzz__crash-deadbeef" in crashes
+    assert crashes["sgfuzz__crash-deadbeef"]["kind"] == "crash"
+    assert crashes["sgfuzz__crash-deadbeef"]["sha1"] == "deadbeef"
+    assert crashes["sgfuzz__timeout-cafebabe"]["campaign"] == "sgfuzz"
+    assert crashes["sgfuzz__timeout-cafebabe"]["kind"] == "timeout"
+    shutil.rmtree(target / "crashes")
+
+
 def test_collect_cov_uses_explicit_gcov_dir(repo: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     from orc import coverage
 

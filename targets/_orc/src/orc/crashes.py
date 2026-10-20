@@ -1,12 +1,15 @@
-"""Post-run crash triage: collect AFL crash files into ``<target>/crashes/``."""
+"""Post-run crash triage: collect AFL and libFuzzer artifacts into ``<target>/crashes/``."""
 
 from __future__ import annotations
 
 import json
 import shutil
 from datetime import datetime, timezone
+from pathlib import Path
 
 from .common import TargetError, load_target_module, target_dir
+
+_LIBFUZZER_ARTIFACTS = ("crash-*", "timeout-*", "oom-*", "leak-*", "slow-unit-*")
 
 
 def _parse_afl_name(name: str) -> dict[str, str]:
@@ -18,15 +21,36 @@ def _parse_afl_name(name: str) -> dict[str, str]:
     return meta
 
 
+def _parse_libfuzzer_name(name: str) -> dict[str, str]:
+    kind, sep, sha1 = name.partition("-")
+    meta = {"kind": kind}
+    if sep and sha1:
+        meta["sha1"] = sha1
+    return meta
+
+
+def _iter_artifacts(root: Path) -> list[Path]:
+    seen: set[Path] = set()
+    found: list[Path] = []
+    for pattern in ("id:*", *_LIBFUZZER_ARTIFACTS):
+        for path in sorted(root.rglob(pattern)):
+            if path.is_file() and path not in seen:
+                seen.add(path)
+                found.append(path)
+    return found
+
+
 def collect_crashes(name: str, profile: str | None = None) -> dict[str, object]:
     """Scan crash dirs and copy them into ``<target>/crashes/``.
 
-    Without *profile*, every ``<target>/out/**/crashes/id:*`` is collected.
-    With one, only ``<target>/out/<profile>/**/crashes/id:*`` is scanned.
+    Without *profile*, every ``<target>/out/**/crashes/id:*`` (AFL) and
+    ``crash-*``/``timeout-*``/``oom-*``/``leak-*``/``slow-unit-*`` (libFuzzer,
+    e.g. SGFuzz ``out/sgfuzz``) is collected. With one, only the matching
+    ``<target>/out/<profile>/`` subtree is scanned.
 
     Each crash is copied as ``<campaign-path>__<original-name>`` where the
-    campaign path joins the AFL output directories below ``out/`` (for example
-    ``default`` or ``calc__default``). A ``summary.json`` is written alongside
+    campaign path joins the output directories below ``out/`` (for example
+    ``default`` or ``sgfuzz``). A ``summary.json`` is written alongside
     describing every finding.
     """
     mod = load_target_module(name)
@@ -46,15 +70,19 @@ def collect_crashes(name: str, profile: str | None = None) -> dict[str, object]:
 
     findings: list[dict[str, str]] = []
     if scan_root.is_dir():
-        for crash in sorted(scan_root.rglob("id:*")):
+        for crash in _iter_artifacts(scan_root):
             rel_parts = crash.relative_to(out_root).parent.parts
-            if not rel_parts or rel_parts[-1] != "crashes":
-                continue
-            campaign_parts = rel_parts[:-1]
+            is_afl = crash.name.startswith("id:")
+            if is_afl:
+                if not rel_parts or rel_parts[-1] != "crashes":
+                    continue
+                campaign_parts = rel_parts[:-1]
+            else:
+                campaign_parts = rel_parts
             if not campaign_parts:
                 continue
             campaign = "/".join(campaign_parts)
-            meta = _parse_afl_name(crash.name)
+            meta = _parse_afl_name(crash.name) if is_afl else _parse_libfuzzer_name(crash.name)
             dst_name = "__".join(campaign_parts) + f"__{crash.name}"
             dst = dst_root / dst_name
             shutil.copy2(crash, dst)

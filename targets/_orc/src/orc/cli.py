@@ -45,7 +45,9 @@ def _build_parser() -> argparse.ArgumentParser:
         default=None,
         help="profile to replay (default: all profiles; legacy targets: default)",
     )
-    p_crashes = sub.add_parser("collect-crashes", help="collect AFL crash files into crashes/")
+    p_crashes = sub.add_parser(
+        "collect-crashes", help="collect AFL/libFuzzer crash artifacts into crashes/"
+    )
     p_crashes.add_argument(
         "--profile",
         default=None,

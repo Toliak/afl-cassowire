@@ -164,11 +164,21 @@ def _exchange(host: str, port: int, payload: bytes, timeout_ms: int) -> int:
     return received
 
 
-def _stop(proc: subprocess.Popen[bytes]) -> None:
+def _stop_signal(cov: dict[str, object]) -> int:
+    raw = cov.get("stop_signal", "SIGTERM")
+    if isinstance(raw, int):
+        return raw
+    sig = getattr(signal, str(raw), None)
+    if not isinstance(sig, int):
+        raise TargetError(f"COVERAGE['stop_signal'] is not a known signal: {raw!r}")
+    return sig
+
+
+def _stop(proc: subprocess.Popen[bytes], sig: int = signal.SIGTERM) -> None:
     if proc.poll() is not None:
         return
     try:
-        os.killpg(proc.pid, signal.SIGTERM)
+        os.killpg(proc.pid, sig)
     except ProcessLookupError:
         return
     try:
@@ -231,6 +241,7 @@ def _replay_profile(
     timeout_ms = int(cov.get("timeout_ms", DEFAULT_TIMEOUT_MS))
     prefix = _as_bytes(cov.get("payload_prefix"), "payload_prefix")
     suffix = _as_bytes(cov.get("payload_suffix"), "payload_suffix")
+    stop_sig = _stop_signal(cov)
 
     proc = _spawn(cov, target, log)
     restarts = 0
@@ -249,7 +260,7 @@ def _replay_profile(
             except OSError as exc:
                 errors.append(f"{path.name}: {exc}")
     finally:
-        _stop(proc)
+        _stop(proc, stop_sig)
 
     return {
         "profile": profile_name,
