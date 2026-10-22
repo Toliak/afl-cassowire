@@ -70,19 +70,20 @@ PASSTHROUGH_VARS := \
 	$(if $(COVERAGE_OUT),COVERAGE_OUT=$(COVERAGE_OUT)) \
 	$(if $(FUZZ_DEBUG),FUZZ_DEBUG=$(FUZZ_DEBUG))
 
-.PHONY: help check-target toolchain aflpp aflnet shell run \
+.PHONY: help check-target toolchain aflpp aflnet afl-cassowire shell run \
 	build prepare-data prepare-seeds fuzz fuzz-qemu cov replay-cov collect-cov crashes
 
 help:
 	@printf '%s\n' \
-		'Goals: toolchain aflpp aflnet shell run' \
+		'Goals: toolchain aflpp aflnet afl-cassowire shell run' \
 		'       build prepare-data prepare-seeds fuzz fuzz-qemu cov replay-cov collect-cov crashes' \
-		'Required: TARGET=<name> (except toolchain/aflpp/aflnet/shell/run)' \
+		'Required: TARGET=<name> (except toolchain/aflpp/aflnet/afl-cassowire/shell/run)' \
 		'Optional: PROFILE=<mode>  FUZZER=aflpp|aflnet  VARIANT=<build-variant>' \
 		'          AFL_FUZZ_CPU=<n> (afl-fuzz -b, default 0)' \
 		'          RUN_IN_CONTAINER=1|0 (default 1; 0 runs targets directly)' \
 		'' \
 		'Examples (host):' \
+		'  make afl-cassowire' \
 		'  make TARGET=nginx VARIANT=afl-clang-fast build' \
 		'  make TARGET=nginx prepare-data' \
 		'  make TARGET=nginx FUZZER=aflpp prepare-seeds' \
@@ -117,6 +118,12 @@ aflpp:
 aflnet:
 	$(PODMAN_RUN) -w $(CONTAINER_WORKDIR)/other/aflnet \
 		$(TOOLCHAIN_IMAGE) make
+
+# Build the persistent proxy. Assumes `make toolchain` and `make aflpp` ran.
+afl-cassowire:
+	$(PODMAN_RUN) -w $(CONTAINER_WORKDIR)/afl-cassowire \
+		$(TOOLCHAIN_IMAGE) bash -lc \
+		'make prepare && { [ -f build/build.ninja ] || make prepare2; } && make build'
 
 shell:
 	$(SHELL_CMD)
