@@ -21,11 +21,12 @@ make toolchain
 ## 2. Build the fuzzer toolchains (once each)
 
 ```sh
-make aflpp     # our patched AFL++ (aflpp/src/distrib)
-make aflnet    # vendor AFLNet (other/aflnet)
+make aflpp          # our patched AFL++ (aflpp/src/distrib)
+make aflnet         # vendor AFLNet (other/aflnet)
+make afl-cassowire  # the persistent proxy (afl-cassowire/build)
 ```
 
-Both are built like targets, inside the toolchain container; artifacts persist on
+All are built like targets, inside the toolchain container; artifacts persist on
 the host volume.
 
 ## 3. Build a target

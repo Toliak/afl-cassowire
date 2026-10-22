@@ -11,6 +11,7 @@ RUN [ -f "/etc/apt/apt.conf.d/docker-clean" ] && \
     true
 
 RUN --mount=type=cache,sharing=locked,target=/var/cache/apt \
+    --mount=type=cache,sharing=locked,target=/var/lib/apt \
 \
     apt-get update -y --allow-releaseinfo-change && \
     apt-get install -y --no-install-recommends \
