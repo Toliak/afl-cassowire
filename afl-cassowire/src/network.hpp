@@ -118,7 +118,7 @@ namespace network {
     struct ConnectError {
         enum class Kind {
             SocketCreate,   ///< socket() syscall failed (sys_errno holds errno)
-            FcntlSetup,     ///< fcntl(F_GETFL) failed while enabling non-blocking mode (sys_errno holds errno)
+            FcntlSetup,     ///< fcntl() failed while enabling non-blocking mode (sys_errno holds errno)
             InvalidHost,    ///< inet_pton() rejected the host (not an IPv4 dotted-quad address)
             ConnectFailed,  ///< connect() failed immediately (sys_errno holds errno)
             TimedOut,       ///< poll() timed out waiting for the connection to complete
@@ -143,10 +143,13 @@ namespace network {
     /**
      * @brief Connects to the target application via TCP.
      *
+     * The returned socket stays in non-blocking mode so send_all() and
+     * wait_response() can enforce their timeouts via poll(); callers that
+     * read or write directly must handle EAGAIN/EWOULDBLOCK themselves.
+     *
      * @param net_cfg The network configuration.
-     * @return ConnectResult The connected socket (switched back to blocking
-     *         mode) owned by a utils::FdGuard, or a ConnectError describing
-     *         the failure.
+     * @return ConnectResult The connected non-blocking socket owned by a
+     *         utils::FdGuard, or a ConnectError describing the failure.
      */
     [[nodiscard]] ConnectResult connect_target(const NetworkConfig& net_cfg);
 
@@ -174,6 +177,9 @@ namespace network {
 
     /**
      * @brief Sends the entire buffer to the socket, handling partial sends and timeouts.
+     *
+     * The socket must be non-blocking (connect_target() returns one in that
+     * state); EAGAIN/EWOULDBLOCK waits on poll() until timeout_ms expires.
      *
      * @param sock The socket file descriptor.
      * @param buf The data to send.
@@ -210,10 +216,12 @@ namespace network {
     /**
      * @brief Reads from the socket until EOF or timeout.
      *
-     * Returns the accumulated bytes when the peer closes the connection, or
-     * when a timeout fires after at least some data was received (a partial
-     * response is still data). A timeout with no data at all, a poll() failure
-     * or a recv() failure is a WaitError. EINTR on poll()/recv() is retried.
+     * The socket must be non-blocking (connect_target() returns one in that
+     * state). Returns the accumulated bytes when the peer closes the
+     * connection, or when a timeout fires after at least some data was received
+     * (a partial response is still data). A timeout with no data at all, a
+     * poll() failure or a recv() failure is a WaitError. EINTR on poll()/recv()
+     * and EAGAIN/EWOULDBLOCK from recv() are retried within the deadline.
      *
      * Note (known limitation): a keep-alive server that ignores the client
      * half-close may keep the connection open after a complete response, so this

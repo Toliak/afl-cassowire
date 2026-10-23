@@ -26,6 +26,7 @@
 #include <sys/uio.h>
 #include <linux/seccomp.h>
 #include <netinet/in.h>
+#include <netinet/tcp.h>
 #include <arpa/inet.h>
 #include <poll.h>
 
@@ -514,20 +515,20 @@ DetectResult wait_for_port(pid_t target_pid, const Config& cfg, int notif_fd) {
 }
 
 ConnectResult connect_target(const NetworkConfig& net_cfg) {
-    // TODO(claude): (1) the socket is switched back to BLOCKING mode after connect, so send_all()'s timeout
-    //   is not enforced: send() can block forever if the target stops reading (the EAGAIN/poll branch in
-    //   send_all is dead code). Keep O_NONBLOCK or set SO_SNDTIMEO. Also no TCP_NODELAY / SOCK_CLOEXEC.
-    //   (2) poll() returning -1/EINTR is treated as a connect failure.
-    //   (The second fcntl() per successful connect, restoring blocking mode, is intentionally unchecked.)
-    //   The host is an IPv4 literal by contract: config.cpp rejects anything inet_pton(AF_INET) cannot parse.
-    int sock = socket(AF_INET, SOCK_STREAM, 0);
+    int sock = socket(AF_INET, SOCK_STREAM | SOCK_CLOEXEC, 0);
     if (sock < 0) return ConnectError{ConnectError::Kind::SocketCreate, errno};
 
     utils::FdGuard guard{sock};
 
     int flags = fcntl(guard.get(), F_GETFL, 0);
     if (flags < 0) return ConnectError{ConnectError::Kind::FcntlSetup, errno};
-    fcntl(guard.get(), F_SETFL, flags | O_NONBLOCK);
+    if (fcntl(guard.get(), F_SETFL, flags | O_NONBLOCK) < 0) {
+        return ConnectError{ConnectError::Kind::FcntlSetup, errno};
+    }
+
+    // Best-effort latency tweak; failure is harmless (the default Nagle behavior stays).
+    int nodelay = 1;
+    (void)setsockopt(guard.get(), IPPROTO_TCP, TCP_NODELAY, &nodelay, sizeof(nodelay));
 
     struct sockaddr_in addr = {};
     addr.sin_family = AF_INET;
@@ -536,27 +537,30 @@ ConnectResult connect_target(const NetworkConfig& net_cfg) {
         return ConnectError{ConnectError::Kind::InvalidHost, 0};
     }
 
+    // The socket stays non-blocking so send_all()/wait_response() enforce their
+    // timeouts via poll(); callers must handle EAGAIN/EWOULDBLOCK.
     int res = connect(guard.get(), (struct sockaddr*)&addr, sizeof(addr));
-    if (res < 0 && errno != EINPROGRESS) {
+    if (res < 0 && errno != EINPROGRESS && errno != EINTR) {
         return ConnectError{ConnectError::Kind::ConnectFailed, errno};
     }
 
-    if (res == 0) {
-        fcntl(guard.get(), F_SETFL, flags);
-        return guard;
-    }
+    if (res == 0) return guard;
 
     struct pollfd pfd;
     pfd.fd = guard.get();
     pfd.events = POLLOUT;
 
-    int poll_res = poll(&pfd, 1, net_cfg.timeout_ms);
-    if (poll_res == 0) {
-        return ConnectError{ConnectError::Kind::TimedOut, 0};
+    uint64_t start = utils::get_time_ms();
+    int poll_res = 0;
+    while (true) {
+        int remaining = net_cfg.timeout_ms - (int)(utils::get_time_ms() - start);
+        if (remaining <= 0) return ConnectError{ConnectError::Kind::TimedOut, 0};
+        pfd.revents = 0;
+        poll_res = poll(&pfd, 1, remaining);
+        if (poll_res >= 0) break;
+        if (errno != EINTR) return ConnectError{ConnectError::Kind::PollFailed, errno};
     }
-    if (poll_res < 0) {
-        return ConnectError{ConnectError::Kind::PollFailed, errno};
-    }
+    if (poll_res == 0) return ConnectError{ConnectError::Kind::TimedOut, 0};
 
     int err = 0;
     socklen_t len = sizeof(err);
@@ -565,12 +569,11 @@ ConnectResult connect_target(const NetworkConfig& net_cfg) {
         return ConnectError{ConnectError::Kind::SocketError, err};
     }
 
-    fcntl(guard.get(), F_SETFL, flags);
     return guard;
 }
 
-// With a blocking socket (the state connect_target() leaves it in) the EAGAIN/poll branch below is
-// dead code and send() can block forever if the target stops reading - see the connect_target() TODO.
+// The socket stays non-blocking (connect_target leaves it so), so the EAGAIN/poll branch below is
+// live and send() cannot block past timeout_ms when the target stops reading.
 SendResult send_all(int sock, const uint8_t* buf, size_t len, int timeout_ms) {
     size_t sent = 0;
     uint64_t start = utils::get_time_ms();
@@ -651,7 +654,7 @@ WaitResult wait_response(int sock, int timeout_ms) {
         }
         if (n == 0) break; // orderly EOF
 
-        if (errno == EINTR) continue;
+        if (errno == EINTR || errno == EAGAIN || errno == EWOULDBLOCK) continue;
         return WaitError{WaitError::Kind::RecvFailed, errno};
     }
 
