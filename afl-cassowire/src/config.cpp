@@ -9,6 +9,7 @@
 #include <filesystem>
 #include <unordered_set>
 #include <vector>
+#include <arpa/inet.h>
 
 std::string ConfigError::to_string() const {
     std::stringstream ss;
@@ -26,20 +27,6 @@ std::string ConfigError::to_string() const {
     }
     return ss.str();
 }
-
-// Builds the final payload transmitted to the target:
-//   prefix + fuzz input + suffix
-std::vector<uint8_t> PayloadConfig::wrap(const uint8_t* data, size_t len) const {
-    std::vector<uint8_t> out;
-    out.reserve(prefix.size() + len + suffix.size());
-    out.insert(out.end(), prefix.begin(), prefix.end());
-    if (len > 0) {
-        out.insert(out.end(), data, data + len);
-    }
-    out.insert(out.end(), suffix.begin(), suffix.end());
-    return out;
-}
-
 
 namespace {
 
@@ -252,9 +239,16 @@ ConfigError parse_network_section(const YAML::Node& node, const std::string& pre
 
     if (node["host"]) {
         if (!node["host"].IsScalar()) return ConfigError{prefix + ".host", "Invalid type", "string", "not a string"};
-        // WARN: host is not validated beyond being a string; network.cpp connect_target() uses inet_pton(AF_INET) only:
-        //   IPv4 literals work, but hostnames, IPv6 literals, and invalid strings are accepted here and may fail at connect time.
-        out.host = node["host"].as<std::string>();
+        // The client (network.cpp connect_target()) resolves the host with
+        // inet_pton(AF_INET) only, so reject anything that is not an IPv4
+        // dotted-quad literal here instead of failing later at connect time.
+        const std::string host = node["host"].as<std::string>();
+        struct in_addr addr = {};
+        if (inet_pton(AF_INET, host.c_str(), &addr) != 1) {
+            return ConfigError{prefix + ".host", "Not an IPv4 dotted-quad address",
+                               "IPv4 dotted-quad address (e.g. 127.0.0.1)", host};
+        }
+        out.host = host;
     }
 
     if (!node["port"] || !node["port"].IsScalar()) {

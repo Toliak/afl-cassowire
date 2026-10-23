@@ -212,7 +212,11 @@ ExchangeOutcome exchange_once(const Config& cfg, const uint8_t* input, size_t in
     // iteration (termination dumps read it even when connect fails).
     payload_buf.clear();
     payload_buf.insert(payload_buf.end(), cfg.payload.prefix.begin(), cfg.payload.prefix.end());
-    payload_buf.insert(payload_buf.end(), input, input + input_len);
+    // Guard the zero-length case: an empty input may be backed by a null
+    // pointer (empty vector data()), and null + 0 is undefined behaviour.
+    if (input_len > 0) {
+        payload_buf.insert(payload_buf.end(), input, input + input_len);
+    }
     payload_buf.insert(payload_buf.end(), cfg.payload.suffix.begin(), cfg.payload.suffix.end());
     out.request_size = payload_buf.size();
 
@@ -587,7 +591,10 @@ int run_proxy_mode(Config cfg, bool forward_output) {
         PROXY_LOG_ERROR("failed to detect port {}: {}",
                         cfg.network.port, std::get<network::DetectError>(port_res).to_string());
 
-        // TODO: make a health check here maybe?
+        // wait_for_port() already polls and reaps the target, so a startup
+        // death surfaces here as DetectError::TargetDied with its wait status.
+        // Still missing: classifying a startup crash (WIFSIGNALED) as a proxy
+        // crash so AFL records it; for now every detection failure exits 1.
         network::set_notif_listener(-1);
         kill_and_reap_pgid(g_child_pid);
         return 1;
@@ -643,6 +650,20 @@ int run_test_mode(const Config& cfg, const std::string& input_path, bool forward
     // input_path is guaranteed non-empty: the parser makes --input mandatory
     // for the `test` subcommand (src/args.cpp), long before this point.
 
+    // Read the payload up front, before Pass 1 spawns the target: an
+    // unreadable --input must fail without paying the spawn/port-detection
+    // cost. A successful read of zero bytes is a valid empty input (the
+    // configured prefix/suffix still produce a payload).
+    std::vector<uint8_t> input_data;
+    if (auto input_res = utils::read_input_file(input_path);
+        std::holds_alternative<std::error_code>(input_res)) {
+        PROXY_LOG_ERROR("failed to read payload from {}: {}",
+                        input_path, std::get<std::error_code>(input_res).message());
+        return 1;
+    } else {
+        input_data = std::get<std::vector<uint8_t>>(std::move(input_res));
+    }
+
     // --- Pass 1: Map Size Extraction ---
     // prepare_target() injects AFL_DUMP_MAP_SIZE=1 into the child's envp for
     // SpawnMode::MapSizePass; the proxy's own environment is not touched.
@@ -696,23 +717,6 @@ int run_test_mode(const Config& cfg, const std::string& input_path, bool forward
     PROXY_LOG_INFO("Pass 1 (Map Size) completed.");
 
     // --- Pass 2: Single Iteration ---
-    // TODO(claude): the --input file is only opened after Pass 1 has spawned (and waited for) the
-    //   target; validate that it is readable up front to fail early. Also an empty regular file is
-    //   reported as "failed to read" below, although an empty input is valid.
-    std::vector<uint8_t> input_data;
-    if (auto input_res = utils::read_input_file(input_path);
-        std::holds_alternative<std::error_code>(input_res)) {
-        PROXY_LOG_ERROR("failed to read payload from {}: {}",
-                        input_path, std::get<std::error_code>(input_res).message());
-        return 1;
-    } else {
-        input_data = std::get<std::vector<uint8_t>>(std::move(input_res));
-    }
-    if (input_data.empty() && input_path != "-") {
-        PROXY_LOG_ERROR("failed to read payload from {}", input_path);
-        return 1;
-    }
-
     // Scratch buffer for the final payload = configured prefix + input data
     // + configured suffix (built by exchange_once()).
     std::vector<uint8_t> payload_buf;
@@ -774,12 +778,12 @@ int run_test_mode(const Config& cfg, const std::string& input_path, bool forward
         PROXY_LOG_ERROR("Pass 2 (Single Iteration) failed.");
     }
 
-    // TODO: wip, maybe remove that later
-    // utils::sleep_ms(500);
-
-    int status;
+    // Opportunistic non-blocking probe for a target that already died after
+    // the single exchange. status is only meaningful when waitpid reaps it.
+    int status = 0;
     pid_t res = waitpid(g_child_pid, &status, WNOHANG);
-    PROXY_LOG_INFO("waitpid res {} status {:x}, signaled={}", res, status, WIFSIGNALED(status));
+    PROXY_LOG_INFO("waitpid res {} status {:x}, signaled={}", res, status,
+                   res > 0 && WIFSIGNALED(status));
     
     // Clean exit
     kill_and_reap_pgid(g_child_pid);

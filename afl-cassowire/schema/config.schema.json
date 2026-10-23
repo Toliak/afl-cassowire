@@ -106,7 +106,7 @@
         "host": {
           "type": "string",
           "default": "127.0.0.1",
-          "description": "TCP host to connect to. Only IPv4 dotted literals work at connect time (the client uses inet_pton with AF_INET); hostnames and IPv6 literals are accepted here but will fail to connect."
+          "description": "TCP host to connect to. Must be an IPv4 dotted-quad literal: the client uses inet_pton(AF_INET), and the loader rejects hostnames and IPv6 literals."
         },
         "port": {
           "type": "integer",

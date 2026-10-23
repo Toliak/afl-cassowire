@@ -115,10 +115,6 @@ struct CleanupConfig {
 struct PayloadConfig {
     std::vector<uint8_t> prefix;  // Prepended to each payload (empty if unset)
     std::vector<uint8_t> suffix;  // Appended to each payload (empty if unset)
-
-    // Builds the final payload from the fuzz input buffer.
-    // TODO: move that function out of the `PayloadConfig` structure
-    std::vector<uint8_t> wrap(const uint8_t* data, size_t len) const;
 };
 
 struct Config {

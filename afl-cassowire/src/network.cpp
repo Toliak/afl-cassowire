@@ -517,9 +517,9 @@ ConnectResult connect_target(const NetworkConfig& net_cfg) {
     // TODO(claude): (1) the socket is switched back to BLOCKING mode after connect, so send_all()'s timeout
     //   is not enforced: send() can block forever if the target stops reading (the EAGAIN/poll branch in
     //   send_all is dead code). Keep O_NONBLOCK or set SO_SNDTIMEO. Also no TCP_NODELAY / SOCK_CLOEXEC.
-    //   (2) Only AF_INET + inet_pton is supported; host "localhost"/IPv6 (accepted by config.cpp) fails.
-    //   (3) poll() returning -1/EINTR is treated as a connect failure.
+    //   (2) poll() returning -1/EINTR is treated as a connect failure.
     //   (The second fcntl() per successful connect, restoring blocking mode, is intentionally unchecked.)
+    //   The host is an IPv4 literal by contract: config.cpp rejects anything inet_pton(AF_INET) cannot parse.
     int sock = socket(AF_INET, SOCK_STREAM, 0);
     if (sock < 0) return ConnectError{ConnectError::Kind::SocketCreate, errno};
 
