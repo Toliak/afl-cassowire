@@ -205,7 +205,7 @@ void dump_termination_data(std::string_view kind, std::string_view message,
     // logger's ring sink) so the dump carries the context that preceded the
     // termination. The final termination line itself is deliberately not part
     // of the history - it is the reason line above.
-    const std::vector<std::string> recent = log::recent_lines();
+    const std::vector<std::string> recent = casslog::recent_lines();
     if (!recent.empty()) {
         msg += "\n--- last warn/error lines (oldest first) ---\n";
         for (const std::string& line : recent) {

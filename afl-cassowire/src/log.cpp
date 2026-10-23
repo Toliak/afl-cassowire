@@ -11,7 +11,7 @@
 #include <memory>
 #include <string>
 
-namespace log {
+namespace casslog {
 
     namespace {
 
@@ -123,4 +123,4 @@ namespace log {
         return " (suppressed " + std::to_string(n) + " similar)";
     }
 
-} // namespace log
+} // namespace casslog

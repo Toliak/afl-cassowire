@@ -19,7 +19,7 @@
 #define PROXY_LOG_WARN(...)  SPDLOG_WARN(__VA_ARGS__)
 #define PROXY_LOG_ERROR(...) SPDLOG_ERROR(__VA_ARGS__)
 
-namespace log {
+namespace casslog {
 
     /**
      * @brief Initializes the default "proxy" logger.
@@ -126,4 +126,4 @@ namespace log {
      */
     [[nodiscard]] std::string throttle_suffix(const Throttle& throttle);
 
-} // namespace log
+} // namespace casslog

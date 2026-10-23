@@ -167,7 +167,7 @@ namespace utils {
      * Before raising the signal, the reason and the failing payload are dumped
      * to the configured data directory (see set_data_dir()). The .msg file
      * also embeds the last warn/error messages captured by the proxy logger
-     * (log::recent_lines()) - the context that preceded the termination.
+     * (casslog::recent_lines()) - the context that preceded the termination.
      * When a history is enabled (set_dump_history_size()), the retained
      * previous-iteration payloads are dumped as .-1.data, .-2.data, ...
      *
@@ -183,7 +183,7 @@ namespace utils {
      * Before raising the signal, the reason and the failing payload are dumped
      * to the configured data directory (see set_data_dir()). The .msg file
      * also embeds the last warn/error messages captured by the proxy logger
-     * (log::recent_lines()) - the context that preceded the termination.
+     * (casslog::recent_lines()) - the context that preceded the termination.
      * When a history is enabled (set_dump_history_size()), the retained
      * previous-iteration payloads are dumped as .-1.data, .-2.data, ...
      *

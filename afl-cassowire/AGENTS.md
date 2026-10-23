@@ -85,9 +85,9 @@ are ignored helper-anchor fields (see Important details).
   `std::variant<Config, ConfigError>`; **no exceptions**, strict type/range validation
   with a structured `ConfigError` (path/message/expected/actual).
   `config.cpp` **cannot include `log.hpp`** — yaml-cpp pulls in `<cmath>`, whose `::log`
-  collides with the `log` namespace in either include order (level-name validation for
+  collides with the `casslog` namespace in either include order (level-name validation for
   `afl.msg_log_level` therefore lives in `main()`).
-- `src/log.{hpp,cpp}` — namespace `log`: spdlog setup (single-threaded stdout logger,
+- `src/log.{hpp,cpp}` — namespace `casslog`: spdlog setup (single-threaded stdout logger,
   flush on warn+), `PROXY_LOG_*` macros gated by `SPDLOG_ACTIVE_LEVEL`
   (`-Dstrip_low_logs=true` compiles trace/debug out), `parse_level()`, `escape_bytes()`,
   and a warn-level ringbuffer sink (capacity 16) exposing `recent_lines()` for
@@ -168,7 +168,7 @@ are ignored helper-anchor fields (see Important details).
   concurrently running instances stay attributable; the `.msg` content and the
   termination log line embed it as `{kind}[{tag}]: {reason}`. The `.msg` additionally
    embeds the last ≤16 warn/error lines (oldest first, console-style timestamps) captured
-   by the logger's ring sink (`log::recent_lines()`, level = `afl.msg_log_level`,
+   by the logger's ring sink (`casslog::recent_lines()`, level = `afl.msg_log_level`,
    default `warn`); capture is independent of
    `--log-level` (logger level is floored at warn, the console sink applies the runtime
     level), so quiet runs still produce rich dumps. The `.msg` also embeds the

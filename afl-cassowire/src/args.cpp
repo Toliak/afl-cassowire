@@ -70,7 +70,7 @@ namespace args {
 
         // Validate the level name here so the error path can still render the
         // usage text; main() only converts the (already valid) name.
-        if (!log::parse_level(parsed.log_level)) {
+        if (!casslog::parse_level(parsed.log_level)) {
             return ArgParseError{
                 "invalid --log-level '" + parsed.log_level +
                     "': expected trace, debug, info, warn, error, critical, or off",

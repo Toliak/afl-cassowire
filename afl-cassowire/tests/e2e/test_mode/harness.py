@@ -136,7 +136,7 @@ def map_sizes(stdout: str) -> list[int]:
 
 
 def escaped(data: bytes) -> str:
-    """Escape bytes the way log::escape_bytes() renders them in the Response line."""
+    """Escape bytes the way casslog::escape_bytes() renders them in the Response line."""
     return "".join(chr(byte) if 0x20 <= byte < 0x7F else f"\\x{byte:02x}" for byte in data)
 
 

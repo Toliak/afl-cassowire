@@ -511,7 +511,7 @@ std::variant<Config, ConfigError> load_config(const std::string& path) {
             }
             if (afl_node["msg_log_level"]) {
                 // Only the type is checked here: the level *name* is validated
-                // in main() via log::parse_level(). config.cpp cannot include
+                // in main() via casslog::parse_level(). config.cpp cannot include
                 // log.hpp — yaml-cpp pulls in <cmath>, whose ::log collides
                 // with the `log` namespace.
                 if (!afl_node["msg_log_level"].IsScalar()) {

@@ -72,9 +72,9 @@ struct AflConfig {
     // written). Must be 0-64.
     std::size_t dump_history = 1;
     // Log level for the warn/error ring sink whose captured lines are embedded
-    // into termination .msg dumps (see log::recent_lines()). Only affects the
+    // into termination .msg dumps (see casslog::recent_lines()). Only affects the
     // dump content, not the console (that is --log-level). Must be a level name
-    // accepted by log::parse_level(); the type is checked by load_config(), the
+    // accepted by casslog::parse_level(); the type is checked by load_config(), the
     // name by main() (config.cpp cannot include log.hpp). Default warn.
     std::string msg_log_level = "warn";
 };

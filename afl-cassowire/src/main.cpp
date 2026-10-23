@@ -136,10 +136,10 @@ struct IterationStats {
     uint64_t max_send_ms = 0;
     uint64_t max_wait_ms = 0;
     uint64_t max_probe_ms = 0;
-    log::Throttle connect_err{3, 5000};
-    log::Throttle send_err{3, 5000};
-    log::Throttle wait_err{3, 5000};
-    log::Throttle probe_err{3, 5000};
+    casslog::Throttle connect_err{3, 5000};
+    casslog::Throttle send_err{3, 5000};
+    casslog::Throttle wait_err{3, 5000};
+    casslog::Throttle probe_err{3, 5000};
 };
 
 /// Emit at most one INFO iteration summary per this interval.
@@ -280,7 +280,7 @@ void run_fuzz_iteration(const Config& cfg, pid_t child_pid, int target_pidfd,
             PROXY_LOG_ERROR("failed to connect to {}:{} after {} ms: {}{}",
                             cfg.network.host, cfg.network.port, ex.connect_ms,
                             ex.connect_error->to_string(),
-                            log::throttle_suffix(stats.connect_err));
+                            casslog::throttle_suffix(stats.connect_err));
         }
         // Connection failed, target might be dead. Check health immediately; a
         // live target falls through to the quiescence probe below: it is
@@ -319,7 +319,7 @@ void run_fuzz_iteration(const Config& cfg, pid_t child_pid, int target_pidfd,
             if (stats.send_err.allow()) {
                 PROXY_LOG_ERROR("send failed after {} ms: {}{}",
                                 ex.send_ms, ex.send_error->to_string(),
-                                log::throttle_suffix(stats.send_err));
+                                casslog::throttle_suffix(stats.send_err));
             }
         } else if (ex.send_ms >= budget_ms) {
             PROXY_LOG_WARN("send_all of {} bytes took {} ms (>= timeout {} ms); target stopped draining the socket",
@@ -328,7 +328,7 @@ void run_fuzz_iteration(const Config& cfg, pid_t child_pid, int target_pidfd,
 
         PROXY_LOG_TRACE("Request (size={}): '{}'",
                             ex.request_size,
-                            log::escape_bytes(payload_buf, 256));
+                            casslog::escape_bytes(payload_buf, 256));
         if (ex.wait_error) {
             if (stats.wait_err.allow()) {
                 std::string hint;
@@ -339,12 +339,12 @@ void run_fuzz_iteration(const Config& cfg, pid_t child_pid, int target_pidfd,
                 }
                 PROXY_LOG_ERROR("waiting for response failed after {} ms: {}{}{}",
                                 ex.wait_ms, ex.wait_error->to_string(), hint,
-                                log::throttle_suffix(stats.wait_err));
+                                casslog::throttle_suffix(stats.wait_err));
             }
         } else {
             PROXY_LOG_TRACE("Response (size={}): '{}'",
                             ex.response.size(),
-                            log::escape_bytes(ex.response, 256));
+                            casslog::escape_bytes(ex.response, 256));
             if (ex.wait_ms >= budget_ms) {
                 PROXY_LOG_WARN("response took {} ms (>= timeout {} ms): {} bytes received; target kept the connection open",
                                ex.wait_ms, budget_ms, ex.response.size());
@@ -399,7 +399,7 @@ void run_fuzz_iteration(const Config& cfg, pid_t child_pid, int target_pidfd,
                                network::probe_outcome_to_string(pr.outcome), first_ms, budget_ms,
                                pr.error ? ": " + pr.error->to_string() : std::string(),
                                probe_exhaustion_hint(pr),
-                               log::throttle_suffix(stats.probe_err));
+                               casslog::throttle_suffix(stats.probe_err));
             }
 
             // Classify the target before deciding anything: if it is dead, the
@@ -769,7 +769,7 @@ int run_test_mode(const Config& cfg, const std::string& input_path, bool forward
         PROXY_LOG_ERROR("waiting for response failed: {}", ex.wait_error->to_string());
         io_ok = false;
     } else {
-        PROXY_LOG_INFO("Response: '{}'", log::escape_bytes(ex.response));
+        PROXY_LOG_INFO("Response: '{}'", casslog::escape_bytes(ex.response));
     }
 
     if (io_ok) {
@@ -795,7 +795,7 @@ int main(int argc, char* argv[]) {
     // the logger; --log-level reconfigures the console after parsing, and the
     // second init() below applies --log-level plus afl.msg_log_level (from the
     // config) once the config is loaded.
-    log::init(spdlog::level::info, spdlog::level::warn);
+    casslog::init(spdlog::level::info, spdlog::level::warn);
 
     // Note: global options (-c/--config, --log-level, --child-output,
     // --data-dir) must precede the subcommand; `test --input <file>` carries
@@ -809,13 +809,13 @@ int main(int argc, char* argv[]) {
     const auto& parsed = std::get<args::ParsedArgs>(args_res);
 
     // parse_args() already validated the --log-level name; this only converts it.
-    auto log_level = log::parse_level(parsed.log_level);
+    auto log_level = casslog::parse_level(parsed.log_level);
     if (!log_level) {
         PROXY_LOG_ERROR("invalid --log-level '{}': expected trace, debug, info, warn, error, critical, or off",
                         parsed.log_level);
         return 1;
     }
-    log::init(*log_level, spdlog::level::warn);
+    casslog::init(*log_level, spdlog::level::warn);
 
     // Destination for crash/abort termination dumps (.msg/.data).
     utils::set_data_dir(parsed.data_dir);
@@ -841,14 +841,14 @@ int main(int argc, char* argv[]) {
     // Reconfigure the logger with the parsed --log-level (console) and the
     // config-provided afl.msg_log_level (ring sink feeding .msg dumps). The
     // level name is validated here (not in load_config()) because config.cpp
-    // cannot include log.hpp (yaml-cpp's <cmath> collides with namespace log).
-    auto crash_msg_level = log::parse_level(cfg.afl.msg_log_level);
+    // cannot include log.hpp (yaml-cpp's <cmath> collides with namespace casslog).
+    auto crash_msg_level = casslog::parse_level(cfg.afl.msg_log_level);
     if (!crash_msg_level) {
         PROXY_LOG_ERROR("invalid afl.msg_log_level '{}': expected trace, debug, info, warn, error, critical, or off",
                         cfg.afl.msg_log_level);
         return 1;
     }
-    log::init(*log_level, *crash_msg_level);
+    casslog::init(*log_level, *crash_msg_level);
 
     // Retain the last N completed payloads so a termination dump can preserve
     // the input that likely caused a deferred/async crash (see
