@@ -28,10 +28,21 @@ make patch      # apply patches from patch/
 make submodules # init qemu_mode/qemuafl and qemu_bridge/qemu-libafl-bridge
 make build      # build the distrib/ bundle
 make build-qemu # build + stage the QEMU guest architectures
-make install    # install into src/distrib (depends on build-qemu)
+make install    # install into src/distrib (depends on build-qemu when WITH_QEMU=1)
 ```
 
 Requires `nproc`, `git`, `patch`, and a working C/C++ toolchain.
+
+QEMU support is optional. Set `WITH_QEMU=0` to skip the QEMU submodules,
+`afl-qemu-trace`/`afl-qemu-bridge`, and guest-architecture staging:
+
+```
+make build WITH_QEMU=0
+make install WITH_QEMU=0   # host tools only; no QEMU binaries installed
+```
+
+With `WITH_QEMU=0`, `install` depends on `build` instead of `build-qemu`, and
+`build` passes `NO_QEMU=1` to AFL++'s `distrib` target.
 
 ## QEMU guest architectures
 

@@ -7,6 +7,15 @@ GIT_TAG := v5.03c
 MAKE_ARGS := -j$(NUM_CORES)
 MAKE_ARGS_ADD :=
 
+# QEMU support (afl-qemu-trace/afl-qemu-bridge) is optional. Set WITH_QEMU=0
+# to skip the QEMU submodules and binaries entirely.
+WITH_QEMU ?= 1
+ifeq ($(strip $(WITH_QEMU)),0)
+  QEMU_ENABLED := 0
+else
+  QEMU_ENABLED := 1
+endif
+
 # Guest architectures to build QEMU support for. The native architecture is
 # reused from the regular `make distrib` build; non-native ones are built with
 # CPU_TARGET=<arch> and installed as arch-suffixed binaries.
@@ -14,8 +23,19 @@ QEMU_ARCHS ?= x86_64 aarch64
 QEMU_HOST_ARCH := $(shell uname -m)
 QEMU_ARCH_STAGE := src/.qemu
 
+ifeq ($(QEMU_ENABLED),1)
+  QEMU_SUBMODULE_DEP := src/.submodules
+  QEMU_MAKE_ARGS :=
+  INSTALL_DEPS := build-qemu
+else
+  QEMU_SUBMODULE_DEP :=
+  QEMU_MAKE_ARGS := NO_QEMU=1
+  INSTALL_DEPS := build
+endif
+
 help:
 	@echo "prepare -- git clone the AFL++ repo"
+	@echo "WITH_QEMU=0 -- skip QEMU support (default: WITH_QEMU=1)"
 	@echo "QEMU_ARCHS -- guest arches for QEMU support (default: x86_64 aarch64)"
 
 src/.cloned:
@@ -24,9 +44,9 @@ src/.cloned:
 src/.submodules: src/.cloned
 	$(call GIT_SUBMODULES_TARGET_CMD,qemu_mode/qemuafl qemu_bridge/qemu-libafl-bridge)
 
-src: src/.submodules
+src: src/.cloned $(QEMU_SUBMODULE_DEP)
 
-src/.patched: src/.submodules
+src/.patched: src/.cloned $(QEMU_SUBMODULE_DEP)
 	cd "./src" && \
 		for F in "../patch"/*.patch; do \
 			patch -p1 -i "$$F" || exit 1; \
@@ -35,7 +55,7 @@ src/.patched: src/.submodules
 
 patch: src/.patched
 
-build: src/.patched
+build: src/.patched $(QEMU_SUBMODULE_DEP)
 	cd "./src" && \
 		make $(MAKE_ARGS) $(MAKE_ARGS_ADD) \
 			distrib \
@@ -44,15 +64,21 @@ build: src/.patched
 			NO_NYX=1 \
 			NO_CORESIGHT=1 \
 			NO_FRIDA=1 \
-			NO_UNICORN=1
+			NO_UNICORN=1 \
+			$(QEMU_MAKE_ARGS)
 
 build-qemu: build
+ifeq ($(QEMU_ENABLED),1)
 	$(MAKE) qemu-archs
+else
+	@echo "[!] QEMU support disabled (WITH_QEMU=0); skipping QEMU build" >&2
+endif
 
 # Stage arch-suffixed QEMU binaries. `make distrib` already built QEMU for the
 # native architecture, so reuse it; other architectures are built in the same
 # tree with CPU_TARGET=<arch>. The trap restores the native binaries afterwards
 # so `make install` still installs the default afl-qemu-trace/afl-qemu-bridge.
+ifeq ($(QEMU_ENABLED),1)
 qemu-archs:
 	@set -e; \
 	native="$(QEMU_ARCH_STAGE)/native"; \
@@ -82,11 +108,16 @@ qemu-archs:
 		fi; \
 		touch "$$out/.built"; \
 	done
+else
+qemu-archs:
+	@echo "[!] QEMU support disabled (WITH_QEMU=0); skipping QEMU guest architectures" >&2
+endif
 
-install: build-qemu
+install: $(INSTALL_DEPS)
 	cd "./src" && \
 		make $(MAKE_ARGS) $(MAKE_ARGS_ADD) \
 			PREFIX=distrib install
+ifeq ($(QEMU_ENABLED),1)
 	@set -e; \
 	mkdir -p src/distrib/bin; \
 	for arch in $(QEMU_ARCHS); do \
@@ -95,5 +126,8 @@ install: build-qemu
 		install -m 755 "$(QEMU_ARCH_STAGE)/$$arch/afl-qemu-bridge" \
 			"src/distrib/bin/afl-qemu-bridge-$$arch"; \
 	done
+else
+	@echo "[!] QEMU support disabled (WITH_QEMU=0); skipping arch-suffixed QEMU install" >&2
+endif
 
 .PHONY: help src prepare patch submodules build build-qemu install qemu-archs
