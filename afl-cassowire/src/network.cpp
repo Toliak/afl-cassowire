@@ -606,10 +606,11 @@ SendResult send_all(int sock, const uint8_t* buf, size_t len, int timeout_ms) {
     return std::monostate{};
 }
 
-// TODO(claude): unverified against a live server (not run, per the testing policy): reading "until EOF
-//   or timeout" against a keep-alive server (nginx) may burn the full timeout_ms per iteration if the
-//   server ignores the half-close (shutdown(SHUT_WR) in exchange_once), capping throughput at
-//   1000/timeout_ms exec/s (5/s with a 200 ms timeout).
+// NOTE (known limitation): reading "until EOF or timeout" against a keep-alive
+//   server (nginx) may burn the full timeout_ms per iteration if the server ignores
+//   the half-close (shutdown(SHUT_WR) in exchange_once), capping throughput at
+//   1000/timeout_ms exec/s (5/s with a 200 ms timeout). See "Known limitations" in
+//   AGENTS.md; the already-received bytes are still returned as a partial response.
 WaitResult wait_response(int sock, int timeout_ms) {
     std::vector<uint8_t> data;
     uint8_t buf[4096];

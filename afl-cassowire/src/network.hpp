@@ -215,6 +215,11 @@ namespace network {
      * response is still data). A timeout with no data at all, a poll() failure
      * or a recv() failure is a WaitError. EINTR on poll()/recv() is retried.
      *
+     * Note (known limitation): a keep-alive server that ignores the client
+     * half-close may keep the connection open after a complete response, so this
+     * call can consume up to timeout_ms per exchange (throughput roughly
+     * 1000/timeout_ms exec/s). See "Known limitations" in AGENTS.md.
+     *
      * @param sock The socket file descriptor.
      * @param timeout_ms The timeout in milliseconds.
      * @return WaitResult The received bytes, or a WaitError describing the failure.

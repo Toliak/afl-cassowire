@@ -281,6 +281,20 @@ are ignored helper-anchor fields (see Important details).
   binary-only fuzzing. See `default.qemu.yaml` for configuration examples and instructions
   on switching between them.
 
+## Known limitations
+- `network::wait_response()` reads until the peer closes the connection (EOF) or
+  `network.timeout_ms` expires. A keep-alive server (nginx) that ignores the
+  half-close (`shutdown(SHUT_WR)` in `exchange_once`) may keep the connection open
+  after sending a complete response; the read then burns up to the full
+  `timeout_ms` per iteration, capping throughput at roughly `1000/timeout_ms`
+  exec/s per proxy (5/s at the default 200 ms; 10/s at 100 ms). The bytes already
+  received are still returned as a partial response, so this shows up as slowness
+  plus the "response took >= timeout_ms" WARN rather than an error. Mitigate by
+  disabling/limiting target keep-alive (e.g. `Connection: close`) or keeping
+  `timeout_ms` short; protocol-aware response framing (HTTP Content-Length /
+  chunked) would be the proper fix. `probe_target()` uses the same half-close
+  pattern for its throwaway connection.
+
 ## Review markers
 Existing review notes are tagged `TODO(claude): ...` (see `grep -rn "TODO(claude)" src/`).
 They mark real, still-open issues; resolved notes are deleted rather than kept as
