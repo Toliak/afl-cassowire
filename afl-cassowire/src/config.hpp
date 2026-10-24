@@ -34,6 +34,12 @@ struct TargetConfig {
     };
     std::unordered_map<std::string, std::string> env;  // Environment variables for target
     EnvPreserveLevel env_preserve = EnvPreserveLevel::afl_only;  // How to handle parent environment
+    // Optional path the proxy opens (read-only) before fork and wires to the
+    // target's stdin (fd 0). The proxy never reads or writes it: this only
+    // satisfies targets that require a specific file - typically a fifo
+    // created by the surrounding setup - on their stdin. When absent, stdin
+    // stays /dev/null. The map-size pass keeps /dev/null regardless.
+    std::optional<std::string> stdin_path;
 };
 
 struct NetworkConfig {

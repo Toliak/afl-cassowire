@@ -14,6 +14,7 @@ import platform
 import re
 import socket
 import subprocess
+import threading
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -73,10 +74,14 @@ def write_config(
     port: int,
     payload: dict[str, str] | None = None,
     primary: str = "procfs",
+    stdin_path: str | None = None,
 ) -> Path:
     """Write a config for the test-target; target_args is the full argv (binary first)."""
+    target_section: dict[str, Any] = {"binary": target_args[0], "args": target_args}
+    if stdin_path is not None:
+        target_section["stdin_path"] = stdin_path
     config: dict[str, Any] = {
-        "target": {"binary": target_args[0], "args": target_args},
+        "target": target_section,
         "network": {
             "host": "127.0.0.1",
             "port": port,
@@ -91,6 +96,24 @@ def write_config(
     path = tmp_path / "cassowire.yaml"
     path.write_text(yaml.safe_dump(config, sort_keys=False), encoding="utf-8")
     return path
+
+
+def wire_stdin_fifo(fifo: Path, payload: bytes) -> threading.Thread:
+    """Write payload into a fifo as soon as a reader appears (the proxy's open).
+
+    open('wb') blocks until the proxy's read end exists, so the thread must be
+    started before the proxy runs. Daemonized: when a run fails before the
+    proxy ever opens the fifo, the blocked open must not wedge pytest.
+    """
+
+    def run() -> None:
+        with open(fifo, "wb") as writer:
+            writer.write(payload)
+            writer.flush()
+
+    thread = threading.Thread(target=run, daemon=True)
+    thread.start()
+    return thread
 
 
 @dataclass(frozen=True)

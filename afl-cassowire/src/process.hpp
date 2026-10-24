@@ -67,7 +67,7 @@ namespace process {
 
     /**
      * @brief Prepared target execution environment (argv, envp) built in the parent before fork().
-     * 
+     *
      * All pointers in argv and envp are valid across fork() because they point into
      * owned storage (argv points into cfg.target.args, envp points into env_strings).
      * No heap allocations occur in the child between fork() and execve().
@@ -76,6 +76,13 @@ namespace process {
         std::vector<char*> argv;          // nullptr-terminated; points into cfg.target.args
         std::vector<std::string> env_strings; // owns environment strings
         std::vector<char*> envp;          // nullptr-terminated; points into env_strings
+        // Descriptor for cfg.target.stdin_path, opened by prepare_target()
+        // (ProxyMode/PlainTest only - MapSizePass never opens it, so an
+        // external fifo writer cannot deliver data a pass that never reads
+        // stdin would lose) and dup2()ed onto the child's fd 0 by
+        // fork_target(); -1 when stdin_path is unset. fork_target() closes the
+        // parent's copy after the fork, so this field is invalid afterwards.
+        int stdin_fd = -1;
     };
 
     /**
@@ -94,7 +101,8 @@ namespace process {
      * 
      * @param cfg global configuration
      * @param mode selects which environment variations to apply (e.g. AFL_DUMP_MAP_SIZE for MapSizePass)
-     * @return TargetPrepared on success, std::nullopt on failure (e.g. pipe creation for MapSizePass)
+     * @return TargetPrepared on success, std::nullopt on failure (e.g. pipe creation for
+     *         MapSizePass or an unopenable target.stdin_path)
      */
     std::optional<TargetPrepared> prepare_target(const Config& cfg, SpawnMode mode);
 
@@ -104,7 +112,10 @@ namespace process {
      *
      * The child never returns; on success it execve()s the target binary.
      *
-     * Stdin is always redirected to /dev/null. The child's stdout/stderr are
+     * Stdin comes from cfg.target.stdin_path when set (opened by
+     * prepare_target(), handed over via TargetPrepared::stdin_fd); otherwise
+     * it is /dev/null. MapSizePass always keeps /dev/null on stdin. The
+     * child's stdout/stderr are
      * forwarded to the proxy's descriptors when @p forward_output is true,
      * and sent to /dev/null otherwise. MapSizePass ignores @p forward_output:
      * its stdout is a pipe carrying the map size and its stderr goes to

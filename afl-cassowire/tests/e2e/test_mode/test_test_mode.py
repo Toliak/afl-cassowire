@@ -12,6 +12,7 @@ harness.cassowire_bin / harness.test_target_bin for the exact paths); missing
 binaries fail instead of being built.
 """
 
+import os
 import sys
 from pathlib import Path
 
@@ -134,3 +135,73 @@ def test_single_iteration_http(tmp_path: Path) -> None:
     res = harness.run_cassowire(config, "test", "--input", str(input_file))
     response = b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nOK"
     assert_single_iteration_pass(res, response)
+
+
+STDIN_MARKER = "cassowire-stdin-e2e"
+
+
+def _start_stdin_fifo(tmp_path: Path, payload: bytes) -> Path:
+    """Create the fifo and start the writer thread for the stdin_path cases."""
+    fifo = tmp_path / "stdin.fifo"
+    os.mkfifo(fifo)
+    harness.wire_stdin_fifo(fifo, payload)
+    return fifo
+
+
+def test_stdin_path_fifo_wiring(tmp_path: Path) -> None:
+    # target.stdin_path wires the fifo to the target's fd 0: the --stdin-marker
+    # canary must arrive there (any mismatch aborts the target) and the calc
+    # serving continues normally.
+    target = harness.test_target_bin()
+    port = harness.free_port()
+    fifo = _start_stdin_fifo(tmp_path, (STDIN_MARKER + "\n").encode())
+    config = harness.write_config(
+        tmp_path,
+        target_args=[str(target), "calc", "--port", str(port), "--stdin-marker", STDIN_MARKER],
+        port=port,
+        stdin_path=str(fifo),
+    )
+    input_file = tmp_path / "input.bin"
+    input_file.write_bytes(CALC_INPUT)
+    res = harness.run_cassowire(config, "test", "--input", str(input_file))
+    assert_dump_map_pass(res, target)
+    assert_single_iteration_pass(res, CALC_RESPONSE)
+
+
+def test_stdin_path_fifo_marker_mismatch_fails(tmp_path: Path) -> None:
+    # The canary proves the wiring is real: when the fifo carries a different
+    # line than --stdin-marker expects, the target aborts before binding and
+    # the run must fail instead of silently ignoring fd 0.
+    target = harness.test_target_bin()
+    port = harness.free_port()
+    fifo = _start_stdin_fifo(tmp_path, b"something-else\n")
+    config = harness.write_config(
+        tmp_path,
+        target_args=[str(target), "calc", "--port", str(port), "--stdin-marker", STDIN_MARKER],
+        port=port,
+        stdin_path=str(fifo),
+    )
+    input_file = tmp_path / "input.bin"
+    input_file.write_bytes(CALC_INPUT)
+    res = harness.run_cassowire(config, "test", "--input", str(input_file))
+    assert res.returncode != 0, res.detail()
+    assert "Pass 2 (Single Iteration) completed successfully." not in res.stdout, res.detail()
+
+
+def test_stdin_path_missing_file_fails(tmp_path: Path) -> None:
+    # An unopenable stdin_path aborts at the Pass 2 prepare step (the
+    # map-size pass never opens the path) with a clear error.
+    target = harness.test_target_bin()
+    port = harness.free_port()
+    config = harness.write_config(
+        tmp_path,
+        target_args=[str(target), "calc", "--port", str(port)],
+        port=port,
+        stdin_path=str(tmp_path / "does-not-exist.fifo"),
+    )
+    input_file = tmp_path / "input.bin"
+    input_file.write_bytes(CALC_INPUT)
+    res = harness.run_cassowire(config, "test", "--input", str(input_file))
+    assert res.returncode != 0, res.detail()
+    assert "failed to open target.stdin_path" in res.stdout, res.detail()
+    assert "Pass 2 (Single Iteration) completed successfully." not in res.stdout, res.detail()

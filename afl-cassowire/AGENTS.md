@@ -129,10 +129,18 @@ are ignored helper-anchor fields (see Important details).
   from `exchange_once` and the network poll loops for the target's whole life
   (worst-case stall for the target = one poll leg). Both detection methods and
   the procfs path poll `waitpid(WNOHANG)` and report `TargetDied`.
-- Stdio redirection differs per mode: stdin always → `/dev/null`; the target's
+- Stdio redirection differs per mode: stdin comes from `target.stdin_path` when
+  set (opened read-only in `prepare_target()` with `O_NONBLOCK|O_CLOEXEC`, the
+  nonblocking flag cleared again so the target's reads block like regular
+  stdin, then `dup2`ed onto the child's fd 0 by `fork_target()`; the proxy
+  never reads or writes it — the surrounding setup creates and feeds the file,
+  typically a fifo), else `/dev/null`; the target's
   stdout/stderr go to `/dev/null` by default and are forwarded to the proxy's fds with
   `--child-output` (both proxy and test pass 2). MapSizePass always pipes stdout (map
-  size protocol) and sends stderr to `/dev/null`; the flag does not affect it.
+  size protocol) and sends stderr to `/dev/null`; the flag does not affect it, and it
+  ignores `stdin_path` entirely (never opens it: a Pass 1 reader would unblock an
+  external fifo writer whose buffered data no pass reads, and the map-size dump never
+  touches stdin).
 - Logging is spdlog → stdout (logger `proxy`, `flush_on(warn)` so messages survive the
   proxy's own `raise(SIGSEGV)`), runtime level via `--log-level`. Never log via spdlog
   between `fork()` and `execve()` — the pre-exec child reports failures with raw
@@ -259,7 +267,7 @@ are ignored helper-anchor fields (see Important details).
 - `src/afl_compat.h` (not `.hpp`) defines *no-op* AFL++ macros instead of `#error`-ing;
   the "must use an AFL++ compiler" enforcement lives in the `meson.build` compiler
   probe. Don't add an `#error` guard to the header.
-- Config keys added after the original design: `target.env`, `target.env_preserve`, `payload.*`,
+- Config keys added after the original design: `target.env`, `target.env_preserve`, `target.stdin_path`, `payload.*`,
   `afl.cov_discard_init`, `afl.dump_history`, `afl.msg_log_level`,
   `target_cmplog.*`, `network_cmplog.*`, and the required
   `AFL_CASSOWIRE_FORCE_FINAL_LOC` env var. `target_cmplog`/`network_cmplog` are standalone

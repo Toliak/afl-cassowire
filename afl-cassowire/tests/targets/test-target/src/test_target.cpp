@@ -12,6 +12,7 @@
 #include <vector>
 
 #include <netinet/in.h>
+#include <poll.h>
 #include <signal.h>
 #include <sys/socket.h>
 #include <sys/time.h>
@@ -40,6 +41,7 @@ struct Options {
     bool ignore_sigterm = false;
     bool keep_alive = false;
     bool with_crash = false;
+    std::string stdin_marker;  // empty: never touch stdin
 };
 
 [[noreturn]] void fatal(const std::string& message) {
@@ -110,6 +112,12 @@ Options parse_options(int argc, char* argv[]) {
         .default_value(false)
         .implicit_value(true);
 
+    program.add_argument("--stdin-marker")
+        .help("read one newline-terminated line from stdin before binding and "
+              "require it to equal this string (exercises fd-0 wiring, e.g. a "
+              "fifo passed by afl-cassowire's target.stdin_path)")
+        .default_value(std::string(""));
+
     try {
         program.parse_args(argc, argv);
     } catch (const std::exception& err) {
@@ -142,6 +150,7 @@ Options parse_options(int argc, char* argv[]) {
     opts.ignore_sigterm = program.get<bool>("--ignore-sigterm");
     opts.keep_alive = program.get<bool>("--keep-alive");
     opts.with_crash = program.get<bool>("--with-crash");
+    opts.stdin_marker = program.get<std::string>("--stdin-marker");
     return opts;
 }
 
@@ -379,10 +388,45 @@ void handle_connection(int fd, const Options& opts) {
     }
 }
 
+// Reads one newline-terminated line from fd 0 (bounded, with a poll timeout)
+// and requires it to equal @p expected. Used to prove that a specific file -
+// typically a fifo wired by afl-cassowire's target.stdin_path - really is our
+// stdin: a missing, late, or different first line aborts the target.
+void consume_stdin_marker(const std::string& expected) {
+    constexpr int kStdinWaitMs = 10000;
+    std::string line;
+    char buffer[1];
+    while (line.size() < kMaxRequestBytes) {
+        pollfd pfd{STDIN_FILENO, POLLIN, 0};
+        const int ready = poll(&pfd, 1, kStdinWaitMs);
+        if (ready <= 0) {
+            fatal("stdin marker: no data on stdin within " + std::to_string(kStdinWaitMs) + " ms");
+        }
+        const ssize_t received = read(STDIN_FILENO, buffer, 1);
+        if (received < 0) {
+            if (errno == EINTR) {
+                continue;
+            }
+            fatal(std::string("stdin marker read: ") + std::strerror(errno));
+        }
+        if (received == 0 || buffer[0] == '\n') {
+            break;
+        }
+        line.push_back(buffer[0]);
+    }
+    if (line != expected) {
+        fatal("stdin marker mismatch: expected '" + expected + "', got '" + line + "'");
+    }
+}
+
 } // namespace
 
 int main(int argc, char* argv[]) {
     const Options opts = parse_options(argc, argv);
+
+    if (!opts.stdin_marker.empty()) {
+        consume_stdin_marker(opts.stdin_marker);
+    }
 
     signal(SIGPIPE, SIG_IGN);
     if (opts.ignore_sigterm) {

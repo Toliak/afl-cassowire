@@ -594,15 +594,47 @@ std::optional<TargetPrepared> prepare_target(const Config& cfg, SpawnMode mode) 
         }
     }
 
+    // Open the configured stdin path (target.stdin_path) in the parent, before
+    // fork(), so failures surface with normal logging instead of the pre-exec
+    // dprintf path. The descriptor is handed to fork_target() via
+    // TargetPrepared::stdin_fd and dup2()ed onto the child's fd 0 there.
+    // MapSizePass deliberately skips this: opening the path would create a
+    // fifo reader during test-mode Pass 1, which (a) unblocks an external
+    // writer so its data lands in the fifo buffer that Pass 1 never reads -
+    // and when Pass 1's fds close, buffered data may be discarded - and (b)
+    // serves no purpose, since the map-size dump never touches stdin.
+    // O_NONBLOCK keeps the open itself from parking on a fifo that has no
+    // writer yet; the flag is cleared right away so the target's read()s
+    // behave like regular blocking stdin. O_CLOEXEC is hygiene for the
+    // parent's copy; the child's dup onto fd 0 clears it.
+    int stdin_fd = -1;
+    if (mode != SpawnMode::MapSizePass && cfg.target.stdin_path) {
+        stdin_fd = open(cfg.target.stdin_path->c_str(), O_RDONLY | O_NONBLOCK | O_CLOEXEC);
+        if (stdin_fd < 0) {
+            PROXY_LOG_ERROR("failed to open target.stdin_path '{}': {}",
+                            *cfg.target.stdin_path, strerror(errno));
+            return std::nullopt;
+        }
+        const int flags = fcntl(stdin_fd, F_GETFL);
+        if (flags >= 0) {
+            (void)fcntl(stdin_fd, F_SETFL, flags & ~O_NONBLOCK);
+        }
+        PROXY_LOG_DEBUG("target stdin wired to {}", *cfg.target.stdin_path);
+    }
+
     return TargetPrepared{
         .argv = std::move(c_args),
         .env_strings = std::move(c_env_strings),
         .envp = std::move(c_env),
+        .stdin_fd = stdin_fd,
     };
 }
 
-// Helper to redirect file descriptors in the child according to the mode
-static void redirect_child_fds(SpawnMode mode, bool forward_output, int pipe_write_fd) {
+// Helper to redirect file descriptors in the child according to the mode.
+// stdin_fd is the prepared target.stdin_path descriptor (-1 when unset and
+// for MapSizePass, which never opens it): ProxyMode/PlainTest dup2() it onto
+// fd 0 (and close the original).
+static void redirect_child_fds(SpawnMode mode, bool forward_output, int pipe_write_fd, int stdin_fd) {
     if (mode == SpawnMode::MapSizePass) {
         // Map size pass: child stdout -> pipe, stderr and stdin -> /dev/null
         dup2(pipe_write_fd, STDOUT_FILENO);
@@ -615,15 +647,21 @@ static void redirect_child_fds(SpawnMode mode, bool forward_output, int pipe_wri
             close(devnull);
         }
     } else {
-        // ProxyMode and PlainTest: stdin -> /dev/null; stdout/stderr either
+        // ProxyMode and PlainTest: stdin comes from target.stdin_path when
+        // prepared, else /dev/null; stdout/stderr either
         // forwarded to the proxy's descriptors (--child-output) or discarded.
-        int devnull = open("/dev/null", O_RDONLY);
-        if (devnull >= 0) {
-            dup2(devnull, STDIN_FILENO);
-            close(devnull);
+        if (stdin_fd >= 0) {
+            dup2(stdin_fd, STDIN_FILENO);
+            close(stdin_fd);
+        } else {
+            int devnull = open("/dev/null", O_RDONLY);
+            if (devnull >= 0) {
+                dup2(devnull, STDIN_FILENO);
+                close(devnull);
+            }
         }
         if (!forward_output) {
-            devnull = open("/dev/null", O_WRONLY);
+            const int devnull = open("/dev/null", O_WRONLY);
             if (devnull >= 0) {
                 dup2(devnull, STDOUT_FILENO);
                 dup2(devnull, STDERR_FILENO);
@@ -646,6 +684,9 @@ SpawnedTarget fork_target(const Config& cfg, const TargetPrepared& prep, SpawnMo
     int sv[2] = {-1, -1};
     if (use_notif) {
         if (socketpair(AF_UNIX, SOCK_DGRAM, 0, sv) != 0) {
+            if (prep.stdin_fd >= 0) {
+                close(prep.stdin_fd);
+            }
             PROXY_LOG_ERROR("socketpair for seccomp listener handoff failed: {}", strerror(errno));
             return SpawnedTarget{-1, -1};
         }
@@ -657,6 +698,9 @@ SpawnedTarget fork_target(const Config& cfg, const TargetPrepared& prep, SpawnMo
             if (use_notif) {
                 close(sv[0]);
                 close(sv[1]);
+            }
+            if (prep.stdin_fd >= 0) {
+                close(prep.stdin_fd);
             }
             PROXY_LOG_ERROR("failed to create pipe for map size extraction");
             return SpawnedTarget{-1, -1};
@@ -672,6 +716,9 @@ SpawnedTarget fork_target(const Config& cfg, const TargetPrepared& prep, SpawnMo
         if (use_notif) {
             close(sv[0]);
             close(sv[1]);
+        }
+        if (prep.stdin_fd >= 0) {
+            close(prep.stdin_fd);
         }
         PROXY_LOG_ERROR("fork() failed: {}", strerror(errno));
         return SpawnedTarget{-1, -1};
@@ -707,7 +754,8 @@ SpawnedTarget fork_target(const Config& cfg, const TargetPrepared& prep, SpawnMo
 
         // Redirect file descriptors according to the mode
         redirect_child_fds(mode, forward_output,
-                           (mode == SpawnMode::MapSizePass) ? pipefd[1] : -1);
+                           (mode == SpawnMode::MapSizePass) ? pipefd[1] : -1,
+                           prep.stdin_fd);
 
         // Put child in a new process group, making it the leader
         if (setpgid(0,0) == -1) {
@@ -768,6 +816,12 @@ SpawnedTarget fork_target(const Config& cfg, const TargetPrepared& prep, SpawnMo
     }
 
     // Parent: we have successfully forked
+
+    // Close our copy of the stdin_path descriptor: the child owns the dup on
+    // its fd 0 now (it is -1 for MapSizePass, which never opens the path).
+    if (prep.stdin_fd >= 0) {
+        close(prep.stdin_fd);
+    }
 
     // Close the write end of the pipe in the parent (we only read from it)
     if (mode == SpawnMode::MapSizePass) {

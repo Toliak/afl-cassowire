@@ -212,6 +212,13 @@ CASES: list[Case] = [
         # port_detection.verify_ownership: false - disables the procfs inode ownership check.
         lambda: base_config(port_detection=port_detection_block(verify_ownership=False)),
     ),
+    Case(
+        "valid_target_stdin_path",
+        True,
+        # target.stdin_path wires a caller-provided file (e.g. a fifo the
+        # surrounding setup creates) to the target's fd 0.
+        lambda: base_config(target=target_block(stdin_path="/run/target/in.fifo")),
+    ),
     # ------------------------------- must fail -------------------------------
     Case(
         "invalid_afl_loop_count_zero",
@@ -417,6 +424,19 @@ CASES: list[Case] = [
         False,
         # target.binary is required.
         lambda: {"target": {"args": ["./target"]}, "network": network_block()},
+    ),
+    Case(
+        "invalid_target_stdin_path_type",
+        False,
+        # stdin_path must be a string; a numeric scalar is rejected even
+        # though yaml-cpp's as<string> would stringify it.
+        lambda: base_config(target=target_block(stdin_path=42)),
+    ),
+    Case(
+        "invalid_target_stdin_path_empty",
+        False,
+        # stdin_path must be a non-empty path.
+        lambda: base_config(target=target_block(stdin_path="")),
     ),
     Case(
         "invalid_unknown_root_key",

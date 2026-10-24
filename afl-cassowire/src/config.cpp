@@ -165,7 +165,7 @@ void resolve_merge_keys(YAML::Node& node, const std::string& path) {
 // are standalone: no values are inherited from any other section.
 // Returns a ConfigError with an empty message on success.
 ConfigError parse_target_section(const YAML::Node& node, const std::string& prefix, TargetConfig& out) {
-    static const std::unordered_set<std::string> target_allowed = {"binary", "args", "env", "env_preserve"};
+    static const std::unordered_set<std::string> target_allowed = {"binary", "args", "env", "env_preserve", "stdin_path"};
     ConfigError err = check_unknown_keys(node, target_allowed, prefix);
     if (!err.message.empty()) {
         return err;
@@ -221,6 +221,20 @@ ConfigError parse_target_section(const YAML::Node& node, const std::string& pref
         } else {
             return ConfigError{prefix + ".env_preserve", "Invalid enum value", "nothing, afl_only, or all", env_preserve};
         }
+    }
+
+    if (node["stdin_path"]) {
+        if (!node["stdin_path"].IsScalar()) {
+            return ConfigError{prefix + ".stdin_path", "Invalid type", "string", "not a string"};
+        }
+        std::string stdin_path = node["stdin_path"].as<std::string>();
+        if (stdin_path.empty()) {
+            return ConfigError{prefix + ".stdin_path", "Must not be empty", "non-empty path", "empty string"};
+        }
+        // Existence is deliberately not checked here: the file (e.g. a fifo)
+        // may be created by the surrounding setup after the config is loaded.
+        // An unopenable path fails at spawn time with a clear error instead.
+        out.stdin_path = stdin_path;
     }
 
     return ConfigError{"", "", "", ""}; // no error

@@ -95,6 +95,11 @@
           "enum": ["nothing", "afl_only", "all"],
           "default": "afl_only",
           "description": "Parent environment inheritance: \"nothing\" (no vars), \"afl_only\" (PATH plus the AFL vars __AFL_SHM_ID, __AFL_CMPLOG_SHM_ID, ___AFL_EINS_ZWEI_POLIZEI___, AFL_DEBUG, AFL_DEBUG_CHILD, AFL_MAP_SIZE, AFL_NO_UI, AFL_QEMU_COMPCOV_DEBUG, AFL_QEMU_CMPLOG_DEBUG, AFL_QEMU_MAP_SIZE), or \"all\" (entire parent environment)."
+        },
+        "stdin_path": {
+          "type": "string",
+          "minLength": 1,
+          "description": "Optional path the proxy opens (read-only, non-blocking open with the flag cleared again afterwards) before fork and wires to the target's stdin (fd 0). Pure plumbing: the proxy never reads or writes it; it only satisfies targets that require a specific file on stdin - typically a fifo the surrounding setup creates and feeds. Must be non-empty; existence is checked at spawn time (an unopenable path aborts startup with a clear error). When absent, stdin stays /dev/null. The map-size pass always keeps /dev/null on stdin."
         }
       }
     },

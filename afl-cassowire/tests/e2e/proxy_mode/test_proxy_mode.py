@@ -11,12 +11,22 @@ tracks the fuzzed input.
 
 from __future__ import annotations
 
+import os
 import sys
 from collections.abc import Callable
+from pathlib import Path
 
 import pytest
 from emul import CMP_MAP_H, CMP_MAP_SIZE, CMP_MAP_W, CMP_OPERANDS_SIZE
-from runner import ProxyRun, seccomp_supported, skip_unless_shm_available
+from runner import (
+    ProxyRun,
+    free_port,
+    run_proxy_mode,
+    seccomp_supported,
+    skip_unless_shm_available,
+    wire_stdin_fifo,
+    write_config,
+)
 
 pytestmark = [
     pytest.mark.skipif(sys.platform != "linux", reason="proxy-mode e2e requires Linux (SysV shmem, forkserver fds)"),
@@ -108,6 +118,25 @@ def test_seccomp_port_detection(proxy_runner: Callable[..., ProxyRun]) -> None:
     if not seccomp_supported():
         pytest.skip("SECCOMP_RET_USER_NOTIF port detection needs kernel >= 5.0")
     run = proxy_runner("calc", "calc/set1", primary="seccomp")
+    _assert_clean_run(run)
+
+
+def test_stdin_path_fifo_wiring(tmp_path: Path) -> None:
+    # target.stdin_path wires a fifo to the target's fd 0 for the whole
+    # persistent run: the --stdin-marker canary must arrive there (any
+    # mismatch aborts the target before it binds, which fails the run).
+    marker = "cassowire-stdin-e2e"
+    fifo = tmp_path / "stdin.fifo"
+    os.mkfifo(fifo)
+    wire_stdin_fifo(fifo, (marker + "\n").encode())
+    config = write_config(
+        tmp_path,
+        mode="calc",
+        port=free_port(),
+        stdin_path=str(fifo),
+        target_extra_args=["--stdin-marker", marker],
+    )
+    run = run_proxy_mode(tmp_path / "run", config, "calc/set1")
     _assert_clean_run(run)
 
 

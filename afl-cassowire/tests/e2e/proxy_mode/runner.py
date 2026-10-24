@@ -17,6 +17,7 @@ import platform
 import socket
 import subprocess
 import sys
+import threading
 import zlib
 from dataclasses import dataclass
 from pathlib import Path
@@ -91,6 +92,8 @@ def write_config(
     primary: str = "procfs",
     loop_count: int = LOOP_COUNT,
     payload: dict[str, str] | None = None,
+    stdin_path: str | None = None,
+    target_extra_args: list[str] | None = None,
 ) -> Path:
     """Write a proxy-mode config for the test-target (calc or http mode).
 
@@ -109,11 +112,14 @@ def write_config(
         "initial_ms": INITIAL_MS,
         "probe": True,
     }
+    target_section: dict[str, Any] = {
+        "binary": normal_binary,
+        "args": [normal_binary, mode, "--port", str(port)] + (target_extra_args or []),
+    }
+    if stdin_path is not None:
+        target_section["stdin_path"] = stdin_path
     config: dict[str, Any] = {
-        "target": {
-            "binary": normal_binary,
-            "args": [normal_binary, mode, "--port", str(port)],
-        },
+        "target": target_section,
         "network": network,
         "afl": {"loop_count": loop_count, "enable_cmplog": cmplog},
         "port_detection": {"primary": primary},
@@ -131,6 +137,24 @@ def write_config(
     path = tmp_path / "cassowire.yaml"
     path.write_text(yaml.safe_dump(config, sort_keys=False), encoding="utf-8")
     return path
+
+
+def wire_stdin_fifo(fifo: Path, payload: bytes) -> threading.Thread:
+    """Write payload into a fifo as soon as a reader appears (the proxy's open).
+
+    open('wb') blocks until the proxy's read end exists, so the thread must be
+    started before the proxy runs. Daemonized: when a run fails before the
+    proxy ever opens the fifo, the blocked open must not wedge pytest.
+    """
+
+    def run() -> None:
+        with open(fifo, "wb") as writer:
+            writer.write(payload)
+            writer.flush()
+
+    thread = threading.Thread(target=run, daemon=True)
+    thread.start()
+    return thread
 
 
 @dataclass(frozen=True)

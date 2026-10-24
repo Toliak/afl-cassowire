@@ -39,6 +39,13 @@ target:
                                # AFL_DEBUG, AFL_DEBUG_CHILD, AFL_MAP_SIZE,
                                # AFL_NO_UI, AFL_QEMU_COMPCOV_DEBUG,
                                # AFL_QEMU_CMPLOG_DEBUG, AFL_QEMU_MAP_SIZE), or "all"
+  # stdin_path: /run/tgt/in.fifo  # Optional: opened read-only before fork and
+                               # wired to the target's stdin (fd 0). Pure
+                               # plumbing - the proxy never reads or writes it;
+                               # your setup creates and feeds the file (e.g. a
+                               # fifo). Non-fifo, absent, or unopenable paths
+                               # abort startup with a clear error. Without it,
+                               # stdin stays /dev/null.
 
 network: &net
   host: "127.0.0.1"            # TCP host to connect to
