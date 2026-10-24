@@ -524,8 +524,8 @@ std::optional<TargetPrepared> prepare_target(const Config& cfg, SpawnMode mode) 
         {
             const std::vector<std::string> conditional_vars = {
                 "PATH", "__AFL_SHM_ID", "__AFL_CMPLOG_SHM_ID", "___AFL_EINS_ZWEI_POLIZEI___",
-                "AFL_DEBUG", "AFL_DEBUG_CHILD", "AFL_NO_UI", "AFL_QEMU_COMPCOV_DEBUG",
-                "AFL_QEMU_CMPLOG_DEBUG", "AFL_QEMU_MAP_SIZE",
+                "AFL_DEBUG", "AFL_DEBUG_CHILD", "AFL_MAP_SIZE", "AFL_NO_UI",
+                "AFL_QEMU_COMPCOV_DEBUG", "AFL_QEMU_CMPLOG_DEBUG", "AFL_QEMU_MAP_SIZE",
             };
             for (const auto& var : conditional_vars) {
                 const char* value = getenv(var.c_str());
