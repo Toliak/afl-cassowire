@@ -229,7 +229,6 @@ ExchangeOutcome exchange_once(const Config& cfg, const uint8_t* input, size_t in
     }
     utils::FdGuard sock = std::get<utils::FdGuard>(std::move(conn));
     // The socket is closed when `sock` goes out of scope at the end.
-    network::pump_notif_listener();
 
     t_stage = utils::get_time_ms();
     if (auto send_res = network::send_all(sock.get(), payload_buf.data(), payload_buf.size(), cfg.network.timeout_ms);
@@ -256,7 +255,6 @@ ExchangeOutcome exchange_once(const Config& cfg, const uint8_t* input, size_t in
     // of iterations/s that accumulation used to exhaust the local port range
     // and made later connect()s (including the probe) fail with EADDRNOTAVAIL.
     network::arm_rst_on_close(sock.get());
-    network::pump_notif_listener();
     return out;
 }
 
