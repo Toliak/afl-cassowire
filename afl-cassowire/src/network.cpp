@@ -354,6 +354,71 @@ bool procfs_port_listening(int target_port) {
     return false;
 }
 
+// Post-detection drain pacing: answer the target's remaining startup
+// bind()/listen() notifications until the listener fd stays idle for this
+// many consecutive polls of this length, never longer than the overall bound.
+constexpr int kNotifDrainPollMs = 25;
+constexpr int kNotifDrainIdlePolls = 2;
+constexpr int kNotifDrainBoundMs = 400;
+
+// Releases startup notifications that are still queued behind the configured
+// port's listen(): after readiness is confirmed, the target's main thread
+// typically issues more bind()/listen() pairs (e.g. nginx binds 8080 first,
+// then 8443 tcp+udp for its TLS/QUIC listeners), and each notification keeps
+// the notifying task suspended in the kernel until we answer it. The steady-
+// state pump only drains notifications that are already queued when it runs,
+// so whether it also catches the target's NEXT bind()/listen() is a
+// microsecond-scale race (thread wake-up vs the pump's poll(0) turnaround)
+// that CPU affinity and load decide either way; a target whose whole startup
+// bind/listen chain has not finished cannot start its event loop, so the
+// first request sits unread in the accepted socket and every response/probe
+// window burns out (abort_proxy -> AFL respawn, dry-run abort per seed).
+// Answering here until the listener fd goes idle therefore closes the race
+// deterministically instead of hoping the pump wins it. Best-effort and
+// bounded: any listener error just ends the drain early, keeping at most the
+// old racy behavior for that case.
+void drain_notif_idle(int notif_fd) {
+    const NotifBuffers& nb = notif_buffers();
+    if (notif_fd < 0 || nb.req_size == 0) return;
+
+    std::vector<unsigned char> buf(nb.req_size);
+    int idle_polls = 0;
+    for (int waited_ms = 0; waited_ms < kNotifDrainBoundMs && idle_polls < kNotifDrainIdlePolls;
+         waited_ms += kNotifDrainPollMs) {
+        struct pollfd pfd = { notif_fd, POLLIN, 0 };
+        const int pr = poll(&pfd, 1, kNotifDrainPollMs);
+        if (pr < 0) {
+            if (errno == EINTR) continue;
+            break;  // listener fd broken: nothing left to answer
+        }
+        if (pr == 0) {
+            idle_polls++;
+            continue;
+        }
+        if (pfd.revents & (POLLHUP | POLLERR | POLLNVAL)) {
+            break;  // no task references the listener anymore: tree gone
+        }
+        if (!(pfd.revents & POLLIN)) {
+            idle_polls++;
+            continue;
+        }
+
+        std::memset(buf.data(), 0, buf.size());
+        struct seccomp_notif* n = reinterpret_cast<struct seccomp_notif*>(buf.data());
+        if (ioctl(notif_fd, SECCOMP_IOCTL_NOTIF_RECV, n) != 0) {
+            break;  // EAGAIN/spurious readiness: treat as drained
+        }
+        const char* what = (n->data.nr == __NR_bind) ? "bind" :
+                           (n->data.nr == __NR_listen) ? "listen" : "traced syscall";
+        PROXY_LOG_DEBUG("post-detection drain: released pending {} (tid {})",
+                        what, static_cast<int>(n->pid));
+        if (!notif_send_continue(notif_fd, *n)) {
+            break;  // task is gone (ENOENT): nothing left to answer
+        }
+        idle_polls = 0;
+    }
+}
+
 DetectResult notif_port(int notif_fd, pid_t target_pid, int target_port, uint64_t timeout_ms) {
     const NotifBuffers& nb = notif_buffers();
     if (notif_fd < 0 || nb.req_size == 0) {
@@ -445,6 +510,10 @@ DetectResult notif_port(int notif_fd, pid_t target_pid, int target_port, uint64_
                 if (procfs_port_listening(target_port)) {
                     PROXY_LOG_INFO("target is listening on port {} (via seccomp user-notification)",
                                    target_port);
+                    // The configured port is up, but the target may still have
+                    // startup binds queued behind it; release them (bounded,
+                    // until the listener goes idle) before the first exchange.
+                    drain_notif_idle(notif_fd);
                     return std::monostate{};
                 }
                 utils::sleep_ms(5);
@@ -483,6 +552,18 @@ void pump_notif_listener() {
     if (nb.req_size == 0) return;
 
     static std::vector<unsigned char> buf(nb.req_size);  // proxy is single-threaded
+    // TODO(claude): poll(0) only drains notifications that are already queued
+    // when the pump runs; a notification that arrives just after an answer (the
+    // target's very next startup/worker bind()) is missed here and stalls the
+    // notifying task until the next pump call on some poll timeout. Waiting out
+    // a tiny blocking poll instead (e.g. poll(&pfd, 1, 1) before returning, or
+    // replacing the 0 timeout with 1 ms) would also catch those stragglers and
+    // make the pump's drain cadence independent of the caller's poll timeouts.
+    // Not implemented: the post-detection drain in notif_port() already covers
+    // the startup chain deterministically, and the steady-state cost of an
+    // extra 1 ms per pump call (it runs from every poll timeout in the
+    // exchange/probe loops) needs measuring against the ~3k exec/s throughput
+    // baseline before changing this hot path.
     while (true) {
         struct pollfd pfd = { fd, POLLIN, 0 };
         int pr = poll(&pfd, 1, 0);

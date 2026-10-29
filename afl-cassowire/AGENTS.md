@@ -123,6 +123,18 @@ are ignored helper-anchor fields (see Important details).
   `process_vm_readv` on the notifying tid), plus a bounded (~100 ms)
   `/proc/net/tcp{,6}` LISTEN confirmation — notifications carry syscall ENTRY
   only, so there is no exit value and e.g. EADDRINUSE is invisible otherwise.
+  After readiness the detector runs a bounded post-detection drain
+  (`drain_notif_idle()` in `network.cpp`): the target's startup
+  `bind()`/`listen()` chain often continues behind the configured port (nginx
+  binds its fuzzed 8080 first, then 8443 tcp+udp for TLS/QUIC), each
+  notification suspends the notifying task until answered, and the steady-state
+  pump only releases already-queued notifications — so without the drain,
+  whether the target's event loop starts in time for the first request is a
+  microsecond-scale race (thread wake-up vs the pump's `poll(0)` turnaround)
+  that CPU affinity and load decide; a lost race burns every response/probe
+  window and aborts the proxy for an AFL respawn. The drain answers pending
+  notifications until the listener fd stays idle for two 25 ms polls (≤400 ms
+  overall), once per spawn.
   Every notification must be answered (`SECCOMP_USER_NOTIF_FLAG_CONTINUE`):
   the filter is irremovable, so `network::pump_notif_listener()` (non-blocking
   drain; registered after detection via `network::set_notif_listener()`) runs

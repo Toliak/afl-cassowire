@@ -63,6 +63,35 @@ def test_dump_map_and_single_iteration_calc(tmp_path: Path, primary: str) -> Non
     assert_single_iteration_pass(res, CALC_RESPONSE)
 
 
+@pytest.mark.parametrize("primary", ["procfs", "seccomp"])
+def test_single_iteration_extra_bind_after_main(tmp_path: Path, primary: str) -> None:
+    """Startup binds queued behind the configured port must not stall the
+    first request: --bind-extra-after binds port+1 after the detected port, so
+    its bind()/listen() notifications arrive while the target's main thread is
+    racing the pump (the seccomp user-notif case that made nginx's TLS/QUIC
+    listeners suspend the event loop; see drain_notif_idle in network.cpp).
+    The post-detection drain answers them before the first exchange.
+    """
+    if primary == "seccomp" and not harness.seccomp_supported():
+        pytest.skip("SECCOMP_RET_USER_NOTIF port detection needs kernel >= 5.0")
+    target = harness.test_target_bin()
+    port = harness.free_port()
+    config = harness.write_config(
+        tmp_path,
+        target_args=[str(target), "calc", "--port", str(port), "--bind-extra-after"],
+        port=port,
+        primary=primary,
+    )
+    input_file = tmp_path / "input.bin"
+    input_file.write_bytes(CALC_INPUT)
+    res = harness.run_cassowire(config, "--log-level", "debug", "test", "--input", str(input_file))
+    assert_dump_map_pass(res, target)
+    assert_single_iteration_pass(res, CALC_RESPONSE)
+    if primary == "seccomp":
+        # The drain must actually have released the queued extra bind().
+        assert "post-detection drain: released pending bind" in res.stdout, res.detail()
+
+
 @pytest.mark.parametrize(
     "output",
     [b"MAP_SIZE: 65536\n", b"65536\ngarbage\n", b""],

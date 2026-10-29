@@ -193,7 +193,7 @@
         "primary": {
           "enum": ["procfs", "seccomp"],
           "default": "procfs",
-          "description": "Port detection method: \"procfs\" (scan /proc/net/tcp{,6}; polls waitpid(WNOHANG) every pass so a dying target is reported, and with verify_ownership: true the LISTEN entry must be owned by the target's process tree), or \"seccomp\" (the target runs with a SECCOMP_RET_USER_NOTIF filter on bind()/listen() installed before its execve(); the proxy polls the notification fd, which aggregates those syscalls from every thread and forked descendant - kernel >= 5.0; readiness is confirmed with a bounded /proc scan). Both methods work with QEMU-mode targets (threads and grandchild processes included); the old ptrace-based methods were removed."
+          "description": "Port detection method: \"procfs\" (scan /proc/net/tcp{,6}; polls waitpid(WNOHANG) every pass so a dying target is reported, and with verify_ownership: true the LISTEN entry must be owned by the target's process tree), or \"seccomp\" (the target runs with a SECCOMP_RET_USER_NOTIF filter on bind()/listen() installed before its execve(); the proxy polls the notification fd, which aggregates those syscalls from every thread and forked descendant - kernel >= 5.0; readiness is confirmed with a bounded /proc scan, after which a bounded drain answers the target's remaining startup bind()/listen() notifications until the listener fd goes idle so the event loop is up before the first exchange). Both methods work with QEMU-mode targets (threads and grandchild processes included); the old ptrace-based methods were removed."
         },
         "verify_ownership": {
           "type": "boolean",
