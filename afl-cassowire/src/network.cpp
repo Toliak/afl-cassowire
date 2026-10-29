@@ -502,6 +502,67 @@ void pump_notif_listener() {
     }
 }
 
+namespace {
+
+// Polls @p sock for @p events while also watching the seccomp notification
+// listener fd (when active). If the target (or any thread/worker under the
+// inherited filter) issues a bind()/listen() while we are blocked waiting on
+// the TCP socket (e.g. startup binds queued behind the main port such as
+// nginx's TLS/QUIC listeners, or worker binds), the notification wakes poll()
+// immediately, pump_notif_listener() answers it with CONTINUE so the target
+// thread can proceed into its event loop, and the wait resumes for the
+// remaining budget until @p deadline_start_ms + @p timeout_ms.
+// Returns: >0 when @p sock has revents, 0 on timeout, -1 on poll() error
+// (with errno set; EINTR is retried internally).
+int poll_with_notif(int sock, short events, uint64_t deadline_start_ms, int timeout_ms) {
+    bool watch_notif = (g_notif_fd >= 0);
+    while (true) {
+        const int remaining = timeout_ms - static_cast<int>(utils::get_time_ms() - deadline_start_ms);
+        if (remaining <= 0) return 0;
+
+        struct pollfd pfds[2];
+        pfds[0].fd = sock;
+        pfds[0].events = events;
+        pfds[0].revents = 0;
+
+        nfds_t nfds = 1;
+        if (watch_notif && g_notif_fd >= 0) {
+            pfds[1].fd = g_notif_fd;
+            pfds[1].events = POLLIN;
+            pfds[1].revents = 0;
+            nfds = 2;
+        }
+
+        const int pr = poll(pfds, nfds, remaining);
+        if (pr < 0) {
+            if (errno == EINTR) continue;
+            return -1;
+        }
+        if (pr == 0) {
+            pump_notif_listener();
+            return 0;
+        }
+
+        if (nfds == 2 && pfds[1].revents != 0) {
+            if (pfds[1].revents & POLLIN) {
+                pump_notif_listener();
+            }
+            if ((pfds[1].revents & (POLLHUP | POLLERR | POLLNVAL)) &&
+                !(pfds[1].revents & POLLIN)) {
+                // No task references the listener anymore (or fd invalid);
+                // stop polling it so POLLHUP cannot busy-spin this loop.
+                watch_notif = false;
+            }
+        }
+
+        if (pfds[0].revents != 0) {
+            return 1;
+        }
+    }
+}
+
+}  // namespace
+
 DetectResult wait_for_port(pid_t target_pid, const Config& cfg, int notif_fd) {
     PROXY_LOG_INFO("waiting for port {} via {} (initial_ms={})",
                    cfg.network.port, cfg.port_detection.primary, cfg.network.initial_ms);
@@ -546,20 +607,9 @@ ConnectResult connect_target(const NetworkConfig& net_cfg) {
 
     if (res == 0) return guard;
 
-    struct pollfd pfd;
-    pfd.fd = guard.get();
-    pfd.events = POLLOUT;
-
     uint64_t start = utils::get_time_ms();
-    int poll_res = 0;
-    while (true) {
-        int remaining = net_cfg.timeout_ms - (int)(utils::get_time_ms() - start);
-        if (remaining <= 0) return ConnectError{ConnectError::Kind::TimedOut, 0};
-        pfd.revents = 0;
-        poll_res = poll(&pfd, 1, remaining);
-        if (poll_res >= 0) break;
-        if (errno != EINTR) return ConnectError{ConnectError::Kind::PollFailed, errno};
-    }
+    int poll_res = poll_with_notif(guard.get(), POLLOUT, start, net_cfg.timeout_ms);
+    if (poll_res < 0) return ConnectError{ConnectError::Kind::PollFailed, errno};
     if (poll_res == 0) return ConnectError{ConnectError::Kind::TimedOut, 0};
 
     int err = 0;
@@ -586,18 +636,11 @@ SendResult send_all(int sock, const uint8_t* buf, size_t len, int timeout_ms) {
         if (n < 0) {
             if (errno == EINTR) continue;
             if (errno == EAGAIN || errno == EWOULDBLOCK) {
-                struct pollfd pfd;
-                pfd.fd = sock;
-                pfd.events = POLLOUT;
-                int remaining = timeout_ms - (int)(utils::get_time_ms() - start);
-                if (remaining <= 0) return SendError{SendError::Kind::TimedOut, 0};
-                int poll_res = poll(&pfd, 1, remaining);
+                int poll_res = poll_with_notif(sock, POLLOUT, start, timeout_ms);
                 if (poll_res < 0) {
-                    if (errno == EINTR) continue;
                     return SendError{SendError::Kind::PollFailed, errno};
                 }
                 if (poll_res == 0) {
-                    pump_notif_listener();
                     return SendError{SendError::Kind::TimedOut, 0};
                 }
                 continue;
@@ -625,26 +668,13 @@ WaitResult wait_response(int sock, int timeout_ms) {
             return data; // partial response received before the timeout
         }
 
-        struct pollfd pfd;
-        pfd.fd = sock;
-        pfd.events = POLLIN;
-        int remaining = timeout_ms - (int)(utils::get_time_ms() - start);
-        if (remaining <= 0) {
-            if (data.empty()) return WaitError{WaitError::Kind::TimedOut, 0};
-            return data;
-        }
-
-        int poll_res = poll(&pfd, 1, remaining);
+        int poll_res = poll_with_notif(sock, POLLIN, start, timeout_ms);
         if (poll_res < 0) {
-            if (errno == EINTR) continue;
             return WaitError{WaitError::Kind::PollFailed, errno};
         }
         if (poll_res == 0) {
-            // Release a pending seccomp notification: a target task blocked
-            // waiting for our CONTINUE cannot service the connection, so poll
-            // would just time out.
-            pump_notif_listener();
-            continue; // poll timeout; the loop top re-checks the overall deadline
+            if (data.empty()) return WaitError{WaitError::Kind::TimedOut, 0};
+            return data;
         }
 
         ssize_t n = recv(sock, buf, sizeof(buf), 0);
@@ -709,31 +739,16 @@ ProbeResult probe_target(const NetworkConfig& net_cfg) {
     // Residual gaps are listed in the probe_target() contract (network.hpp).
     uint64_t start = utils::get_time_ms();
     PROXY_LOG_TRACE("probe_target start={}", start);
-    while (true) {
-        int remaining = net_cfg.timeout_ms - (int)(utils::get_time_ms() - start);
-        PROXY_LOG_TRACE("probe_target remaining={}", remaining);
-        if (remaining <= 0) return ProbeResult{ProbeOutcome::Timeout, std::nullopt};
-
-        struct pollfd pfd;
-        pfd.fd = sock.get();
-        pfd.events = POLLIN;
-        pfd.revents = 0;
-        int poll_res = poll(&pfd, 1, remaining);
-        PROXY_LOG_TRACE("probe_target poll_res={}", poll_res);
-        if (poll_res < 0) {
-            if (errno == EINTR) continue;
-            return ProbeResult{ProbeOutcome::Failed,
-                               ConnectError{ConnectError::Kind::PollFailed, errno}};
-        }
-        if (poll_res == 0) {
-            // Release a pending seccomp notification: a target task blocked
-            // waiting for our CONTINUE cannot service the connection, so poll
-            // would just time out.
-            pump_notif_listener();
-            continue; // poll timeout; the loop top re-checks the overall deadline
-        }
-        return ProbeResult{ProbeOutcome::Serviced, std::nullopt};
+    int poll_res = poll_with_notif(sock.get(), POLLIN, start, net_cfg.timeout_ms);
+    PROXY_LOG_TRACE("probe_target poll_res={}", poll_res);
+    if (poll_res < 0) {
+        return ProbeResult{ProbeOutcome::Failed,
+                           ConnectError{ConnectError::Kind::PollFailed, errno}};
     }
+    if (poll_res == 0) {
+        return ProbeResult{ProbeOutcome::Timeout, std::nullopt};
+    }
+    return ProbeResult{ProbeOutcome::Serviced, std::nullopt};
 }
 
 void arm_rst_on_close(int sock) {

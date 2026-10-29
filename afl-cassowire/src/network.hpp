@@ -106,9 +106,10 @@ namespace network {
      *
      * No-op unless a listener fd was registered with set_notif_listener().
      * Answers every queued notification with SECCOMP_USER_NOTIF_FLAG_CONTINUE
-     * so the syscall runs normally. Call at bounded intervals (poll-timeout
-     * re-checks and between exchange stages): a notified task is suspended
-     * until pumped, so the worst-case target stall is one poll leg.
+     * so the syscall runs normally. Socket poll() loops in connect_target(),
+     * send_all(), wait_response(), and probe_target() multiplex the listener
+     * fd alongside the TCP socket so notifications arriving during any network
+     * wait wake poll() and are answered immediately without stalling the target.
      */
     void pump_notif_listener();
 

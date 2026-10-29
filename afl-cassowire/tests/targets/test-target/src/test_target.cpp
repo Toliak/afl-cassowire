@@ -38,6 +38,7 @@ struct Options {
     int startup_delay_ms = 0;
     bool bind_ephemeral_first = false;
     bool bind_extra_port = false;
+    bool bind_extra_after = false;
     bool ignore_sigterm = false;
     bool keep_alive = false;
     bool with_crash = false;
@@ -97,6 +98,13 @@ Options parse_options(int argc, char* argv[]) {
         .default_value(false)
         .implicit_value(true);
 
+    program.add_argument("--bind-extra-after")
+        .help("bind port+1 after the configured port (startup notifications "
+              "queued behind the detected one, as e.g. nginx's TLS/QUIC "
+              "listeners land after its main HTTP port)")
+        .default_value(false)
+        .implicit_value(true);
+
     program.add_argument("--ignore-sigterm")
         .help("ignore SIGTERM so cleanup must escalate to SIGKILL")
         .default_value(false)
@@ -142,11 +150,12 @@ Options parse_options(int argc, char* argv[]) {
     if (opts.startup_delay_ms < 0) {
         fatal("invalid --startup-delay-ms: expected >= 0");
     }
-    if (opts.bind_extra_port && opts.port == 65535) {
-        fatal("--bind-extra-port requires --port < 65535");
-    }
     opts.bind_ephemeral_first = program.get<bool>("--bind-ephemeral-first");
     opts.bind_extra_port = program.get<bool>("--bind-extra-port");
+    opts.bind_extra_after = program.get<bool>("--bind-extra-after");
+    if ((opts.bind_extra_port || opts.bind_extra_after) && opts.port == 65535) {
+        fatal("--bind-extra-port/--bind-extra-after require --port < 65535");
+    }
     opts.ignore_sigterm = program.get<bool>("--ignore-sigterm");
     opts.keep_alive = program.get<bool>("--keep-alive");
     opts.with_crash = program.get<bool>("--with-crash");
@@ -455,6 +464,9 @@ int main(int argc, char* argv[]) {
     }
     const int main_fd = make_listener(opts.host, opts.port, "main");
     listeners.push_back(main_fd);
+    if (opts.bind_extra_after) {
+        listeners.push_back(make_listener(opts.host, static_cast<uint16_t>(opts.port + 1), "extra-after"));
+    }
 
     int lingering_fd = -1;
     while (!g_stop) {

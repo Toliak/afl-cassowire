@@ -126,8 +126,12 @@ are ignored helper-anchor fields (see Important details).
   Every notification must be answered (`SECCOMP_USER_NOTIF_FLAG_CONTINUE`):
   the filter is irremovable, so `network::pump_notif_listener()` (non-blocking
   drain; registered after detection via `network::set_notif_listener()`) runs
-  from `exchange_once` and the network poll loops for the target's whole life
-  (worst-case stall for the target = one poll leg). Both detection methods and
+  from `exchange_once`, and every socket `poll()` in `connect_target`,
+  `send_all`, `wait_response`, and `probe_target` (`poll_with_notif` in
+  `network.cpp`) multiplexes the seccomp notification fd alongside the TCP
+  socket so any `bind()`/`listen()` notification arriving after the configured
+  port (e.g. nginx's TLS/QUIC listeners or worker binds) wakes `poll()` and is
+  answered immediately without stalling the target. Both detection methods and
   the procfs path poll `waitpid(WNOHANG)` and report `TargetDied`.
 - Stdio redirection differs per mode: stdin comes from `target.stdin_path` when
   set (opened read-only in `prepare_target()` with `O_NONBLOCK|O_CLOEXEC`, the
