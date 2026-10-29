@@ -11,16 +11,25 @@ index 6a1bee3..de71df1 100644
      "AFL_DUMP_PC_MAP",
  #endif
 diff --git a/instrumentation/SanitizerCoveragePCGUARD.so.cc b/instrumentation/SanitizerCoveragePCGUARD.so.cc
-index f7bb60e..513ecd7 100644
+index f7bb60e..9364f88 100644
 --- a/instrumentation/SanitizerCoveragePCGUARD.so.cc
 +++ b/instrumentation/SanitizerCoveragePCGUARD.so.cc
-@@ -714,6 +714,10 @@ bool ModuleSanitizerCoverageAFL::isNoAbortFunction(Function &F) {
+@@ -714,6 +714,19 @@ bool ModuleSanitizerCoverageAFL::isNoAbortFunction(Function &F) {
  void ModuleSanitizerCoverageAFL::updateCoverageBitmap(IRBuilder<> &IRB,
                                                        Value *CoverageIndex,
                                                        Value *MapPtr) {
 +  if (getenv("AFL_CASSOWIRE_LLVM_ONLY_FSRV")) {
-+    DEBUGF("Skipped coverage due to AFL_CASSOWIRE_LLVM_ONLY_FSRV\n");
++
++    static bool warned = false;
++    if (!warned) {
++
++      warned = true;
++      DEBUGF("Skipped coverage due to AFL_CASSOWIRE_LLVM_ONLY_FSRV\n");
++
++    }
++
 +    return;
++
 +  }
  
    Value *MapPtrIdx = IRB.CreateGEP(Int8Ty, MapPtr, CoverageIndex);
