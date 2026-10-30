@@ -36,6 +36,20 @@ PROFILES = {
             "corpus": ["in/http", "out/http/*/queue"],
         },
     },
+    "http-seq": {
+        # AFLNet-style sequence mode for aflpp: each seed is a session with
+        # several CRLFCRLF-terminated requests (data/cassowire.seq.yaml enables
+        # `sequence:`). The same corpus also works for the vendor AFLNet fuzzer.
+        "seeds": {
+            "aflpp": ["_fuzz/in_http_seq"],
+            "aflnet": ["_fuzz/in_http_seq"],
+        },
+        "coverage": {
+            "args": ["-c", "{target_dir}/data/nginx.new.conf"],
+            "payload_suffix": "\r\n\r\n",
+            "corpus": ["in/http-seq", "out/http-seq/*/queue"],
+        },
+    },
 }
 
 # Reference documentation of the fuzz command per fuzzer. The executable form

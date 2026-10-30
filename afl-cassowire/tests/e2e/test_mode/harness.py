@@ -72,7 +72,8 @@ def write_config(
     *,
     target_args: list[str],
     port: int,
-    payload: dict[str, str] | None = None,
+    payload: dict[str, str | bytes] | None = None,
+    sequence: dict[str, Any] | None = None,
     primary: str = "procfs",
     stdin_path: str | None = None,
 ) -> Path:
@@ -93,6 +94,8 @@ def write_config(
     }
     if payload is not None:
         config["payload"] = payload
+    if sequence is not None:
+        config["sequence"] = sequence
     path = tmp_path / "cassowire.yaml"
     path.write_text(yaml.safe_dump(config, sort_keys=False), encoding="utf-8")
     return path

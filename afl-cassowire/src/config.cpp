@@ -160,6 +160,37 @@ void resolve_merge_keys(YAML::Node& node, const std::string& path) {
     g_merge_key_visiting->pop_back();
 }
 
+// Reads a byte-oriented scalar: a plain string keeps its bytes, a YAML
+// `!!binary` tagged scalar is base64-decoded by yaml-cpp, and a null node is
+// an empty value. Used by payload prefix/suffix and the sequence section.
+// Returns false for non-scalar nodes (sequences/maps).
+bool read_bytes_value(const YAML::Node& node, std::vector<uint8_t>& out) {
+    out.clear();
+    if (!node || node.IsNull()) {
+        return true;
+    }
+    if (!node.IsScalar()) {
+        return false;
+    }
+    const std::string tag = node.Tag();
+    static const std::string kBinarySuffix = ":binary";
+    if (tag.size() >= kBinarySuffix.size() &&
+        tag.compare(tag.size() - kBinarySuffix.size(), kBinarySuffix.size(), kBinarySuffix) == 0) {
+        try {
+            const YAML::Binary bin = node.as<YAML::Binary>();
+            if (bin.size() > 0) {
+                out.assign(bin.data(), bin.data() + bin.size());
+            }
+        } catch (const YAML::Exception&) {
+            return false;
+        }
+        return true;
+    }
+    const std::string s = node.as<std::string>();
+    out.assign(s.begin(), s.end());
+    return true;
+}
+
 // Parses a target-shaped section ("binary"/"args"/"env"/"env_preserve"). `prefix`
 // is the config path used in errors (e.g. "target", "target_cmplog"). Sections
 // are standalone: no values are inherited from any other section.
@@ -332,6 +363,105 @@ ConfigError parse_network_section(const YAML::Node& node, const std::string& pre
     return ConfigError{"", "", "", ""}; // no error
 }
 
+// Parses the optional sequence section. All keys are type/range-checked
+// whenever the section exists; `delimiter` is required (and non-empty) only
+// when enabled. Returns a ConfigError with an empty message on success.
+ConfigError parse_sequence_section(const YAML::Node& node, SequenceConfig& out) {
+    static const std::unordered_set<std::string> sequence_allowed = {
+        "enabled", "delimiter", "keep_delimiter", "response_poll_us",
+        "initial_poll_us", "final_poll_us", "max_messages",
+        "message_prefix", "message_suffix"};
+    ConfigError err = check_unknown_keys(node, sequence_allowed, "sequence");
+    if (!err.message.empty()) {
+        return err;
+    }
+
+    if (node["enabled"]) {
+        try {
+            out.enabled = node["enabled"].as<bool>();
+        } catch (const YAML::BadConversion&) {
+            return ConfigError{"sequence.enabled", "Invalid type", "boolean", node["enabled"].Scalar()};
+        }
+    }
+
+    if (node["delimiter"] && !read_bytes_value(node["delimiter"], out.delimiter)) {
+        return ConfigError{"sequence.delimiter", "Invalid type", "string or !!binary bytes",
+                           "not a string or binary"};
+    }
+    if (out.enabled && (!node["delimiter"] || out.delimiter.empty())) {
+        return ConfigError{"sequence.delimiter",
+                           "Missing or empty delimiter in sequence mode",
+                           "non-empty string or !!binary bytes",
+                           node["delimiter"] ? "empty" : "missing"};
+    }
+
+    if (node["keep_delimiter"]) {
+        try {
+            out.keep_delimiter = node["keep_delimiter"].as<bool>();
+        } catch (const YAML::BadConversion&) {
+            return ConfigError{"sequence.keep_delimiter", "Invalid type", "boolean",
+                               node["keep_delimiter"].Scalar()};
+        }
+    }
+
+    // Poll windows: [0, 5s] in microseconds. 0 disables the wait (one
+    // non-blocking drain only).
+    const auto parse_poll_us = [&](const char* key, int& value) -> ConfigError {
+        YAML::Node n = node[key];
+        if (!n) return ConfigError{"", "", "", ""};
+        try {
+            const int v = n.as<int>();
+            if (v < 0 || v > 5000000) {
+                return ConfigError{std::string("sequence.") + key, "Out of range",
+                                   "integer 0-5000000 (microseconds)", std::to_string(v)};
+            }
+            value = v;
+        } catch (const YAML::BadConversion&) {
+            return ConfigError{std::string("sequence.") + key, "Invalid type",
+                               "integer 0-5000000 (microseconds)", n.Scalar()};
+        }
+        return ConfigError{"", "", "", ""};
+    };
+    struct PollKey {
+        const char* key;
+        int* value;
+    };
+    const PollKey poll_keys[] = {
+        {"response_poll_us", &out.response_poll_us},
+        {"initial_poll_us", &out.initial_poll_us},
+        {"final_poll_us", &out.final_poll_us},
+    };
+    for (const auto& item : poll_keys) {
+        ConfigError e = parse_poll_us(item.key, *item.value);
+        if (!e.message.empty()) return e;
+    }
+
+    if (node["max_messages"]) {
+        try {
+            const int v = node["max_messages"].as<int>();
+            if (v < 1 || v > 1024) {
+                return ConfigError{"sequence.max_messages", "Out of range", "integer 1-1024",
+                                   std::to_string(v)};
+            }
+            out.max_messages = v;
+        } catch (const YAML::BadConversion&) {
+            return ConfigError{"sequence.max_messages", "Invalid type", "integer 1-1024",
+                               node["max_messages"].Scalar()};
+        }
+    }
+
+    if (node["message_prefix"] && !read_bytes_value(node["message_prefix"], out.message_prefix)) {
+        return ConfigError{"sequence.message_prefix", "Invalid type", "string or !!binary bytes",
+                           "not a string or binary"};
+    }
+    if (node["message_suffix"] && !read_bytes_value(node["message_suffix"], out.message_suffix)) {
+        return ConfigError{"sequence.message_suffix", "Invalid type", "string or !!binary bytes",
+                           "not a string or binary"};
+    }
+
+    return ConfigError{"", "", "", ""}; // no error
+}
+
 // Reads the config file as raw text and expands environment variables before
 // any YAML parsing happens. Supported syntax:
 //   $$               -> literal '$' (escape, prevents accidental expansion)
@@ -451,7 +581,7 @@ std::variant<Config, ConfigError> load_config(const std::string& path) {
         // Root keys starting with "__" are ignored: they are reserved for
         // helper fragments anchored for reuse (aliases / merge keys) below.
         {
-            static const std::unordered_set<std::string> root_allowed = {"target", "target_cmplog", "network", "network_cmplog", "afl", "port_detection", "cleanup", "payload"};
+            static const std::unordered_set<std::string> root_allowed = {"target", "target_cmplog", "network", "network_cmplog", "afl", "port_detection", "cleanup", "payload", "sequence"};
             ConfigError err = check_unknown_keys(root, root_allowed, "", true);
             if (!err.message.empty()) {
                 return err;
@@ -667,36 +797,44 @@ std::variant<Config, ConfigError> load_config(const std::string& path) {
                        }
                    }
 
-                   if (payload_node["prefix"]) {
-                       if (!payload_node["prefix"].IsScalar() && !payload_node["prefix"].IsNull()) {
-                           return ConfigError{"payload.prefix", "Invalid type", "string or binary", "not a string or binary"};
-                       }
-                       // Handle both string and binary YAML types
-                       if (payload_node["prefix"].IsScalar()) {
-                           std::string prefix_str = payload_node["prefix"].as<std::string>();
-                           cfg.payload.prefix = std::vector<uint8_t>(prefix_str.begin(), prefix_str.end());
-                       } else {
-                           // This handles !!binary and other binary formats
-                           cfg.payload.prefix = payload_node["prefix"].as<std::vector<uint8_t>>();
-                       }
+                   if (payload_node["prefix"] &&
+                       !read_bytes_value(payload_node["prefix"], cfg.payload.prefix)) {
+                       return ConfigError{"payload.prefix", "Invalid type", "string or binary",
+                                          "not a string or binary"};
                    }
 
-                   if (payload_node["suffix"]) {
-                       if (!payload_node["suffix"].IsScalar() && !payload_node["suffix"].IsNull()) {
-                           return ConfigError{"payload.suffix", "Invalid type", "string or binary", "not a string or binary"};
-                       }
-                       // Handle both string and binary YAML types
-                       if (payload_node["suffix"].IsScalar()) {
-                           std::string suffix_str = payload_node["suffix"].as<std::string>();
-                           cfg.payload.suffix = std::vector<uint8_t>(suffix_str.begin(), suffix_str.end());
-                       } else {
-                           // This handles !!binary and other binary formats
-                           cfg.payload.suffix = payload_node["suffix"].as<std::vector<uint8_t>>();
-                       }
+                   if (payload_node["suffix"] &&
+                       !read_bytes_value(payload_node["suffix"], cfg.payload.suffix)) {
+                       return ConfigError{"payload.suffix", "Invalid type", "string or binary",
+                                          "not a string or binary"};
                    }
                }
            }
- 
+
+        // --- Parse sequence (AFLNet-style message sequences) ---
+        if (root["sequence"]) {
+            if (root["sequence"].IsNull()) {
+                // null section is treated as empty (same as omitting it)
+            } else if (!root["sequence"].IsMap()) {
+                return ConfigError{"sequence", "Invalid 'sequence' section", "map", "not a map"};
+            } else {
+                ConfigError err = parse_sequence_section(root["sequence"], cfg.sequence);
+                if (!err.message.empty()) {
+                    return err;
+                }
+            }
+        }
+
+        // Sequence mode wraps each message with sequence.message_prefix/suffix;
+        // the legacy payload wrappers are ambiguous there (double delimiters),
+        // so reject the combination instead of silently applying both.
+        if (cfg.sequence.enabled && (!cfg.payload.prefix.empty() || !cfg.payload.suffix.empty())) {
+            return ConfigError{"payload",
+                               "payload.prefix/suffix cannot be combined with sequence.enabled",
+                               "omit the payload section in sequence mode; use "
+                               "sequence.message_prefix/message_suffix",
+                               "payload is set"};
+        }
 
     } catch (const ConfigError& e) {
         return e;

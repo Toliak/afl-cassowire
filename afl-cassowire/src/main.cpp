@@ -112,7 +112,7 @@ void kill_and_reap_pgid(pid_t pgid) {
 struct ExchangeOutcome {
     std::optional<network::ConnectError> connect_error;  ///< fatal: no socket was established
     std::optional<network::SendError> send_error;        ///< send failed, cycle still continued
-    std::optional<network::WaitError> wait_error;        ///< response failed/timed out
+    std::optional<network::WaitError> wait_error;        ///< legacy mode: response failed/timed out
     std::vector<uint8_t> response;                       ///< received bytes, valid when wait_error is empty
     size_t request_size = 0;                             ///< bytes queued for sending (prefix + input + suffix)
     // Wall-clock cost of each stage, for the slow/mostly-hanging cases. These
@@ -121,7 +121,23 @@ struct ExchangeOutcome {
     uint64_t connect_ms = 0;   ///< time spent in network::connect_target()
     uint64_t send_ms = 0;      ///< time spent in network::send_all()
     uint64_t shutdown_ms = 0;  ///< time spent in shutdown(SHUT_WR)
-    uint64_t wait_ms = 0;      ///< time spent in network::wait_response()
+    uint64_t wait_ms = 0;      ///< time spent in network::wait_response() / recv_window()
+
+    // --- Sequence mode (cfg.sequence.enabled) ---
+    // messages_total counts every message found in the testcase before the
+    // sequence.max_messages cap; messages_built is what was actually built into
+    // the session payload (== total unless truncated). payload_buf always holds
+    // the full built session, so crash dumps stay replayable even when an early
+    // send failed.
+    size_t messages_total = 0;
+    size_t messages_built = 0;
+    size_t messages_sent = 0;
+    size_t bytes_sent = 0;
+    std::optional<size_t> failed_message_index;          ///< 0-based, on send/recv failure
+    std::optional<network::WaitError> sequence_error;     ///< per-message poll/recv failure
+    size_t initial_response_size = 0;                     ///< bytes from the early banner drain
+    size_t final_response_size = 0;                       ///< bytes from the post-SHUT_WR drain
+    std::vector<size_t> response_sizes;                   ///< per sent+drained message, in order
 };
 
 /**
@@ -136,6 +152,7 @@ struct IterationStats {
     uint64_t max_send_ms = 0;
     uint64_t max_wait_ms = 0;
     uint64_t max_probe_ms = 0;
+    size_t max_messages = 0;   ///< largest sequence session seen (messages built)
     casslog::Throttle connect_err{3, 5000};
     casslog::Throttle send_err{3, 5000};
     casslog::Throttle wait_err{3, 5000};
@@ -149,12 +166,13 @@ constexpr uint64_t kHeartbeatMs = 5000;
 /// periodic INFO heartbeat (flushed, so it survives AFL's output capture).
 static void update_iteration_stats(IterationStats& stats, uint64_t connect_ms,
                                    uint64_t send_ms, uint64_t wait_ms,
-                                   uint64_t probe_ms, uint64_t budget_ms) {
+                                   uint64_t probe_ms, size_t messages, uint64_t budget_ms) {
     ++stats.iterations;
     stats.max_connect_ms = std::max(stats.max_connect_ms, connect_ms);
     stats.max_send_ms = std::max(stats.max_send_ms, send_ms);
     stats.max_wait_ms = std::max(stats.max_wait_ms, wait_ms);
     stats.max_probe_ms = std::max(stats.max_probe_ms, probe_ms);
+    stats.max_messages = std::max(stats.max_messages, messages);
     if (connect_ms >= budget_ms || send_ms >= budget_ms ||
         wait_ms >= budget_ms || probe_ms >= budget_ms) {
         ++stats.slow_iters;
@@ -162,10 +180,10 @@ static void update_iteration_stats(IterationStats& stats, uint64_t connect_ms,
 
     const uint64_t now_ms = utils::get_time_ms();
     if (now_ms - stats.last_heartbeat_ms >= kHeartbeatMs) {
-        PROXY_LOG_INFO("heartbeat: {} iterations, max connect/send/wait/probe = {}/{}/{}/{} ms, slow={}, cpu affinity: {}",
+        PROXY_LOG_INFO("heartbeat: {} iterations, max connect/send/wait/probe = {}/{}/{}/{} ms, max messages={}, slow={}, cpu affinity: {}",
                        stats.iterations, stats.max_connect_ms, stats.max_send_ms,
-                       stats.max_wait_ms, stats.max_probe_ms, stats.slow_iters,
-                       utils::get_cpu_affinity());
+                       stats.max_wait_ms, stats.max_probe_ms, stats.max_messages,
+                       stats.slow_iters, utils::get_cpu_affinity());
         spdlog::default_logger()->flush();
         stats.last_heartbeat_ms = now_ms;
     }
@@ -188,13 +206,188 @@ static std::string probe_exhaustion_hint(const network::ProbeResult& pr) {
     return "";
 }
 
+/// Result of splitting one testcase into a session: payload_buf ranges for the
+/// built (possibly truncated) messages plus the total number of messages found
+/// before the sequence.max_messages cap.
+struct SequenceBuild {
+    std::vector<std::pair<size_t, size_t>> ranges;  ///< [begin,end) in payload_buf
+    size_t discovered = 0;                          ///< messages found before the cap
+};
+
+/**
+ * @brief Split @p input into messages at sequence.delimiter and build the
+ *        session payload into @p session (message_prefix + message +
+ *        message_suffix per message). Pure function of the testcase: no I/O.
+ *
+ * Delimiter occurrences are non-overlapping and scanned left to right. With
+ * keep_delimiter the message includes the delimiter; otherwise it is stripped
+ * (an empty message produced that way is skipped). Trailing bytes after the
+ * last delimiter form one final message (AFLNet does the same); an input with
+ * no delimiter at all is one message. Empty input yields zero messages.
+ * At most sequence.max_messages messages are built; the rest are counted in
+ * SequenceBuild::discovered so the caller can log the truncation.
+ */
+SequenceBuild build_sequence(const SequenceConfig& sc, const uint8_t* input, size_t input_len,
+                             std::vector<uint8_t>& session) {
+    SequenceBuild build;
+    session.clear();
+    const auto& delim = sc.delimiter;
+    const size_t cap = static_cast<size_t>(sc.max_messages);
+
+    auto add_message = [&](size_t begin, size_t end) {
+        if (end <= begin) return;  // empty message (e.g. stripped delimiter)
+        ++build.discovered;
+        if (build.ranges.size() >= cap) return;
+        const size_t start = session.size();
+        session.insert(session.end(), sc.message_prefix.begin(), sc.message_prefix.end());
+        session.insert(session.end(), input + begin, input + end);
+        session.insert(session.end(), sc.message_suffix.begin(), sc.message_suffix.end());
+        build.ranges.emplace_back(start, session.size());
+    };
+
+    bool found_delimiter = false;
+    size_t msg_start = 0;
+    size_t scan = 0;
+    while (!delim.empty() && scan + delim.size() <= input_len) {
+        if (std::memcmp(input + scan, delim.data(), delim.size()) != 0) {
+            ++scan;
+            continue;
+        }
+        found_delimiter = true;
+        const size_t match_end = scan + delim.size();
+        add_message(msg_start, sc.keep_delimiter ? match_end : scan);
+        msg_start = match_end;
+        scan = match_end;
+    }
+    if (msg_start < input_len) {
+        add_message(msg_start, input_len);
+    }
+    if (!found_delimiter && input_len > 0) {
+        add_message(0, input_len);
+    }
+    return build;
+}
+
+/**
+ * @brief Human-readable sequence progress for WARN/crash reason strings.
+ *        Empty string when sequence mode is disabled.
+ */
+std::string sequence_summary(const Config& cfg, const ExchangeOutcome& ex) {
+    if (!cfg.sequence.enabled) return "";
+    std::string s = " [sequence: " + std::to_string(ex.messages_sent) + "/" +
+                    std::to_string(ex.messages_built) + " messages sent";
+    if (ex.messages_total > ex.messages_built) {
+        s += ", truncated from " + std::to_string(ex.messages_total);
+    }
+    if (ex.failed_message_index) {
+        s += ", failed at #" + std::to_string(*ex.failed_message_index + 1);
+    }
+    s += "]";
+    return s;
+}
+
+/**
+ * @brief AFLNet-style sequence exchange: connect once, send each message one
+ *        at a time, read after each send (bounded idle window), then half-close
+ *        and perform a final drain. The session payload (all built messages) is
+ *        written to @p payload_buf so termination dumps remain replayable even
+ *        when an early send fails.
+ *
+ * No explicit pump_notif_listener() calls are needed between stages: all waits
+ * go through network::{connect_target,send_all,recv_window}, which multiplex
+ * the seccomp notification fd alongside the TCP socket.
+ */
+ExchangeOutcome exchange_sequence(const Config& cfg, const uint8_t* input, size_t input_len,
+                                  std::vector<uint8_t>& payload_buf) {
+    ExchangeOutcome out;
+    const SequenceConfig& sc = cfg.sequence;
+    const SequenceBuild build = build_sequence(sc, input, input_len, payload_buf);
+    out.request_size = payload_buf.size();
+    out.messages_total = build.discovered;
+    out.messages_built = build.ranges.size();
+
+    network::pump_notif_listener();
+
+    uint64_t t_stage = utils::get_time_ms();
+    auto conn = network::connect_target(cfg.network);
+    out.connect_ms = utils::get_time_ms() - t_stage;
+    if (std::holds_alternative<network::ConnectError>(conn)) {
+        out.connect_error = std::get<network::ConnectError>(conn);
+        return out;
+    }
+    utils::FdGuard sock = std::get<utils::FdGuard>(std::move(conn));
+
+    bool broken = false;
+    // Optional early drain: servers with a banner/greeting (SMTP, SSH, ...)
+    // send it before any request. Disabled by default (0) for HTTP.
+    if (sc.initial_poll_us > 0) {
+        t_stage = utils::get_time_ms();
+        auto w = network::recv_window(sock.get(), sc.initial_poll_us, cfg.network.timeout_ms);
+        out.wait_ms += utils::get_time_ms() - t_stage;
+        out.initial_response_size = w.data.size();
+        out.response.insert(out.response.end(), w.data.begin(), w.data.end());
+        if (w.error) {
+            out.sequence_error = w.error;
+            broken = true;
+        }
+        if (w.closed) broken = true;
+    }
+
+    for (size_t i = 0; i < build.ranges.size() && !broken; ++i) {
+        const auto [begin, end] = build.ranges[i];
+
+        t_stage = utils::get_time_ms();
+        auto send_res = network::send_all(sock.get(), payload_buf.data() + begin, end - begin,
+                                          cfg.network.timeout_ms);
+        out.send_ms += utils::get_time_ms() - t_stage;
+        if (std::holds_alternative<network::SendError>(send_res)) {
+            out.send_error = std::get<network::SendError>(send_res);
+            out.failed_message_index = i;
+            break;
+        }
+        out.bytes_sent += end - begin;
+        ++out.messages_sent;
+
+        t_stage = utils::get_time_ms();
+        auto w = network::recv_window(sock.get(), sc.response_poll_us, cfg.network.timeout_ms);
+        out.wait_ms += utils::get_time_ms() - t_stage;
+        out.response_sizes.push_back(w.data.size());
+        out.response.insert(out.response.end(), w.data.begin(), w.data.end());
+        if (w.error) {
+            out.sequence_error = w.error;
+            out.failed_message_index = i;
+            break;
+        }
+        if (w.closed) break;  // peer is gone; further sends are pointless
+    }
+
+    t_stage = utils::get_time_ms();
+    shutdown(sock.get(), SHUT_WR);
+    out.shutdown_ms = utils::get_time_ms() - t_stage;
+
+    t_stage = utils::get_time_ms();
+    auto final_w = network::recv_window(sock.get(), sc.final_poll_us, cfg.network.timeout_ms);
+    out.wait_ms += utils::get_time_ms() - t_stage;
+    out.final_response_size = final_w.data.size();
+    out.response.insert(out.response.end(), final_w.data.begin(), final_w.data.end());
+    if (final_w.error && !out.sequence_error) {
+        out.sequence_error = final_w.error;
+    }
+
+    network::arm_rst_on_close(sock.get());
+    return out;
+}
+
 /**
  * @brief Performs one request/response cycle against the target: connect,
  *        send prefix + input + suffix, half-close (SHUT_WR), read the
  *        response. Does not touch target health or log; each caller does
  *        that per its mode. The socket is closed before returning.
  *
- * @param cfg The global configuration (network + payload sections).
+ *        With sequence.enabled, dispatches to exchange_sequence() instead:
+ *        the input is split into messages and each is sent/received in turn.
+ *
+ * @param cfg The global configuration (network + payload + sequence sections).
  * @param input The raw input bytes (fuzz testcase or test file contents).
  * @param input_len Number of bytes in @p input.
  * @param payload_buf Scratch buffer reused to build the final payload
@@ -204,6 +397,10 @@ static std::string probe_exhaustion_hint(const network::ProbeResult& pr) {
  */
 ExchangeOutcome exchange_once(const Config& cfg, const uint8_t* input, size_t input_len,
                               std::vector<uint8_t>& payload_buf) {
+    if (cfg.sequence.enabled) {
+        return exchange_sequence(cfg, input, input_len, payload_buf);
+    }
+
     ExchangeOutcome out;
     network::pump_notif_listener();
 
@@ -292,14 +489,16 @@ void run_fuzz_iteration(const Config& cfg, pid_t child_pid, int target_pidfd,
         case process::TargetState::Kind::Crashed:
             PROXY_LOG_WARN("target {} after connect failure, crashing the proxy so AFL respawns it",
                            st.to_string());
-            utils::crash_proxy("target crashed after connect failure: " + st.to_string(),
+            utils::crash_proxy("target crashed after connect failure: " + st.to_string()
+                                   + sequence_summary(cfg, ex),
                                payload_buf);
             break;
         case process::TargetState::Kind::Exited:
         case process::TargetState::Kind::Unknown:
             PROXY_LOG_WARN("target {} after connect failure, aborting the proxy so AFL respawns it",
                            st.to_string());
-            utils::abort_proxy("target " + st.to_string() + " after connect failure",
+            utils::abort_proxy("target " + st.to_string() + " after connect failure"
+                                   + sequence_summary(cfg, ex),
                                payload_buf);
             break;
         case process::TargetState::Kind::Alive:
@@ -327,6 +526,32 @@ void run_fuzz_iteration(const Config& cfg, pid_t child_pid, int target_pidfd,
         PROXY_LOG_TRACE("Request (size={}): '{}'",
                             ex.request_size,
                             casslog::escape_bytes(payload_buf, 256));
+        if (cfg.sequence.enabled) {
+            if (ex.messages_total > ex.messages_built) {
+                PROXY_LOG_WARN("sequence truncated to sequence.max_messages={}: sending {} of {} messages",
+                               cfg.sequence.max_messages, ex.messages_built, ex.messages_total);
+            }
+            PROXY_LOG_TRACE("sequence: sent {}/{} messages ({} bytes); final drain {} bytes",
+                            ex.messages_sent, ex.messages_built, ex.bytes_sent,
+                            ex.final_response_size);
+            if (ex.failed_message_index) {
+                std::string why = ex.send_error ? "send failed"
+                                 : (ex.sequence_error ? ex.sequence_error->to_string()
+                                                      : std::string("connection closed"));
+                PROXY_LOG_WARN("sequence stopped at message {}/{} ({} sent): {}",
+                               *ex.failed_message_index + 1, ex.messages_built,
+                               ex.messages_sent, why);
+            }
+            if (ex.sequence_error && stats.wait_err.allow()) {
+                PROXY_LOG_ERROR("sequence receive failed after {} ms: {}{}",
+                                ex.wait_ms, ex.sequence_error->to_string(),
+                                casslog::throttle_suffix(stats.wait_err));
+            }
+            if (ex.wait_ms >= budget_ms) {
+                PROXY_LOG_WARN("sequence response windows took {} ms total (>= timeout {} ms)",
+                               ex.wait_ms, budget_ms);
+            }
+        }
         if (ex.wait_error) {
             if (stats.wait_err.allow()) {
                 std::string hint;
@@ -343,7 +568,7 @@ void run_fuzz_iteration(const Config& cfg, pid_t child_pid, int target_pidfd,
             PROXY_LOG_TRACE("Response (size={}): '{}'",
                             ex.response.size(),
                             casslog::escape_bytes(ex.response, 256));
-            if (ex.wait_ms >= budget_ms) {
+            if (!cfg.sequence.enabled && ex.wait_ms >= budget_ms) {
                 PROXY_LOG_WARN("response took {} ms (>= timeout {} ms): {} bytes received; target kept the connection open",
                                ex.wait_ms, budget_ms, ex.response.size());
             }
@@ -408,7 +633,8 @@ void run_fuzz_iteration(const Config& cfg, pid_t child_pid, int target_pidfd,
                 PROXY_LOG_WARN("target {} after probe failure ({}), crashing the proxy so AFL records the finding",
                                st.to_string(), network::probe_outcome_to_string(pr.outcome));
                 utils::crash_proxy("target " + st.to_string() + " after probe failure ("
-                                       + network::probe_outcome_to_string(pr.outcome) + ")",
+                                       + network::probe_outcome_to_string(pr.outcome) + ")"
+                                       + sequence_summary(cfg, ex),
                                    payload_buf);
                 break;
             case process::TargetState::Kind::Exited:
@@ -416,7 +642,8 @@ void run_fuzz_iteration(const Config& cfg, pid_t child_pid, int target_pidfd,
                 PROXY_LOG_WARN("target {} after probe failure ({}), aborting the proxy so AFL respawns it",
                                st.to_string(), network::probe_outcome_to_string(pr.outcome));
                 utils::abort_proxy("target " + st.to_string() + " after probe failure ("
-                                       + network::probe_outcome_to_string(pr.outcome) + ")",
+                                       + network::probe_outcome_to_string(pr.outcome) + ")"
+                                       + sequence_summary(cfg, ex),
                                    payload_buf);
                 break;
             case process::TargetState::Kind::Alive:
@@ -444,7 +671,8 @@ void run_fuzz_iteration(const Config& cfg, pid_t child_pid, int target_pidfd,
                 utils::abort_proxy("probe connection " + network::probe_outcome_to_string(pr.outcome)
                                        + " in all " + std::to_string(cfg.network.probe_attempts)
                                        + " attempts in one iteration (total " + std::to_string(probe_ms)
-                                       + " ms" + err_detail + ") - target listener is gone",
+                                       + " ms" + err_detail + ") - target listener is gone"
+                                       + sequence_summary(cfg, ex),
                                    payload_buf);
             }
 
@@ -482,18 +710,19 @@ void run_fuzz_iteration(const Config& cfg, pid_t child_pid, int target_pidfd,
     switch (st.kind) {
     case process::TargetState::Kind::Crashed:
         PROXY_LOG_WARN("target {}, crashing the proxy so AFL records the finding", st.to_string());
-        utils::crash_proxy("target " + st.to_string(), payload_buf);
+        utils::crash_proxy("target " + st.to_string() + sequence_summary(cfg, ex), payload_buf);
         break;
     case process::TargetState::Kind::Exited:
     case process::TargetState::Kind::Unknown:
         PROXY_LOG_WARN("target {}, aborting the proxy so AFL records the finding", st.to_string());
-        utils::abort_proxy("target " + st.to_string(), payload_buf);
+        utils::abort_proxy("target " + st.to_string() + sequence_summary(cfg, ex), payload_buf);
         break;
     case process::TargetState::Kind::Alive:
         break; // normal case, keep fuzzing
     }
 
-    update_iteration_stats(stats, ex.connect_ms, ex.send_ms, ex.wait_ms, probe_ms, budget_ms);
+    update_iteration_stats(stats, ex.connect_ms, ex.send_ms, ex.wait_ms, probe_ms,
+                           ex.messages_built, budget_ms);
 }
 
 int run_proxy_mode(Config cfg, bool forward_output) {
@@ -760,6 +989,32 @@ int run_test_mode(const Config& cfg, const std::string& input_path, bool forward
     if (ex.send_error) {
         PROXY_LOG_ERROR("send failed: {}", ex.send_error->to_string());
         io_ok = false;
+    }
+
+    // Sequence mode: show per-message progress and slice the concatenated
+    // response using the per-window sizes so each reply is attributable.
+    if (cfg.sequence.enabled) {
+        if (ex.messages_total > ex.messages_built) {
+            PROXY_LOG_WARN("Sequence truncated to sequence.max_messages={}: sending {} of {} messages",
+                           cfg.sequence.max_messages, ex.messages_built, ex.messages_total);
+        }
+        PROXY_LOG_INFO("Sequence: sent {}/{} messages ({} bytes); final drain {} bytes",
+                       ex.messages_sent, ex.messages_built, ex.bytes_sent,
+                       ex.final_response_size);
+        if (ex.sequence_error) {
+            PROXY_LOG_ERROR("sequence receive failed: {}", ex.sequence_error->to_string());
+            io_ok = false;
+        }
+        size_t offset = ex.initial_response_size;
+        for (size_t i = 0; i < ex.response_sizes.size(); ++i) {
+            const size_t size = ex.response_sizes[i];
+            const size_t end = std::min(offset + size, ex.response.size());
+            const std::vector<uint8_t> slice(ex.response.begin() + offset,
+                                             ex.response.begin() + end);
+            PROXY_LOG_INFO("Message {}/{} response ({} bytes): '{}'",
+                           i + 1, ex.messages_built, size, casslog::escape_bytes(slice));
+            offset = end;
+        }
     }
 
     // Log the target's response in test mode (escaped, any binary safe).

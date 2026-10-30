@@ -42,8 +42,15 @@ struct Options {
     bool ignore_sigterm = false;
     bool keep_alive = false;
     bool with_crash = false;
-    std::string stdin_marker;  // empty: never touch stdin
+    bool multi_request = false;
+    std::string stdin_marker;   // empty: never touch stdin
+    std::string request_log;    // empty: do not log received messages
 };
+
+// Optional request log (--log-requests): one "<n> <bytes>" line per received
+// message, appended and flushed immediately so e2e tests can inspect how many
+// messages the proxy actually delivered on the connection.
+std::FILE* g_request_log = nullptr;
 
 [[noreturn]] void fatal(const std::string& message) {
     std::fprintf(stderr, "test-target: %s\n", message.c_str());
@@ -120,6 +127,18 @@ Options parse_options(int argc, char* argv[]) {
         .default_value(false)
         .implicit_value(true);
 
+    program.add_argument("--multi-request")
+        .help("keep handling framed requests on the same connection until EOF: "
+              "calc frames on '\\n', http on CRLFCRLF; one response per request "
+              "(exercises afl-cassowire sequence mode)")
+        .default_value(false)
+        .implicit_value(true);
+
+    program.add_argument("--log-requests")
+        .help("append one '<n> <bytes>' line per received message to this file "
+              "(lets e2e tests verify how many messages arrived)")
+        .default_value(std::string(""));
+
     program.add_argument("--stdin-marker")
         .help("read one newline-terminated line from stdin before binding and "
               "require it to equal this string (exercises fd-0 wiring, e.g. a "
@@ -159,6 +178,8 @@ Options parse_options(int argc, char* argv[]) {
     opts.ignore_sigterm = program.get<bool>("--ignore-sigterm");
     opts.keep_alive = program.get<bool>("--keep-alive");
     opts.with_crash = program.get<bool>("--with-crash");
+    opts.multi_request = program.get<bool>("--multi-request");
+    opts.request_log = program.get<std::string>("--log-requests");
     opts.stdin_marker = program.get<std::string>("--stdin-marker");
     return opts;
 }
@@ -197,30 +218,68 @@ void set_recv_timeout(int fd) {
     setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
 }
 
-bool request_complete(const std::string& data, bool stop_at_newline) {
-    if (stop_at_newline) {
-        return data.find('\n') != std::string::npos;
-    }
-    return data.find("\r\n\r\n") != std::string::npos;
-}
+// Buffered framed-request reader: returns exactly one message per call and
+// keeps any extra bytes (pipelined requests) for the next call. Used by
+// --multi-request so a single recv that spans several messages is not lost.
+class RequestReader {
+public:
+    RequestReader(int fd, bool stop_at_newline) : fd_(fd), stop_at_newline_(stop_at_newline) {}
 
-std::string read_request(int fd, bool stop_at_newline) {
-    std::string data;
-    char buffer[4096];
-    while (!g_stop) {
-        const ssize_t received = recv(fd, buffer, sizeof(buffer), 0);
-        if (received > 0) {
-            data.append(buffer, static_cast<size_t>(received));
-            if (request_complete(data, stop_at_newline) || data.size() >= kMaxRequestBytes) {
-                break;
+    // Reads the next framed request into @p out. Returns false when the
+    // connection is done (EOF/timeout/error) and no partial data is left.
+    bool next(std::string& out) {
+        out.clear();
+        while (!g_stop) {
+            const size_t frame = frame_end();
+            if (frame != std::string::npos) {
+                out = buffer_.substr(0, frame);
+                buffer_.erase(0, frame);
+                return true;
             }
-        } else if (received == 0) {
-            break;
-        } else if (errno != EINTR || g_stop) {
-            break;
+            if (buffer_.size() >= kMaxRequestBytes) {
+                // Unframed flood: hand the buffered bytes over as one message.
+                out.swap(buffer_);
+                return true;
+            }
+            char chunk[4096];
+            const ssize_t received = recv(fd_, chunk, sizeof(chunk), 0);
+            if (received > 0) {
+                buffer_.append(chunk, static_cast<size_t>(received));
+                continue;
+            }
+            if (received == 0) break;  // EOF
+            if (errno == EINTR) continue;
+            break;  // timeout (EAGAIN) or error: return whatever is buffered
         }
+        if (buffer_.empty()) {
+            return false;
+        }
+        out.swap(buffer_);
+        return true;
     }
-    return data;
+
+private:
+    // Position just past the next frame terminator, or npos if not yet seen.
+    size_t frame_end() const {
+        if (stop_at_newline_) {
+            const size_t pos = buffer_.find('\n');
+            return pos == std::string::npos ? std::string::npos : pos + 1;
+        }
+        const size_t pos = buffer_.find("\r\n\r\n");
+        return pos == std::string::npos ? std::string::npos : pos + 4;
+    }
+
+    int fd_;
+    bool stop_at_newline_;
+    std::string buffer_;
+};
+
+void log_request(size_t index, size_t bytes) {
+    if (g_request_log == nullptr) {
+        return;
+    }
+    std::fprintf(g_request_log, "%zu %zu\n", index, bytes);
+    std::fflush(g_request_log);
 }
 
 bool send_all(int fd, const std::string& data) {
@@ -365,9 +424,7 @@ bool parse_slow_ms(const std::string& line, long& out_ms) {
     return true;
 }
 
-void handle_connection(int fd, const Options& opts) {
-    set_recv_timeout(fd);
-    const std::string data = read_request(fd, opts.mode == "calc");
+void handle_message(int fd, const Options& opts, const std::string& data) {
     const std::string line = trim_end(data);
     if (line.empty()) {
         return;
@@ -394,6 +451,21 @@ void handle_connection(int fd, const Options& opts) {
         send_all(fd, calc_response(line, opts.with_crash));
     } else {
         send_all(fd, http_response(data));
+    }
+}
+
+void handle_connection(int fd, const Options& opts) {
+    set_recv_timeout(fd);
+    RequestReader reader(fd, opts.mode == "calc");
+    std::string data;
+    size_t index = 0;
+    while (reader.next(data)) {
+        ++index;
+        log_request(index, data.size());
+        handle_message(fd, opts, data);
+        if (!opts.multi_request) {
+            break;
+        }
     }
 }
 
@@ -453,6 +525,14 @@ int main(int argc, char* argv[]) {
     }
     if (g_stop) {
         return 0;
+    }
+
+    if (!opts.request_log.empty()) {
+        g_request_log = std::fopen(opts.request_log.c_str(), "a");
+        if (g_request_log == nullptr) {
+            fatal("--log-requests: cannot open '" + opts.request_log + "': " +
+                  std::strerror(errno));
+        }
     }
 
     std::vector<int> listeners;

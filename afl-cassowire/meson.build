@@ -27,6 +27,10 @@ yaml_cpp_dep = dependency('yaml-cpp', required : true)
 argparse_dep = dependency('argparse', required : true)
 spdlog_dep = dependency('spdlog', required : true)
 
+# network.cpp uses ppoll() for the microsecond response windows of sequence
+# mode (recv_window); ppoll is exposed by glibc only with _GNU_SOURCE.
+add_project_arguments('-D_GNU_SOURCE', language : 'cpp')
+
 # Compile-time floor for the PROXY_LOG_TRACE/PROXY_LOG_DEBUG macros (src/log.hpp).
 # With strip_low_logs=true the trace/debug statements compile to no-ops and the
 # --log-level runtime flag can only go down to info.

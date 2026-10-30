@@ -159,3 +159,28 @@ payload:
 
   # The prefix and suffix may be string or bytes
   # Omit the whole section (or a key) to send the payload unmodified.
+
+# Optional AFLNet-style sequence execution: split one AFL testcase into
+# messages and send them one at a time on a single connection (reading after
+# each send) instead of sending the testcase as one packet. AFL++ still mutates
+# the testcase byte-wise; this only changes how the proxy transmits it.
+sequence:
+  enabled: false               # opt-in; false/omitted = legacy single-payload mode
+  delimiter: !!binary DQoNCg== # Message separator (here CRLFCRLF); required when enabled.
+                               # Plain string or !!binary bytes; scanned left to right,
+                               # non-overlapping.
+  keep_delimiter: true         # true: keep the delimiter at the end of each message;
+                               # false: strip it (re-add via message_suffix if needed).
+  response_poll_us: 100        # Idle window after each message, in MICROSECONDS
+                               # (0 = one non-blocking drain only). This is the main
+                               # speed/fidelity knob: 0 is fastest but can break
+                               # lock-step protocols; >= 1 ms is AFLNet's default.
+  initial_poll_us: 0           # Optional early drain before the first message (server
+                               # banner/greeting), microseconds. 0 = disabled (HTTP).
+  final_poll_us: 100           # Final drain after shutdown(SHUT_WR), microseconds.
+                               # Servers that close on EOF end it immediately.
+  max_messages: 64             # Hard cap per iteration; truncation logs a WARN.
+  # message_prefix: ""         # Bytes prepended to every message (str or !!binary).
+  # message_suffix: ""         # Bytes appended to every message (str or !!binary).
+  # NOTE: payload.prefix/suffix cannot be combined with sequence.enabled; use the
+  # message_* keys above instead.

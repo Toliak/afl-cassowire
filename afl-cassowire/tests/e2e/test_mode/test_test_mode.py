@@ -234,3 +234,103 @@ def test_stdin_path_missing_file_fails(tmp_path: Path) -> None:
     assert res.returncode != 0, res.detail()
     assert "failed to open target.stdin_path" in res.stdout, res.detail()
     assert "Pass 2 (Single Iteration) completed successfully." not in res.stdout, res.detail()
+
+
+# --- AFLNet-style sequence mode -------------------------------------------
+
+
+def _sequence_config(tmp_path: Path, *, port: int, request_log: Path | None = None,
+                     primary: str = "procfs") -> Path:
+    target = harness.test_target_bin()
+    extra = ["--multi-request"]
+    if request_log is not None:
+        extra += ["--log-requests", str(request_log)]
+    return harness.write_config(
+        tmp_path,
+        target_args=[str(target), "calc", "--port", str(port), *extra],
+        port=port,
+        primary=primary,
+        sequence={
+            "enabled": True,
+            "delimiter": b"\n",
+            "keep_delimiter": True,
+            "response_poll_us": 10000,
+            "initial_poll_us": 0,
+            "final_poll_us": 5000,
+            "max_messages": 16,
+        },
+    )
+
+
+def test_sequence_messages_and_responses(tmp_path: Path) -> None:
+    port = harness.free_port()
+    request_log = tmp_path / "requests.log"
+    config = _sequence_config(tmp_path, port=port, request_log=request_log)
+    input_file = tmp_path / "input.bin"
+    input_file.write_bytes(b"2 + 2\n3 * 3\n")
+
+    res = harness.run_cassowire(config, "test", "--input", str(input_file))
+
+    assert_dump_map_pass(res, harness.test_target_bin())
+    assert res.returncode == 0, res.detail()
+    assert harness.error_lines(res.stdout) == [], res.detail()
+    assert "Sequence: sent 2/2 messages" in res.stdout, res.detail()
+    assert "Message 1/2 response (2 bytes): '" + harness.escaped(b"4\n") + "'" in res.stdout
+    assert "Message 2/2 response (2 bytes): '" + harness.escaped(b"9\n") + "'" in res.stdout
+    assert "Pass 2 (Single Iteration) completed successfully." in res.stdout
+    assert request_log.read_text().splitlines() == ["1 6", "2 6"]
+
+
+def test_sequence_empty_input_sends_nothing(tmp_path: Path) -> None:
+    port = harness.free_port()
+    request_log = tmp_path / "requests.log"
+    config = _sequence_config(tmp_path, port=port, request_log=request_log)
+    input_file = tmp_path / "input.bin"
+    input_file.write_bytes(b"")
+
+    res = harness.run_cassowire(config, "test", "--input", str(input_file))
+
+    assert_dump_map_pass(res, harness.test_target_bin())
+    assert res.returncode == 0, res.detail()
+    assert "Sequence: sent 0/0 messages" in res.stdout, res.detail()
+    assert "Pass 2 (Single Iteration) completed successfully." in res.stdout
+    assert request_log.read_text() == ""
+
+
+def test_sequence_rejects_payload_combination(tmp_path: Path) -> None:
+    port = harness.free_port()
+    target = harness.test_target_bin()
+    config = harness.write_config(
+        tmp_path,
+        target_args=[str(target), "calc", "--port", str(port)],
+        port=port,
+        payload={"suffix": "!"},
+        sequence={"enabled": True, "delimiter": b"\n"},
+    )
+    input_file = tmp_path / "input.bin"
+    input_file.write_bytes(b"2 + 2\n")
+
+    res = harness.run_cassowire(config, "test", "--input", str(input_file))
+
+    assert res.returncode == 1, res.detail()
+    assert "payload.prefix/suffix cannot be combined with sequence.enabled" in res.stdout, res.detail()
+
+
+def test_binary_payload_tag_is_decoded(tmp_path: Path) -> None:
+    # PyYAML emits `!!binary` for bytes values; the loader must base64-decode
+    # them (not send the base64 text). "2 + " + "2" + "\n" -> "4\n".
+    target = harness.test_target_bin()
+    port = harness.free_port()
+    config = harness.write_config(
+        tmp_path,
+        target_args=[str(target), "calc", "--port", str(port)],
+        port=port,
+        payload={"prefix": b"2 + ", "suffix": b"\n"},
+    )
+    input_file = tmp_path / "input.bin"
+    input_file.write_bytes(b"2")
+
+    res = harness.run_cassowire(config, "test", "--input", str(input_file))
+
+    assert_dump_map_pass(res, target)
+    assert_single_iteration_pass(res, CALC_RESPONSE)

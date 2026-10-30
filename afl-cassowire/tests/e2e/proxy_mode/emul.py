@@ -71,7 +71,19 @@ FS_NEW_OPT_NAMES = {
 CMP_MAP_W = 65536
 CMP_MAP_H = 32
 CMP_OPERANDS_SIZE = 72
-CMP_MAP_SIZE = CMP_MAP_W * 2 + CMP_MAP_W * CMP_MAP_H * CMP_OPERANDS_SIZE
+# struct cmp_map (include/cmplog.h): packed 2-byte cmp_header per slot, the
+# packed 72-byte cmp_operands log, then site_ids (u32) and attributes (u16)
+# per slot. Leaving out the last two arrays makes the segment too small and
+# the cmplog-instrumented target writes past its mapping (SIGSEGV at startup).
+CMP_HDR_SIZE = 2
+CMP_SITE_IDS_SIZE = 4
+CMP_ATTRIBUTES_SIZE = 2
+CMP_MAP_SIZE = (
+    CMP_MAP_W * CMP_HDR_SIZE
+    + CMP_MAP_W * CMP_MAP_H * CMP_OPERANDS_SIZE
+    + CMP_MAP_W * CMP_SITE_IDS_SIZE
+    + CMP_MAP_W * CMP_ATTRIBUTES_SIZE
+)
 
 # Coverage map: must hold the forced final loc (+1) of every writer and the
 # MAP_INITIAL_SIZE (2 MiB) default the runtime memsets when unforced.

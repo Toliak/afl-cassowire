@@ -504,6 +504,21 @@ void pump_notif_listener() {
 
 namespace {
 
+// Handles the seccomp notification-listener leg of a multiplexed poll().
+// Answers every queued notification so the target never stalls. Returns false
+// when the listener should no longer be watched: POLLHUP/POLLERR/POLLNVAL
+// without POLLIN means no task references it anymore (or the fd is invalid),
+// and keeping it in the poll set would busy-spin.
+bool handle_notif_revents(const struct pollfd& pfd) {
+    if (pfd.revents & POLLIN) {
+        pump_notif_listener();
+    }
+    if ((pfd.revents & (POLLHUP | POLLERR | POLLNVAL)) && !(pfd.revents & POLLIN)) {
+        return false;
+    }
+    return true;
+}
+
 // Polls @p sock for @p events while also watching the seccomp notification
 // listener fd (when active). If the target (or any thread/worker under the
 // inherited filter) issues a bind()/listen() while we are blocked waiting on
@@ -544,17 +559,53 @@ int poll_with_notif(int sock, short events, uint64_t deadline_start_ms, int time
         }
 
         if (nfds == 2 && pfds[1].revents != 0) {
-            if (pfds[1].revents & POLLIN) {
-                pump_notif_listener();
-            }
-            if ((pfds[1].revents & (POLLHUP | POLLERR | POLLNVAL)) &&
-                !(pfds[1].revents & POLLIN)) {
-                // No task references the listener anymore (or fd invalid);
-                // stop polling it so POLLHUP cannot busy-spin this loop.
-                watch_notif = false;
-            }
+            // No task references the listener anymore (or fd invalid): stop
+            // watching it so POLLHUP cannot busy-spin this loop.
+            watch_notif = handle_notif_revents(pfds[1]);
         }
 
+        if (pfds[0].revents != 0) {
+            return 1;
+        }
+    }
+}
+
+// Microsecond-granularity variant of poll_with_notif(), used by recv_window()
+// for sequence mode's short response windows (response_poll_us). Same seccomp
+// multiplexing invariant: the notification fd is polled alongside the data
+// socket so a bind()/listen() during the wait is answered immediately.
+// Returns: 1 when @p sock has revents, 0 when the idle window expired, -1 on
+// poll() error (errno set; EINTR is retried internally).
+int poll_with_notif_us(int sock, short events, int idle_poll_us) {
+    bool watch_notif = (g_notif_fd >= 0);
+    struct timespec ts;
+    ts.tv_sec = idle_poll_us / 1000000;
+    ts.tv_nsec = static_cast<long>(idle_poll_us % 1000000) * 1000L;
+
+    while (true) {
+        struct pollfd pfds[2];
+        pfds[0].fd = sock;
+        pfds[0].events = events;
+        pfds[0].revents = 0;
+
+        nfds_t nfds = 1;
+        if (watch_notif && g_notif_fd >= 0) {
+            pfds[1].fd = g_notif_fd;
+            pfds[1].events = POLLIN;
+            pfds[1].revents = 0;
+            nfds = 2;
+        }
+
+        const int pr = ppoll(pfds, nfds, &ts, nullptr);
+        if (pr < 0) {
+            if (errno == EINTR) continue;
+            return -1;
+        }
+        if (pr == 0) return 0;
+
+        if (nfds == 2 && pfds[1].revents != 0) {
+            watch_notif = handle_notif_revents(pfds[1]);
+        }
         if (pfds[0].revents != 0) {
             return 1;
         }
@@ -689,6 +740,60 @@ WaitResult wait_response(int sock, int timeout_ms) {
     }
 
     return data;
+}
+
+RecvWindowResult recv_window(int sock, int idle_poll_us, int cap_ms) {
+    RecvWindowResult out;
+    uint8_t buf[16384];
+    const uint64_t start = utils::get_time_ms();
+    const uint64_t cap = cap_ms > 0 ? static_cast<uint64_t>(cap_ms) : 1;
+
+    while (true) {
+        uint64_t elapsed = utils::get_time_ms() - start;
+        if (elapsed >= cap) {
+            out.elapsed_ms = elapsed;
+            return out;
+        }
+
+        const int poll_res = poll_with_notif_us(sock, POLLIN, idle_poll_us);
+        if (poll_res < 0) {
+            out.error = WaitError{WaitError::Kind::PollFailed, errno};
+            out.elapsed_ms = utils::get_time_ms() - start;
+            return out;
+        }
+        if (poll_res == 0) {
+            // Idle window expired with no data: the normal end of a response
+            // window (not an error, unlike wait_response()).
+            out.elapsed_ms = utils::get_time_ms() - start;
+            return out;
+        }
+
+        // Drain everything currently queued, then poll again with a fresh idle
+        // window. The overall budget is re-checked inside the drain so a
+        // continuously streaming server cannot pin the iteration.
+        while (true) {
+            const ssize_t n = recv(sock, buf, sizeof(buf), 0);
+            if (n > 0) {
+                out.data.insert(out.data.end(), buf, buf + n);
+                elapsed = utils::get_time_ms() - start;
+                if (elapsed >= cap) {
+                    out.elapsed_ms = elapsed;
+                    return out;
+                }
+                continue;
+            }
+            if (n == 0) {
+                out.closed = true;
+                out.elapsed_ms = utils::get_time_ms() - start;
+                return out;
+            }
+            if (errno == EINTR) continue;
+            if (errno == EAGAIN || errno == EWOULDBLOCK) break;
+            out.error = WaitError{WaitError::Kind::RecvFailed, errno};
+            out.elapsed_ms = utils::get_time_ms() - start;
+            return out;
+        }
+    }
 }
 
 std::string probe_outcome_to_string(ProbeOutcome outcome) {

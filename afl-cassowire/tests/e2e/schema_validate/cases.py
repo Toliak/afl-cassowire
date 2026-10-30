@@ -29,6 +29,7 @@ from blocks import (
     network_block,
     payload_block,
     port_detection_block,
+    sequence_block,
     target_block,
 )
 
@@ -64,6 +65,7 @@ def _build_full() -> dict[str, Any]:
             prefix="GET / HTTP/1.1\r\nHost: localhost\r\n\r\n",
             suffix=b"\r\n\r\n",
         ),
+        "sequence": sequence_block(),
     }
 
 
@@ -219,12 +221,73 @@ CASES: list[Case] = [
         # surrounding setup creates) to the target's fd 0.
         lambda: base_config(target=target_block(stdin_path="/run/target/in.fifo")),
     ),
+    Case(
+        "valid_sequence_disabled",
+        True,
+        # Sequence mode is opt-in; a disabled/omitted section keeps the legacy
+        # single-payload behavior, and `delimiter` is then optional.
+        lambda: base_config(sequence={"enabled": False}),
+    ),
+    Case(
+        "valid_sequence_null",
+        True,
+        # A null sequence section is accepted and treated as empty.
+        lambda: base_config(sequence=None),
+    ),
+    Case(
+        "valid_sequence_full",
+        True,
+        # All sequence keys populated; delimiter is bytes (rendered as !!binary).
+        lambda: base_config(sequence=sequence_block(message_suffix=b"\n")),
+    ),
+    Case(
+        "valid_sequence_plain_delimiter",
+        True,
+        # Delimiter may be a plain string.
+        lambda: base_config(sequence=sequence_block(delimiter="\n", keep_delimiter=False)),
+    ),
     # ------------------------------- must fail -------------------------------
     Case(
         "invalid_afl_loop_count_zero",
         False,
         # afl.loop_count must be > 0.
         lambda: base_config(afl=afl_block(loop_count=0)),
+    ),
+    Case(
+        "invalid_sequence_missing_delimiter",
+        False,
+        # sequence.enabled requires a delimiter.
+        lambda: base_config(sequence={"enabled": True}),
+    ),
+    Case(
+        "invalid_sequence_empty_delimiter",
+        False,
+        # The delimiter must be non-empty when sequence mode is enabled.
+        lambda: base_config(sequence=sequence_block(delimiter="")),
+    ),
+    Case(
+        "invalid_sequence_unknown_key",
+        False,
+        # Unknown keys inside sequence are rejected.
+        lambda: base_config(sequence=sequence_block(bogus_key=True)),
+    ),
+    Case(
+        "invalid_sequence_negative_poll",
+        False,
+        # Poll windows are microseconds and cannot be negative.
+        lambda: base_config(sequence=sequence_block(response_poll_us=-1)),
+    ),
+    Case(
+        "invalid_sequence_max_messages_zero",
+        False,
+        # At least one message must be allowed.
+        lambda: base_config(sequence=sequence_block(max_messages=0)),
+    ),
+    Case(
+        "invalid_sequence_delimiter_type",
+        False,
+        # A delimiter must be a scalar (string or !!binary), not a list.
+        lambda: base_config(sequence=sequence_block(delimiter=["\r\n", "\r\n"])),
     ),
     Case(
         "invalid_afl_msg_log_level",

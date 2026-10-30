@@ -46,6 +46,7 @@ Variants follow the `build_<variant>` targets in each target's `Makefile`
 make TARGET=nginx prepare-data                 # render data_template/*.j2 -> data/ (+ cassowire.yaml)
 make TARGET=nginx FUZZER=aflpp prepare-seeds   # merge SEED_SOURCES into in/
 make TARGET=nginx FUZZER=aflnet prepare-seeds  # request-sequence seeds for AFLNet
+make TARGET=nginx PROFILE=http-seq FUZZER=aflpp prepare-seeds  # multi-request sessions
 ```
 
 `prepare-data` renders every `*.j2` in `data_template/` (multi-output via the
@@ -64,6 +65,38 @@ Each fuzz run is a separate `podman run`; rootless podman provides user-mode
 networking by default, so every instance is network-isolated (no port collisions,
 no host exposure). Run multiple campaigns simply by launching more `make ... fuzz`
 processes.
+
+### Sequence (AFLNet-style) fuzzing
+
+`PROFILE=http-seq` drives afl-cassowire's sequence mode: each seed is a session
+of several CRLFCRLF-terminated requests, and the proxy sends them one at a time
+on a single connection, reading after each send (AFLNet's execution model). AFL++
+still mutates the session byte-wise.
+
+```sh
+make TARGET=nginx PROFILE=http-seq prepare-data
+make TARGET=nginx PROFILE=http-seq FUZZER=aflpp prepare-seeds
+make TARGET=nginx PROFILE=http-seq FUZZER=aflpp fuzz
+```
+
+The generated config is `data/cassowire.seq.yaml`; the knobs live in its
+`sequence:` section:
+
+- `delimiter` (required when enabled) — message separator, plain string or
+  `!!binary` bytes; scanned left to right.
+- `keep_delimiter` — keep the separator at the end of each sent message
+  (`true`) or strip it and re-add via `message_suffix`.
+- `response_poll_us` — per-message idle window in **microseconds**; the main
+  speed/fidelity knob (`0` = one non-blocking drain; >=1000 approximates
+  AFLNet's default but costs ~1 ms per message).
+- `initial_poll_us` — optional banner drain before the first message.
+- `final_poll_us` — drain after `shutdown(SHUT_WR)`.
+- `max_messages` — per-iteration cap; truncation logs a WARN.
+
+`payload.prefix/suffix` cannot be combined with sequence mode; use
+`sequence.message_prefix/message_suffix` instead. Because mutation is still
+byte-level, keep the dictionary (`_fuzz/dict/http-seq.dict`) close at hand and
+prefer `response_poll_us` low for throughput.
 
 ## 6. Coverage
 

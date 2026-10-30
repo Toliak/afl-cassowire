@@ -236,6 +236,50 @@ namespace network {
     [[nodiscard]] WaitResult wait_response(int sock, int timeout_ms);
 
     /**
+     * @brief Result of recv_window(): the bytes that arrived within one bounded
+     *        response window, plus whether the peer closed and how long the
+     *        window took.
+     *
+     * Unlike wait_response(), an idle window expiring is NOT an error: sequence
+     * mode treats "nothing more arrived within response_poll_us" as normal and
+     * moves on to the next message. Only poll()/recv() failures populate
+     * @p error.
+     */
+    struct RecvWindowResult {
+        std::vector<uint8_t> data;          ///< bytes received during the window
+        bool closed = false;                ///< peer sent EOF during the window
+        uint64_t elapsed_ms = 0;            ///< wall-clock cost of the whole window
+        std::optional<WaitError> error;     ///< only PollFailed / RecvFailed
+    };
+
+    /**
+     * @brief Reads whatever the peer sends until it has been idle for
+     *        @p idle_poll_us or the @p cap_ms budget is exhausted.
+     *
+     * Used by AFLNet-style sequence execution: after each message the proxy
+     * waits a short, configurable window for the server's response instead of
+     * reading until EOF (which keep-alive servers never send). Semantics:
+     *  - poll the socket (multiplexing the seccomp notification fd, like every
+     *    other socket wait in this module) for @p idle_poll_us;
+     *  - when readable, recv() until EAGAIN and then poll again with a fresh
+     *    idle window; return when a window expires with no data, on EOF, or on
+     *    error;
+     *  - @p idle_poll_us == 0 performs exactly one non-blocking poll + drain,
+     *    so a caller that does not need response pacing pays no sleep;
+     *  - the whole call is bounded by @p cap_ms (pass network.timeout_ms) so a
+     *    continuously streaming server cannot consume the iteration.
+     *
+     * The socket must be non-blocking (connect_target() returns one).
+     *
+     * @param sock The socket file descriptor.
+     * @param idle_poll_us Idle window in microseconds (>= 0).
+     * @param cap_ms Overall wall-clock budget in milliseconds (> 0).
+     * @return RecvWindowResult The received bytes, EOF flag, elapsed time and
+     *         an optional poll/recv error (never TimedOut).
+     */
+    [[nodiscard]] RecvWindowResult recv_window(int sock, int idle_poll_us, int cap_ms);
+
+    /**
      * @brief Outcome of probe_target().
      */
     enum class ProbeOutcome {

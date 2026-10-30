@@ -32,6 +32,17 @@
     },
     "payload": {
       "$ref": "#/definitions/payload_section"
+    },
+    "sequence": {
+      "anyOf": [
+        {
+          "type": "null"
+        },
+        {
+          "$ref": "#/definitions/sequence_section"
+        }
+      ],
+      "description": "Optional AFLNet-style sequence execution; a null section is accepted and treated as empty (like payload)."
     }
   },
   "allOf": [
@@ -58,6 +69,35 @@
           },
           "network_cmplog": {
             "$ref": "#/definitions/network_section"
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "required": ["sequence"],
+        "properties": {
+          "sequence": {
+            "type": "object",
+            "properties": {
+              "enabled": {
+                "const": true
+              }
+            },
+            "required": ["enabled"]
+          }
+        }
+      },
+      "then": {
+        "properties": {
+          "sequence": {
+            "required": ["delimiter"],
+            "properties": {
+              "delimiter": {
+                "type": "string",
+                "minLength": 1
+              }
+            }
           }
         }
       }
@@ -219,8 +259,65 @@
         }
       }
     },
+    "sequence_section": {
+      "type": "object",
+      "additionalProperties": false,
+      "description": "AFLNet-style sequence execution. When enabled, one AFL testcase is split into messages at `delimiter` and the proxy sends them one at a time on a single connection, reading after each send (AFLNet's send/receive model). AFL++ still mutates the testcase byte-wise. payload.prefix/suffix cannot be combined with this mode - use message_prefix/message_suffix instead (enforced by the loader).",
+      "properties": {
+        "enabled": {
+          "type": "boolean",
+          "default": false,
+          "description": "Enable sequence execution. When false/omitted the proxy sends the testcase as one payload (legacy behavior)."
+        },
+        "delimiter": {
+          "$ref": "#/definitions/bytes_value",
+          "description": "Message separator scanned in the input (non-overlapping, left to right). Required and non-empty when enabled. Plain string or YAML !!binary bytes."
+        },
+        "keep_delimiter": {
+          "type": "boolean",
+          "default": true,
+          "description": "true: each sent message keeps its trailing delimiter. false: the delimiter is stripped from the message (re-add it via message_suffix if the protocol needs one)."
+        },
+        "response_poll_us": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 5000000,
+          "default": 100,
+          "description": "Idle window waited after each message before sending the next one, in MICROSECONDS. 0 performs one non-blocking drain only: fastest, but unsuitable for lock-step protocols that need the response before the next request."
+        },
+        "initial_poll_us": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 5000000,
+          "default": 0,
+          "description": "Idle window for the optional early drain before the first message (server banner/greeting), in microseconds. 0 disables it (the right default for HTTP)."
+        },
+        "final_poll_us": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 5000000,
+          "default": 100,
+          "description": "Idle window for the final drain after shutdown(SHUT_WR), in microseconds. A server that closes on EOF ends the drain immediately, so this usually costs nothing."
+        },
+        "max_messages": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 1024,
+          "default": 64,
+          "description": "Hard cap on the number of messages sent per iteration; truncation is logged at WARN."
+        },
+        "message_prefix": {
+          "$ref": "#/definitions/bytes_value",
+          "description": "Bytes prepended to every message after splitting (plain string or YAML !!binary bytes)."
+        },
+        "message_suffix": {
+          "$ref": "#/definitions/bytes_value",
+          "description": "Bytes appended to every message after splitting (plain string or YAML !!binary bytes)."
+        }
+      }
+    },
     "payload_section": {
-      "description": "Optional prefix/suffix wrapped around every payload sent to the target (in `proxy` and `test` mode): the transmitted data is prefix + fuzz input + suffix. Values may be plain strings or YAML `!!binary` base64-encoded bytes (a YAML tag, which JSON Schema cannot see - tagged scalars appear as plain strings here). Omit the section or a key to send the payload unmodified. A null section is accepted and treated as empty.",
+      "description": "Optional prefix/suffix wrapped around every payload sent to the target (in `proxy` and `test` mode): the transmitted data is prefix + fuzz input + suffix. Values may be plain strings or YAML `!!binary` base64-encoded bytes (a YAML tag, which JSON Schema cannot see - tagged scalars appear as plain strings here). Omit the section or a key to send the payload unmodified. A null section is accepted and treated as empty. Cannot be combined with sequence.enabled: use sequence.message_prefix/message_suffix there.",
       "anyOf": [
         {
           "type": "null"
