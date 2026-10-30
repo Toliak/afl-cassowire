@@ -23,9 +23,17 @@ result = compiler.run(code, name : 'check that is afl++ compiler', required: tru
 # Dependencies
 # No explicit dependency('threads'): the proxy has no threads and spdlog's
 # pkg-config entry already propagates -pthread.
-yaml_cpp_dep = dependency('yaml-cpp', required : true)
-argparse_dep = dependency('argparse', required : true)
-spdlog_dep = dependency('spdlog', required : true)
+static_link = get_option('static_link')
+yaml_cpp_dep = dependency('yaml-cpp', required : true, static : static_link)
+argparse_dep = dependency('argparse', required : true, static : static_link)
+# spdlog resolves fmt from inside its own subproject, which does not inherit
+# the static kwarg from the spdlog dependency. Configure fmt first so that a
+# fully static link uses libfmt.a instead of libfmt.so.
+if static_link
+    fmt_dep = dependency('fmt', required : false, static : true,
+                         fallback : ['fmt', 'fmt_dep'])
+endif
+spdlog_dep = dependency('spdlog', required : true, static : static_link)
 
 # Compile-time floor for the PROXY_LOG_TRACE/PROXY_LOG_DEBUG macros (src/log.hpp).
 # With strip_low_logs=true the trace/debug statements compile to no-ops and the
@@ -50,10 +58,16 @@ sources = files(
     'src/utils.cpp',
 )
 
+link_args = []
+if static_link
+    link_args += '-static'
+endif
+
 executable(
     'afl-cassowire',
     sources,
     include_directories : include_dirs,
     dependencies : [yaml_cpp_dep, argparse_dep, spdlog_dep],
+    link_args : link_args,
     install : true,
 )

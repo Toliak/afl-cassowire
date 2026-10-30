@@ -20,6 +20,9 @@ make prepare2   # meson setup build with CXX=<aflpp>/src/distrib/bin/afl-clang-f
 make build      # meson compile -C build (sets AFL_CASSOWIRE_LLVM_ONLY_FSRV=1)
 ```
 
+The default build is dynamically linked. Pass `STATIC=1` to `prepare2`/`build`
+for a fully static build (Meson `-Dstatic_link=true`); it uses `build-static/`.
+
 `AFLPP_DISTRIB_DIR` defaults to `../aflpp/src/distrib`; override if AFL++ lives elsewhere.
 
 ## Testing policy (strict)

@@ -27,6 +27,8 @@ RUN_IN_CONTAINER ?= 1
 PODMAN           ?= podman
 WITH_QEMU        ?= 1
 GIT_DEPTH        ?= 1
+STATIC           ?= 0
+AFL_CASSOWIRE_BUILD_DIR := $(if $(filter 1,$(strip $(STATIC))),build-static,build)
 
 # Targets whose Makefiles are container-local (no podman).
 CONTAINER_TARGETS := nginx tiny-nginx haproxy h2o cassowire-test-target
@@ -84,11 +86,13 @@ help:
 		'          AFL_FUZZ_CPU=<n> (afl-fuzz -b, default 0)' \
 		'          WITH_QEMU=0|1 (aflpp QEMU support, default 1)' \
 		'          GIT_DEPTH=<n>|0 (aflpp clone depth, default 1; 0 = full)' \
+		'          STATIC=0|1 (afl-cassowire static link, default 0)' \
 		'          RUN_IN_CONTAINER=1|0 (default 1; 0 runs targets directly)' \
 		'' \
 		'Examples (host):' \
 		'  make aflpp WITH_QEMU=0' \
 		'  make afl-cassowire' \
+		'  make afl-cassowire STATIC=1' \
 		'  make TARGET=nginx VARIANT=afl-clang-fast build' \
 		'  make TARGET=nginx prepare-data' \
 		'  make TARGET=nginx FUZZER=aflpp prepare-seeds' \
@@ -129,7 +133,7 @@ aflnet:
 afl-cassowire:
 	$(PODMAN_RUN) -w $(CONTAINER_WORKDIR)/afl-cassowire \
 		$(TOOLCHAIN_IMAGE) bash -lc \
-		'make prepare && { [ -f build/build.ninja ] || make prepare2; } && make build'
+		'make prepare && { [ -f $(AFL_CASSOWIRE_BUILD_DIR)/build.ninja ] || make prepare2 STATIC=$(STATIC); } && make build STATIC=$(STATIC)'
 
 shell:
 	$(SHELL_CMD)

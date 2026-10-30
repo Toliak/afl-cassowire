@@ -1,4 +1,5 @@
 /build
+/build-static
 /.cache
 
 __pycache__
