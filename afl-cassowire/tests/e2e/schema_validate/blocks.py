@@ -39,6 +39,21 @@ def payload_block(**overrides: Any) -> dict[str, Any]:
     return dict(overrides)
 
 
+def sequence_block(**overrides: Any) -> dict[str, Any]:
+    """Valid `sequence:` section (only `delimiter` is required when enabled)."""
+    block: dict[str, Any] = {
+        "enabled": True,
+        "delimiter": b"\r\n\r\n",
+        "keep_delimiter": True,
+        "response_poll_us": 100,
+        "initial_poll_us": 0,
+        "final_poll_us": 100,
+        "max_messages": 64,
+    }
+    block.update(overrides)
+    return block
+
+
 def base_config(**sections: Any) -> dict[str, Any]:
     """Base valid config: only the required sections, plus any extra sections."""
     return {"target": target_block(), "network": network_block(), **sections}

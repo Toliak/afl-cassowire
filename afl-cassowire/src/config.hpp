@@ -126,6 +126,39 @@ struct PayloadConfig {
     std::vector<uint8_t> suffix;  // Appended to each payload (empty if unset)
 };
 
+// Optional AFLNet-style sequence execution. When enabled, one AFL testcase is
+// split into messages at `delimiter` and the proxy sends them one at a time on
+// a single connection, reading after each send (AFLNet's send/receive model).
+// The testcase is still mutated by AFL++; this only changes how the proxy
+// transmits it. PayloadConfig prefix/suffix cannot be combined with this mode
+// (use message_prefix/message_suffix instead).
+struct SequenceConfig {
+    bool enabled = false;
+    // Message separator scanned in the input (non-overlapping, left to right).
+    // Required and non-empty when enabled.
+    std::vector<uint8_t> delimiter;
+    // true: each sent message keeps its trailing delimiter; false: the
+    // delimiter is stripped (re-add it via message_suffix if the protocol
+    // needs one).
+    bool keep_delimiter = true;
+    // Idle window waited after each message before moving on, in microseconds.
+    // 0 performs one non-blocking drain only (fastest; unsuitable for
+    // lock-step protocols that need the response before the next request).
+    int response_poll_us = 100;
+    // Idle window for the optional early drain before the first message
+    // (server banner/greeting). 0 disables it (the right default for HTTP).
+    int initial_poll_us = 0;
+    // Idle window for the final drain after shutdown(SHUT_WR). A server that
+    // closes on EOF ends the drain immediately, so this usually costs nothing.
+    int final_poll_us = 100;
+    // Hard cap on the number of messages sent per iteration; truncation is
+    // logged as a WARN so a silently shortened session is visible.
+    int max_messages = 64;
+    // Per-message wrapping applied to every message after splitting.
+    std::vector<uint8_t> message_prefix;
+    std::vector<uint8_t> message_suffix;
+};
+
 struct Config {
     TargetConfig target;
     TargetConfig target_cmplog;  // compare-mode target, used instead of `target` when __AFL_CMPLOG_SHM_ID is set
@@ -136,6 +169,7 @@ struct Config {
     PortDetectionConfig port_detection;
     CleanupConfig cleanup;
     PayloadConfig payload;
+    SequenceConfig sequence;
 };
 
 // Loads and strictly validates the YAML configuration file.

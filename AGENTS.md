@@ -24,6 +24,7 @@ make TARGET=nginx VARIANT=afl-clang-fast build # build one variant
 make TARGET=nginx prepare-data                 # render data_template/*.j2 -> data/
 make TARGET=nginx FUZZER=aflpp prepare-seeds   # merge seeds into in/
 make TARGET=nginx FUZZER=aflpp fuzz            # fuzz (aflpp + afl-cassowire)
+make TARGET=nginx PROFILE=http-seq fuzz        # sequence mode (AFLNet-style sessions)
 make TARGET=nginx FUZZER=aflnet fuzz           # fuzz (AFLNet, stateful HTTP)
 make TARGET=nginx cov                          # lcov coverage
 make TARGET=nginx crashes                      # collect crashes

@@ -13,7 +13,7 @@ NGINX_BRANCH := release-1.31.4
 # ---------------------------------------------------------------------------
 
 DEFAULT_PROFILE := http
-PROFILES := http
+PROFILES := http http-seq
 
 # Coverage/triage goals without an explicit profile aggregate every profile;
 # seed/fuzz goals default to the target's primary profile.
@@ -144,7 +144,7 @@ prepare-data:
 prepare-seeds:
 	$(ORC) $(TARGET_NAME) prepare-seeds --fuzzer $(FUZZER) $(PROFILE_ARG) --out $(AFL_IN_DIR)
 
-CASSOWIRE_CONFIG ?= data/cassowire.yaml
+CASSOWIRE_CONFIG ?= $(if $(filter http-seq,$(PROFILE)),data/cassowire.seq.yaml,data/cassowire.yaml)
 FUZZER           ?= aflpp
 AFL_FUZZ_CPU     ?= 0
 AFL_IN_DIR       ?= in/$(FUZZ_PROFILE)

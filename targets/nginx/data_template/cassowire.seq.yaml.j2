@@ -1,0 +1,49 @@
+# yaml-language-server: $schema=../../afl-cassowire/schema/config.schema.json
+
+# Sequence-mode profile: same target/network as cassowire.yaml, but the fuzz
+# testcase is a session of CRLFCRLF-terminated HTTP requests and the proxy
+# sends them one at a time on a single connection (AFLNet-style).
+
+target:
+  binary: "./src/install/afl-clang-fast/usr/bin/nginx"           # Path to the target binary (required)
+  args: ["nginx", "-c", "{{ target_dir }}/data/nginx.new.conf"]                     # Additional arguments (binary is added automatically)
+
+target_cmplog:
+  binary: "./src/install/afl-clang-fast_cmplog/usr/bin/nginx"           # Path to the compare-mode target binary (required)
+  args: ["nginx", "-c", "{{ target_dir }}/data/nginx.new.cmplog.conf"]                     # Additional arguments (binary is added automatically)
+
+network: &network
+  host: "127.0.10.1"           # TCP host to connect to
+  port: 8080                   # Port to connect to (1-65535, required)
+  timeout_ms: 100              # Network send/recv timeout in milliseconds
+  initial_ms: 200              # Port detection timeout in milliseconds
+
+  probe: true
+  probe_retry_ms: 10
+  probe_attempts: 3
+
+network_cmplog:
+  <<: *network
+  port: 9080                   # Port to connect to (1-65535, required)
+
+afl:
+  loop_count: 10000            # Number of __AFL_LOOP iterations
+  enable_cmplog: true         # Enable AFL compare log (requires __AFL_CMPLOG_SHM_ID)
+  cov_discard_init: true
+
+port_detection:
+  primary: "seccomp"            # Method: "procfs" or "seccomp"
+  verify_ownership: true
+
+# AFLNet-style sequence execution: split the testcase at CRLFCRLF and send each
+# request separately, reading the response after each send. response_poll_us is
+# the per-message idle window in microseconds; 0 is fastest but assumes the
+# server processes pipelined requests without needing the client to read.
+sequence:
+  enabled: true
+  delimiter: !!binary DQoNCg==  # CRLFCRLF
+  keep_delimiter: true
+  response_poll_us: 100
+  initial_poll_us: 0
+  final_poll_us: 100
+  max_messages: 64

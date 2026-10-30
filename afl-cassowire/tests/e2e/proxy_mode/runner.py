@@ -91,7 +91,8 @@ def write_config(
     cmplog: bool = False,
     primary: str = "procfs",
     loop_count: int = LOOP_COUNT,
-    payload: dict[str, str] | None = None,
+    payload: dict[str, str | bytes] | None = None,
+    sequence: dict[str, Any] | None = None,
     stdin_path: str | None = None,
     target_extra_args: list[str] | None = None,
 ) -> Path:
@@ -127,6 +128,8 @@ def write_config(
     }
     if payload is not None:
         config["payload"] = payload
+    if sequence is not None:
+        config["sequence"] = sequence
     if cmplog:
         cmplog_binary = str(test_target_bin(CMPLOG_VARIANT))
         config["target_cmplog"] = {
@@ -175,8 +178,13 @@ class ProxyRun:
         return zlib.decompress((self.out_dir / "cmp.bin.zlib").read_bytes())
 
 
-def run_proxy_mode(out_dir: Path, config_path: Path, corpus: str, *, cmplog: bool = False) -> ProxyRun:
-    """Drive one emulator run; raises AssertionError when the emulator itself crashes."""
+def run_proxy_mode(out_dir: Path, config_path: Path, corpus: str, *,
+                   cmplog: bool = False, iterations: int = LOOP_COUNT) -> ProxyRun:
+    """Drive one emulator run; raises AssertionError when the emulator itself crashes.
+
+    `iterations` must match the config's afl.loop_count. Tests that expect the
+    proxy to terminate early (e.g. a target crash) use 1.
+    """
     command = [
         sys.executable,
         str(EMUL_PATH),
@@ -187,7 +195,7 @@ def run_proxy_mode(out_dir: Path, config_path: Path, corpus: str, *, cmplog: boo
         "--mode",
         "cmplog" if cmplog else "normal",
         "--iterations",
-        str(LOOP_COUNT),
+        str(iterations),
         "--out-dir",
         str(out_dir),
         "--input",

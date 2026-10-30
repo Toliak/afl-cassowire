@@ -103,7 +103,7 @@ are ignored helper-anchor fields (see Important details).
 - `src/network.{hpp,cpp}` — namespace `network`: port detection (`procfs` |
   `seccomp`, both in `wait_for_port()`), the steady-state notification pump
   (`set_notif_listener`/`pump_notif_listener`) plus TCP client (`connect_target`, `send_all`,
-  `wait_response`).
+  `wait_response`, and the sequence-mode `recv_window`).
 - `src/utils.{hpp,cpp}` — namespace `utils`: time, sleep, `crash_proxy()`/`abort_proxy()`
   (shared `terminate_proxy()` implementation) and their termination dumps.
 - Header guards are `#pragma once`; Doxygen-style comments on public functions;
@@ -129,8 +129,13 @@ are ignored helper-anchor fields (see Important details).
   Every notification must be answered (`SECCOMP_USER_NOTIF_FLAG_CONTINUE`):
   the filter is irremovable, so `network::pump_notif_listener()` (non-blocking
   drain; registered after detection via `network::set_notif_listener()`) runs
-  from `exchange_once` and the network poll loops for the target's whole life
-  (worst-case stall for the target = one poll leg). Both detection methods and
+  from `exchange_once`, and every socket wait in `connect_target`,
+  `send_all`, `wait_response`, `probe_target` (`poll_with_notif`) and
+  `recv_window` (`poll_with_notif_us`, `ppoll` for microsecond windows) in
+  `network.cpp` multiplexes the seccomp notification fd alongside the TCP
+  socket so any `bind()`/`listen()` notification arriving after the configured
+  port (e.g. nginx's TLS/QUIC listeners or worker binds) wakes the poll and is
+  answered immediately without stalling the target. Both detection methods and
   the procfs path poll `waitpid(WNOHANG)` and report `TargetDied`.
 - Stdio redirection differs per mode: stdin comes from `target.stdin_path` when
   set (opened read-only in `prepare_target()` with `O_NONBLOCK|O_CLOEXEC`, the
@@ -189,7 +194,22 @@ are ignored helper-anchor fields (see Important details).
    With `afl.dump_history > 0` the dump also writes the retained previous-iteration
    payloads as `{stem}.-1.data`, `{stem}.-2.data`, ... (see "Crash detection gaps").
 - Payload sent over TCP is `payload.prefix + fuzz input + payload.suffix`
-  (`PayloadConfig::wrap()`); values may be `!!binary`.
+  (`PayloadConfig::wrap()`); values may be `!!binary` and are base64-decoded by
+  `read_bytes_value()` in config.cpp (the same helper reads the sequence
+  delimiter and message wrappers).
+- Sequence execution (`exchange_sequence()`/`build_sequence()` in main.cpp):
+  when `sequence.enabled`, the testcase is split on `sequence.delimiter`
+  (non-overlapping, left to right; trailing bytes are one final message; no
+  delimiter = one message; empty input = zero messages), each message is
+  wrapped with `sequence.message_prefix/message_suffix` and sent in order on
+  one connection, and its response is drained for `response_poll_us` (µs;
+  `0` = one non-blocking drain). `keep_delimiter` decides whether the separator
+  stays in the sent message. The full built session (capped by `max_messages`,
+  truncation logged at WARN) is written to `payload_buf`, so termination dumps
+  stay replayable when an early send fails. `initial_poll_us` enables an
+  optional banner drain before message 1; `final_poll_us` is the post-SHUT_WR
+  drain. All waits go through `recv_window`/`send_all`, so the seccomp listener
+  fd is multiplexed and no explicit pump is needed mid-sequence.
 - Startup-coverage fix (stability): `main.cpp` has a file-scope `__AFL_COVERAGE()`
   (afl-cc `-D` macro; no-op placeholder in `afl_compat.h`). afl-cassowire is built with
   the patched `afl-clang-fast++` (`patch/force_loc.patch`), which skips PC-guard edge
@@ -270,7 +290,7 @@ are ignored helper-anchor fields (see Important details).
 - `src/afl_compat.h` (not `.hpp`) defines *no-op* AFL++ macros instead of `#error`-ing;
   the "must use an AFL++ compiler" enforcement lives in the `meson.build` compiler
   probe. Don't add an `#error` guard to the header.
-- Config keys added after the original design: `target.env`, `target.env_preserve`, `target.stdin_path`, `payload.*`,
+- Config keys added after the original design: `target.env`, `target.env_preserve`, `target.stdin_path`, `payload.*`, `sequence.*`,
   `afl.cov_discard_init`, `afl.dump_history`, `afl.msg_log_level`,
   `target_cmplog.*`, `network_cmplog.*`, and the required
   `AFL_CASSOWIRE_FORCE_FINAL_LOC` env var. `target_cmplog`/`network_cmplog` are standalone
@@ -293,6 +313,18 @@ are ignored helper-anchor fields (see Important details).
   on switching between them.
 
 ## Known limitations
+- Sequence mode (`sequence.enabled: true`) sends each testcase message with
+  `network::recv_window(idle_poll_us, network.timeout_ms)` after it, then
+  half-closes and drains once more. A response slower than `response_poll_us`
+  (or `final_poll_us` for the last drain) is intentionally truncated, and
+  requests can be pipelined before the previous response arrives; set the
+  windows to 0 for maximum throughput (but then lock-step protocols that need
+  the response before the next request break). The whole `wait_ms` budget is the
+  sum of the windows, each independently capped by `network.timeout_ms`. This is
+  execution semantics only: AFL++ still mutates the testcase byte-wise, so
+  message boundaries are not protected (dictionary entries for verbs/framing
+  help). `payload.prefix/suffix` is rejected in sequence mode; use
+  `sequence.message_prefix/message_suffix`.
 - `network::wait_response()` reads until the peer closes the connection (EOF) or
   `network.timeout_ms` expires. A keep-alive server (nginx) that ignores the
   half-close (`shutdown(SHUT_WR)` in `exchange_once`) may keep the connection open
