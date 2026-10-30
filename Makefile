@@ -26,6 +26,7 @@ CONTAINER_WORKDIR ?= /opt/workdir
 RUN_IN_CONTAINER ?= 1
 PODMAN           ?= podman
 WITH_QEMU        ?= 1
+GIT_DEPTH        ?= 1
 
 # Targets whose Makefiles are container-local (no podman).
 CONTAINER_TARGETS := nginx tiny-nginx haproxy h2o cassowire-test-target
@@ -82,6 +83,7 @@ help:
 		'Optional: PROFILE=<mode>  FUZZER=aflpp|aflnet  VARIANT=<build-variant>' \
 		'          AFL_FUZZ_CPU=<n> (afl-fuzz -b, default 0)' \
 		'          WITH_QEMU=0|1 (aflpp QEMU support, default 1)' \
+		'          GIT_DEPTH=<n>|0 (aflpp clone depth, default 1; 0 = full)' \
 		'          RUN_IN_CONTAINER=1|0 (default 1; 0 runs targets directly)' \
 		'' \
 		'Examples (host):' \
@@ -117,7 +119,7 @@ toolchain:
 aflpp:
 	$(PODMAN_RUN) -w $(CONTAINER_WORKDIR)/aflpp \
 		$(TOOLCHAIN_IMAGE) make prepare patch submodules build install \
-			WITH_QEMU=$(WITH_QEMU)
+			WITH_QEMU=$(WITH_QEMU) GIT_DEPTH=$(GIT_DEPTH)
 
 aflnet:
 	$(PODMAN_RUN) -w $(CONTAINER_WORKDIR)/other/aflnet \

@@ -34,9 +34,16 @@ make install    # install into src/distrib (depends on build-qemu when WITH_QEMU
 Requires `nproc`, `git`, `patch`, and a working C/C++ toolchain.
 
 The AFL++ checkout and its top-level submodules are cloned shallow
-(`--depth 1`). Submodules are not initialized recursively: QEMU's configure
-fetches the nested modules it actually needs on the first build, so unused
-content such as the QEMU ROMs is not cloned.
+(`--depth 1`) by default. Set `GIT_DEPTH=0` (or `GIT_DEPTH=`) to fetch full
+histories; this only affects new clones:
+
+```
+make prepare GIT_DEPTH=0
+```
+
+Submodules are not initialized recursively: QEMU's configure fetches the nested
+modules it actually needs on the first build, so unused content such as the
+QEMU ROMs is not cloned.
 
 QEMU support is optional. Set `WITH_QEMU=0` to skip the QEMU submodules,
 `afl-qemu-trace`/`afl-qemu-bridge`, and guest-architecture staging:

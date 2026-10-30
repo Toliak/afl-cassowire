@@ -35,6 +35,7 @@ endif
 
 help:
 	@echo "prepare -- git clone the AFL++ repo"
+	@echo "GIT_DEPTH -- clone depth for AFL++ and its submodules (default: 1; 0 or empty = full)"
 	@echo "WITH_QEMU=0 -- skip QEMU support (default: WITH_QEMU=1)"
 	@echo "QEMU_ARCHS -- guest arches for QEMU support (default: x86_64 aarch64)"
 
