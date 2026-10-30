@@ -17,9 +17,12 @@ $(GIT_CLONE_CMD) $(1) ./src && \
 	touch .cloned
 endef
 
-# Use only inside the `src/.submodules` target
+# Use only inside the `src/.submodules` target.
+# Shallow top-level submodules only: QEMU's own configure fetches the nested
+# modules it needs. Do not use `--recursive --depth 1` here: nested pins are
+# non-tip commits (on GitLab) that a depth-1 clone cannot always check out.
 define GIT_SUBMODULES_TARGET_CMD
 cd ./src && \
-	git submodule update --progress --init --recursive $(1) && \
+	git submodule update --progress --init --depth 1 $(1) && \
 	touch .submodules
 endef
