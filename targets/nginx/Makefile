@@ -153,9 +153,14 @@ AFL_OUT_DIR      ?= out/$(FUZZ_PROFILE)
 AFL_FUZZ_DICT    ?= $(REPO_ROOT)/targets/_fuzz/dict/$(FUZZ_PROFILE).dict
 COVERAGE_OUT     ?= $(if $(PROFILE),cov/$(PROFILE),cov)
 
+# nginx only mkdir()s the leaf temp paths; the parent must exist. Keep this in
+# sync with the /tmp/nginx-fuzz paths in data_template/nginx.new.conf.j2.
+prepare-runtime:
+	mkdir -p /tmp/nginx-fuzz
+
 fuzz: fuzz-$(FUZZER)
 
-fuzz-aflpp:
+fuzz-aflpp: prepare-runtime
 	mkdir -p "$(AFL_IN_DIR)" "$(AFL_OUT_DIR)"
 	PATH="$(AFLPP_BIN_DIR):$$PATH" \
 	AFL_CASSOWIRE_FORCE_FINAL_LOC=70000 $(AFL_FUZZ_ENV) \
@@ -163,7 +168,7 @@ fuzz-aflpp:
 			-x $(AFL_FUZZ_DICT) -t 1500 -c 0 -- \
 			$(AFLPP_CASSOWIRE) $(CASSOWIRE_LOG_ARGS) --config $(CASSOWIRE_CONFIG) proxy
 
-fuzz-aflnet:
+fuzz-aflnet: prepare-runtime
 	mkdir -p "$(AFL_IN_DIR)" "$(AFL_OUT_DIR)"
 	PATH="$(AFLNET_BIN_DIR):$$PATH" \
 		afl-fuzz -d -i "$(AFL_IN_DIR)" -o "$(AFL_OUT_DIR)" -N tcp://127.0.0.1/8080 -P HTTP -D 10000 -q 3 -s 3 -E -K -R -- \
@@ -171,7 +176,7 @@ fuzz-aflnet:
 
 cov: replay-cov collect-cov
 
-replay-cov:
+replay-cov: prepare-runtime
 	$(ORC) $(TARGET_NAME) replay-cov $(PROFILE_ARG)
 
 collect-cov:
@@ -180,4 +185,4 @@ collect-cov:
 crashes:
 	$(ORC) $(TARGET_NAME) collect-crashes $(PROFILE_ARG)
 
-.PHONY: src build prepare-data prepare-seeds fuzz fuzz-aflpp fuzz-aflnet cov replay-cov collect-cov crashes $(ALL_BUILD_SUBTARGETS)
+.PHONY: src build prepare-data prepare-seeds prepare-runtime fuzz fuzz-aflpp fuzz-aflnet cov replay-cov collect-cov crashes $(ALL_BUILD_SUBTARGETS)
