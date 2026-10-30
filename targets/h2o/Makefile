@@ -2,6 +2,7 @@ include ../_mk/env.mk
 include ../_mk/git.mk
 include ../_mk/fuzzers/aflpp.mk
 include ../_mk/fuzzers/aflnet.mk
+include ../_mk/fuzz.mk
 
 TARGET_NAME := h2o
 
@@ -94,17 +95,17 @@ fuzz: fuzz-$(FUZZER)
 fuzz-aflpp:
 	mkdir -p ./out ./in
 	PATH="$(AFLPP_BIN_DIR):$$PATH" \
-	AFL_CASSOWIRE_FORCE_FINAL_LOC=262144 AFL_ALLOW_CORES=1 \
+	AFL_CASSOWIRE_FORCE_FINAL_LOC=262144 $(AFL_FUZZ_ENV) \
 		afl-fuzz -b $(AFL_FUZZ_CPU) -i ./in -o ./out \
 			-x $(REPO_ROOT)/targets/_fuzz/dict/http.dict -t 1500 -c 0 -- \
-			$(AFLPP_CASSOWIRE) --log-level error --config $(CASSOWIRE_CONFIG) proxy
+			$(AFLPP_CASSOWIRE) $(CASSOWIRE_LOG_ARGS) --config $(CASSOWIRE_CONFIG) proxy
 
 fuzz-qemu:
 	mkdir -p ./out ./in
 	PATH="$(AFLPP_BIN_DIR):$$PATH" \
-	AFL_CASSOWIRE_FORCE_FINAL_LOC=262144 AFL_ALLOW_CORES=1 \
+	AFL_CASSOWIRE_FORCE_FINAL_LOC=262144 $(AFL_FUZZ_ENV) \
 		afl-fuzz -b $(AFL_FUZZ_CPU) -i ./in -o ./out -t 2000 -c 0 -- \
-			$(AFLPP_CASSOWIRE) --log-level error --config data/cassowire.qemu.yaml proxy
+			$(AFLPP_CASSOWIRE) $(CASSOWIRE_LOG_ARGS) --config data/cassowire.qemu.yaml proxy
 
 fuzz-aflnet:
 	mkdir -p ./out ./in

@@ -1,6 +1,7 @@
 include ../_mk/env.mk
 include ../_mk/git.mk
 include ../_mk/fuzzers/aflpp.mk
+include ../_mk/fuzz.mk
 
 TARGET_NAME := tiny-nginx
 
@@ -99,16 +100,16 @@ fuzz: fuzz-aflpp
 fuzz-aflpp:
 	mkdir -p "$(AFL_IN_DIR)" "$(AFL_OUT_DIR)"
 	PATH="$(AFLPP_BIN_DIR):$$PATH" \
-	AFL_CASSOWIRE_FORCE_FINAL_LOC=4096 AFL_ALLOW_CORES=1 \
+	AFL_CASSOWIRE_FORCE_FINAL_LOC=4096 $(AFL_FUZZ_ENV) \
 		afl-fuzz -b $(AFL_FUZZ_CPU) -i "$(AFL_IN_DIR)" -o "$(AFL_OUT_DIR)" -t 1500 -c 0 -- \
-			$(AFLPP_CASSOWIRE) --log-level error --config data/cassowire.yaml proxy
+			$(AFLPP_CASSOWIRE) $(CASSOWIRE_LOG_ARGS) --config data/cassowire.yaml proxy
 
 fuzz-qemu:
 	mkdir -p "$(AFL_IN_DIR)" "$(AFL_OUT_DIR)"
 	PATH="$(AFLPP_BIN_DIR):$$PATH" \
-	AFL_CASSOWIRE_FORCE_FINAL_LOC=65536 AFL_ALLOW_CORES=1 \
+	AFL_CASSOWIRE_FORCE_FINAL_LOC=65536 $(AFL_FUZZ_ENV) \
 		afl-fuzz -b $(AFL_FUZZ_CPU) -i "$(AFL_IN_DIR)" -o "$(AFL_OUT_DIR)" -t 2000 -c 0 -- \
-			$(AFLPP_CASSOWIRE) --log-level error --config data/cassowire.qemu.yaml proxy
+			$(AFLPP_CASSOWIRE) $(CASSOWIRE_LOG_ARGS) --config data/cassowire.qemu.yaml proxy
 
 cov: replay-cov collect-cov
 

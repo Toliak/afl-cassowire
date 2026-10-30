@@ -59,7 +59,12 @@ make TARGET=nginx FUZZER=aflpp fuzz    # afl-fuzz + afl-cassowire (persistent pr
 make TARGET=nginx FUZZER=aflnet fuzz   # AFLNet -P HTTP stateful fuzzing
 make TARGET=tiny-nginx fuzz            # normal
 make TARGET=tiny-nginx fuzz-qemu       # binary-only QEMU mode
+make TARGET=nginx FUZZER=aflpp FUZZ_DEBUG=1 fuzz  # AFL++ debug output + proxy debug logs
 ```
+
+`FUZZ_DEBUG=1` sets `AFL_DEBUG=1 AFL_DEBUG_CHILD=1 AFL_NO_UI=1` for `afl-fuzz`
+and runs `afl-cassowire` with `--log-level debug --child-output`. Without it the
+proxy stays at `--log-level error`.
 
 Each fuzz run is a separate `podman run`; rootless podman provides user-mode
 networking by default, so every instance is network-isolated (no port collisions,

@@ -2,6 +2,7 @@ include ../_mk/env.mk
 include ../_mk/git.mk
 include ../_mk/fuzzers/aflpp.mk
 include ../_mk/fuzzers/aflnet.mk
+include ../_mk/fuzz.mk
 
 TARGET_NAME := nginx
 
@@ -157,10 +158,10 @@ fuzz: fuzz-$(FUZZER)
 fuzz-aflpp:
 	mkdir -p "$(AFL_IN_DIR)" "$(AFL_OUT_DIR)"
 	PATH="$(AFLPP_BIN_DIR):$$PATH" \
-	AFL_CASSOWIRE_FORCE_FINAL_LOC=70000 AFL_ALLOW_CORES=1 \
+	AFL_CASSOWIRE_FORCE_FINAL_LOC=70000 $(AFL_FUZZ_ENV) \
 		afl-fuzz -b $(AFL_FUZZ_CPU) -i "$(AFL_IN_DIR)" -o "$(AFL_OUT_DIR)" \
 			-x $(AFL_FUZZ_DICT) -t 1500 -c 0 -- \
-			$(AFLPP_CASSOWIRE) --log-level error --config $(CASSOWIRE_CONFIG) proxy
+			$(AFLPP_CASSOWIRE) $(CASSOWIRE_LOG_ARGS) --config $(CASSOWIRE_CONFIG) proxy
 
 fuzz-aflnet:
 	mkdir -p "$(AFL_IN_DIR)" "$(AFL_OUT_DIR)"

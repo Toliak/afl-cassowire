@@ -84,6 +84,7 @@ help:
 		'Required: TARGET=<name> (except toolchain/aflpp/aflnet/afl-cassowire/shell/run)' \
 		'Optional: PROFILE=<mode>  FUZZER=aflpp|aflnet  VARIANT=<build-variant>' \
 		'          AFL_FUZZ_CPU=<n> (afl-fuzz -b, default 0)' \
+		'          FUZZ_DEBUG=1 (AFL++ debug output + verbose afl-cassowire logs)' \
 		'          WITH_QEMU=0|1 (aflpp QEMU support, default 1)' \
 		'          GIT_DEPTH=<n>|0 (aflpp clone depth, default 1; 0 = full)' \
 		'          STATIC=0|1 (afl-cassowire static link, default 0)' \
