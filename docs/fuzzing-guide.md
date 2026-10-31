@@ -121,6 +121,24 @@ make TARGET=nginx crashes
 Copies every `out/**/crashes/id:*` into `targets/nginx/crashes/` (as
 `<campaign>__<name>`) and writes `summary.json`.
 
+### Probabilistic cache crashes
+
+`cassowire-test-target`'s cache profile has an opt-in lottery crash
+(`--with-crash`, enabled by `cache.cassowire.yaml`). Its request is safe on the
+cold MISS that populates the cache entry and draws again on every warm HIT, so
+one collected AFL artifact reproduces with retries:
+
+1. Start a fresh cache target with `--with-crash`.
+2. Send the collected request once to prime its cache entry.
+3. Send the same request again over new connections to the same live target,
+   up to the retry budget (the draw is roughly 50/50 per warm hit).
+4. After any crash or target restart, start a fresh target and prime again.
+
+If the budget is exhausted without a crash, classify the finding as
+`unreproduced/flaky` rather than as a false positive. `make ... crashes` only
+collects artifacts and does not perform this replay, so probabilistic findings
+need manual (or future tooling-assisted) prime-and-retry reproduction.
+
 ## Layout
 
 ```

@@ -38,7 +38,9 @@ PROFILES = {
         },
     },
     # Stateful cache server: identical requests take different paths depending
-    # on the cache/history, which is the instability under study.
+    # on the cache/history, which is the instability under study. The profile
+    # also carries a CmpLog-gated PRNG region and an opt-in lottery crash that
+    # only fires on a warm hit.
     "cache": {
         "seeds": {"aflpp": ["_fuzz/in_cache"]},
         "coverage": {
@@ -59,7 +61,7 @@ COVERAGE = {
     "binary": "src/build/gcov/test-target",
     # clang gcov branch data is inconsistent for libstdc++ headers.
     "include": ["*/test_target.cpp"],
-    "ignore_errors": ["inconsistent"],
+    "ignore_errors": ["inconsistent", "category"],
     "host": "127.0.0.1",
     "port": 8050,
     "timeout_ms": 200,

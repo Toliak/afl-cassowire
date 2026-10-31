@@ -2,11 +2,11 @@
 
 target: &target
   binary: "./src/build/afl-clang-fast++/test-target"
-  args: ["test-target", "cache", "--port", "8050", "--startup-delay-ms", "100"]
+  args: ["test-target", "cache", "--port", "8050", "--startup-delay-ms", "100", "--with-crash"]
 
 target_cmplog:
-  <<: *target
-  args: ["test-target", "cache", "--port", "9050", "--startup-delay-ms", "100"]
+  binary: "./src/build/afl-clang-fast++_cmplog/test-target"
+  args: ["test-target", "cache", "--port", "9050", "--startup-delay-ms", "100", "--with-crash"]
 
 network: &network
   host: 127.0.0.1

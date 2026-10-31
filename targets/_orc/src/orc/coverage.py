@@ -88,7 +88,7 @@ def collect_cov(name: str, out_rel: str = "cov") -> dict[str, object]:
         "--output-file",
         str(info),
         "--rc",
-        "lcov_branch_coverage=1",
+        "branch_coverage=1",
     ]
     include = cov.get("include", [])
     if isinstance(include, str):

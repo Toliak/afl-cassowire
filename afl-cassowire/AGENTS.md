@@ -40,9 +40,10 @@ End-to-end tests live in `tests/e2e` (a self-contained uv project):
   (`proxy_mode/emul.py`, a stdlib-only fake afl-fuzz: SysV shmem for the
   coverage / fuzz-testcase / cmplog maps plus the AFL++ FS_NEW forkserver
   protocol on fds 198/199). Runs the persistent `__AFL_LOOP` against the
-  prebuilt instrumented test-target in calc/http mode (normal + cmplog,
+  prebuilt instrumented test-target in calc/http/cache mode (normal + cmplog,
   procfs + one seccomp config) and asserts the coverage and cmplog maps differ
-  between target modes and between corpora. Same prebuilt-binary contract as
+  between target modes and between corpora; cache cases cover the CmpLog-gated
+  PRNG region and the warm-hit lottery crash. Same prebuilt-binary contract as
   `test_mode` plus the cmplog target variant `build/afl-clang-fast++_cmplog/`
   (override with `AFL_CASSOWIRE_BIN`, `CASSOWIRE_TEST_TARGET_BIN`,
   `CASSOWIRE_TEST_TARGET_CMPLOG_BIN`); fails when binaries are missing, skips

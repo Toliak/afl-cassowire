@@ -96,7 +96,7 @@ def write_config(
     stdin_path: str | None = None,
     target_extra_args: list[str] | None = None,
 ) -> Path:
-    """Write a proxy-mode config for the test-target (calc or http mode).
+    """Write a proxy-mode config for the test-target (calc, http or cache mode).
 
     target.args is the full argv (binary first, like execve) and must pin the
     same port the proxy watches. In cmplog mode both cmplog sections are

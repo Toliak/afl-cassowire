@@ -4,7 +4,7 @@ The emulator (emul.py) provides the forkserver and shared-memory sides of
 afl-fuzz, so the real proxy binary runs its persistent __AFL_LOOP against the
 prebuilt instrumented test-target: coverage lands in the shared map written by
 the target, and in cmplog mode the cmplog-instrumented target writes compare
-records into the cmplog map. The tests assert that the calc and http target
+records into the cmplog map. The tests assert that the calc, http and cache target
 modes produce different coverage and cmplog feedback, and that the feedback
 tracks the fuzzed input.
 """
@@ -20,6 +20,7 @@ import pytest
 from emul import CMP_MAP_H, CMP_MAP_SIZE, CMP_MAP_W, CMP_OPERANDS_SIZE
 from runner import (
     ProxyRun,
+    corpus_dir,
     free_port,
     run_proxy_mode,
     seccomp_supported,
@@ -112,6 +113,78 @@ def test_cmplog_tracks_input(proxy_runner: Callable[..., ProxyRun]) -> None:
     _assert_cmplog_written(mul_add)
     _assert_cmplog_written(div)
     assert mul_add.cmp_bytes() != div.cmp_bytes(), "cmplog feedback did not change with the corpus"
+
+
+def test_cache_prng_gate_coverage(proxy_runner: Callable[..., ProxyRun]) -> None:
+    near = proxy_runner("cache", "cache_prng/near")
+    solved = proxy_runner("cache", "cache_prng/solved")
+    _assert_clean_run(near)
+    _assert_clean_run(solved)
+
+    near_cov, solved_cov = near.cov_bytes(), solved.cov_bytes()
+    assert near_cov[1:] != solved_cov[1:], "solving the gate did not change coverage"
+    assert _has_bits_only_in(solved_cov, near_cov), "no coverage is unique to the gated PRNG region"
+    assert _has_bits_only_in(near_cov, solved_cov), "no coverage is unique to the locked gate path"
+
+
+def test_cache_prng_gate_cmplog_feedback(proxy_runner: Callable[..., ProxyRun]) -> None:
+    skip_unless_shm_available()
+    near = proxy_runner("cache", "cache_prng/near", cmplog=True)
+    solved = proxy_runner("cache", "cache_prng/solved", cmplog=True)
+    _assert_clean_run(near)
+    _assert_clean_run(solved)
+    _assert_cmplog_written(near)
+    _assert_cmplog_written(solved)
+    assert near.cmp_bytes() != solved.cmp_bytes(), "solving the gate did not change cmplog feedback"
+
+
+def _lottery_run(
+    tmp_path: Path,
+    *,
+    with_crash: bool,
+    iterations: int,
+) -> tuple[ProxyRun, Path]:
+    """Run one cache lottery campaign; returns (run, request-log path)."""
+    port = free_port()
+    request_log = tmp_path / "requests.log"
+    target_args = ["--log-requests", str(request_log)]
+    if with_crash:
+        target_args = ["--with-crash", *target_args]
+    config = write_config(
+        tmp_path,
+        mode="cache",
+        port=port,
+        loop_count=iterations,
+        target_extra_args=target_args,
+    )
+    run = run_proxy_mode(tmp_path / "run", config, "cache_lottery/repeat", iterations=iterations)
+    return run, request_log
+
+
+def test_cache_lottery_cold_miss_is_safe(tmp_path: Path) -> None:
+    run, request_log = _lottery_run(tmp_path, with_crash=True, iterations=1)
+    _assert_clean_run(run, iterations=1)
+    assert [index for index, _ in _request_log_lines(request_log)] == [1]
+
+
+def test_cache_lottery_crashes_on_warm_hit(tmp_path: Path) -> None:
+    run, request_log = _lottery_run(tmp_path, with_crash=True, iterations=2)
+    events = run.summary["events"]
+    assert [event["kind"] for event in events] == ["stopped", "signaled"], run.summary
+    assert events[-1]["signal"] == "SIGSEGV", run.summary
+    lines = _request_log_lines(request_log)
+    assert [index for index, _ in lines] == [1, 1]
+    payload = corpus_dir("cache_lottery/repeat/01-lottery.txt").read_bytes()
+    assert {size for _, size in lines} == {len(payload)}
+    dumps = sorted((run.out_dir / "afl-cassowire-data").glob("*.data"))
+    assert len(dumps) == 2, "expected the current payload plus one history payload"
+    assert payload in [path.read_bytes() for path in dumps]
+
+
+def test_cache_lottery_without_crash_stays_safe(tmp_path: Path) -> None:
+    run, request_log = _lottery_run(tmp_path, with_crash=False, iterations=4)
+    _assert_clean_run(run, iterations=4)
+    assert [index for index, _ in _request_log_lines(request_log)] == [1] * 4
 
 
 def test_seccomp_port_detection(proxy_runner: Callable[..., ProxyRun]) -> None:

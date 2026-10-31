@@ -415,6 +415,13 @@ std::string http_response(const std::string& raw) {
 // ---------------------------------------------------------------------------
 
 constexpr size_t kCacheCapacity = 4;
+constexpr char kPrngPrefix[] = "/prng/";
+constexpr size_t kPrngPrefixLen = sizeof(kPrngPrefix) - 1;
+constexpr size_t kPrngTokenOffset = kPrngPrefixLen;
+constexpr size_t kPrngTokenBytes = 8;
+constexpr size_t kPrngSeedOffset = kPrngTokenOffset + kPrngTokenBytes + 1;
+constexpr uint64_t kPrngGateToken = 0x3372317735356143ULL;
+constexpr char kLotteryPrefix[] = "/lottery/";
 
 struct CacheEntry {
     std::string key;
@@ -422,12 +429,79 @@ struct CacheEntry {
     uint64_t uses = 0;
     uint64_t stamp = 0;
     bool compressed = false;
+    bool lottery = false;
+    uint64_t lottery_state = 0;
 };
 
 std::vector<CacheEntry> g_cache;
 uint64_t g_clock = 0;
 uint64_t g_requests = 0;
 uint64_t g_fills = 0;
+
+__attribute__((noinline)) uint64_t splitmix64(uint64_t& state) {
+    state += 0x9E3779B97F4A7C15ULL;
+    uint64_t value = state;
+    value = (value ^ (value >> 30)) * 0xBF58476D1CE4E5B9ULL;
+    value = (value ^ (value >> 27)) * 0x94D049BB133111EBULL;
+    return value ^ (value >> 31);
+}
+
+__attribute__((noinline)) uint64_t cache_hash_seed(const std::string& seed) {
+    uint64_t hash = 1469598103934665603ULL;
+    for (const unsigned char byte : seed) {
+        hash ^= byte;
+        hash *= 1099511628211ULL;
+    }
+    return hash;
+}
+
+__attribute__((noinline)) bool cache_is_prng_path(const std::string& path) {
+    return path.rfind(kPrngPrefix, 0) == 0;
+}
+
+__attribute__((noinline)) bool cache_prng_gate(const std::string& path, std::string& seed) {
+    if (path.size() < kPrngSeedOffset || path[kPrngSeedOffset - 1] != '/') {
+        return false;
+    }
+    uint64_t token = 0;
+    std::memcpy(&token, path.data() + kPrngTokenOffset, kPrngTokenBytes);
+    seed = path.substr(kPrngSeedOffset);
+    return token == kPrngGateToken;
+}
+
+__attribute__((noinline)) std::string cache_prng_bucket0(uint64_t value) {
+    return "prng:0:" + std::to_string(value % 97);
+}
+
+__attribute__((noinline)) std::string cache_prng_bucket1(uint64_t value) {
+    return "prng:1:" + std::to_string(value % 89);
+}
+
+__attribute__((noinline)) std::string cache_prng_bucket2(uint64_t value) {
+    return "prng:2:" + std::to_string(value % 83);
+}
+
+__attribute__((noinline)) std::string cache_prng_body(const std::string& seed) {
+    uint64_t state = cache_hash_seed(seed);
+    const uint64_t value = splitmix64(state);
+    switch (value % 3) {
+        case 0: return cache_prng_bucket0(value);
+        case 1: return cache_prng_bucket1(value);
+        default: return cache_prng_bucket2(value);
+    }
+}
+
+__attribute__((noinline)) std::string cache_prng_reply(const std::string& seed) {
+    const std::string body = cache_prng_body(seed);
+    return std::string("HTTP/1.1 200 OK\r\nContent-Length: ") +
+        std::to_string(body.size()) + "\r\nX-Cache: PRNG\r\nConnection: close\r\n\r\n" + body;
+}
+
+__attribute__((noinline)) std::string cache_gate_locked_reply() {
+    const std::string body = "gate-locked";
+    return std::string("HTTP/1.1 200 OK\r\nContent-Length: ") +
+        std::to_string(body.size()) + "\r\nX-Cache: GATE\r\nConnection: close\r\n\r\n" + body;
+}
 
 __attribute__((noinline)) std::string cache_compress_body(const std::string& key) {
     std::string out;
@@ -462,7 +536,7 @@ __attribute__((noinline)) std::string cache_fill_body(const std::string& key, bo
 }
 
 __attribute__((noinline)) void cache_insert(const std::string& key, const std::string& body,
-                                            bool compressed) {
+                                            bool compressed, bool lottery, uint64_t lottery_state) {
     if (g_cache.size() >= kCacheCapacity) {
         size_t victim = 0;
         for (size_t i = 1; i < g_cache.size(); ++i) {
@@ -476,6 +550,8 @@ __attribute__((noinline)) void cache_insert(const std::string& key, const std::s
     entry.key = key;
     entry.body = body;
     entry.compressed = compressed;
+    entry.lottery = lottery;
+    entry.lottery_state = lottery_state;
     entry.stamp = ++g_clock;
     g_cache.push_back(entry);
     ++g_fills;
@@ -497,6 +573,19 @@ __attribute__((noinline)) std::string cache_serve_hit(CacheEntry& entry) {
     return body;
 }
 
+__attribute__((noinline)) std::string cache_lottery_hit(CacheEntry& entry, bool with_crash) {
+    ++entry.uses;
+    entry.stamp = ++g_clock;
+    const uint64_t value = splitmix64(entry.lottery_state);
+    if ((value & 1ULL) == 0) {
+        return "lottery:safe";
+    }
+    if (with_crash) {
+        abort();
+    }
+    return "lottery:bang";
+}
+
 __attribute__((noinline)) std::string cache_admin(uint64_t fills) {
     std::string body = "admin:";
     if (fills >= 8) {
@@ -512,7 +601,7 @@ __attribute__((noinline)) std::string cache_admin(uint64_t fills) {
     return body;
 }
 
-std::string cache_response(const std::string& raw) {
+std::string cache_response(const std::string& raw, bool with_crash) {
     size_t line_end = raw.find('\n');
     if (line_end == std::string::npos) {
         line_end = raw.size();
@@ -537,6 +626,15 @@ std::string cache_response(const std::string& raw) {
         return "HTTP/1.1 405 Method Not Allowed\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
     }
 
+    if (cache_is_prng_path(path)) {
+        std::string seed;
+        if (cache_prng_gate(path, seed)) {
+            return cache_prng_reply(seed);
+        }
+        return cache_gate_locked_reply();
+    }
+
+    const bool lottery = path.rfind(kLotteryPrefix, 0) == 0;
     ++g_requests;
     std::string body;
     std::string cache_status = "MISS";
@@ -557,12 +655,21 @@ std::string cache_response(const std::string& raw) {
             }
         }
         if (found != nullptr) {
-            cache_status = "HIT";
-            body = cache_serve_hit(*found);
+            if (lottery && found->lottery) {
+                cache_status = "LOTTERY-HIT";
+                body = cache_lottery_hit(*found, with_crash);
+            } else {
+                cache_status = "HIT";
+                body = cache_serve_hit(*found);
+            }
         } else {
             bool compressed = false;
             body = cache_fill_body(path, compressed);
-            cache_insert(path, body, compressed);
+            cache_insert(path, body, compressed, lottery,
+                         lottery ? cache_hash_seed(path) : 0);
+            if (lottery) {
+                cache_status = "LOTTERY-MISS";
+            }
         }
     }
 
@@ -596,8 +703,7 @@ void handle_message(int fd, const Options& opts, const std::string& data) {
         return;
     }
     // The CRASH/HANG/SLOW hooks exercise the proxy's fault handling. They are
-    // disabled in cache mode, which is a coverage/instability experiment target
-    // where slow or crashing inputs would only add measurement noise.
+    // disabled in cache mode; its opt-in lottery crash is drawn on cache hits.
     if (opts.mode != "cache") {
         if (line == "CRASH") {
             abort();
@@ -621,7 +727,7 @@ void handle_message(int fd, const Options& opts, const std::string& data) {
     if (opts.mode == "calc") {
         send_all(fd, calc_response(line, opts.with_crash));
     } else if (opts.mode == "cache") {
-        send_all(fd, cache_response(data));
+        send_all(fd, cache_response(data, opts.with_crash));
     } else {
         send_all(fd, http_response(data));
     }
