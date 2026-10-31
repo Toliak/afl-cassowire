@@ -125,8 +125,6 @@ def test_cmplog_tracks_input(proxy_runner: Callable[..., ProxyRun]) -> None:
 # presence of edges (counts are monotonic, u8 wrap notwithstanding) and on the
 # cmp_map `hits` counters, which only grow.
 
-CMP_HEADER_BYTES = CMP_MAP_W * 2
-
 
 def _window_run(
     tmp_path: Path,

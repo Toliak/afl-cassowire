@@ -91,7 +91,7 @@ bool MapWindow::attach_cmp(int shm_id, std::string& error) {
     }
 
     cmp_ptr_ = ptr;
-    cmp_snapshot_.resize(kCmpHeaderBytes + kCmpSiteIdBytes + kCmpAttributeBytes);
+    cmp_snapshot_.resize(kCmpHeaderBytes);
     return true;
 }
 
@@ -100,13 +100,7 @@ void MapWindow::capture() {
         std::memcpy(cov_snapshot_.data(), cov_ptr_, cov_len_);
     }
     if (cmp_ptr_ != nullptr) {
-        // [headers][site_ids][attributes] into one contiguous buffer.
         std::memcpy(cmp_snapshot_.data(), cmp_ptr_, kCmpHeaderBytes);
-        std::memcpy(cmp_snapshot_.data() + kCmpHeaderBytes,
-                    cmp_ptr_ + kCmpHeaderBytes + kCmpLogBytes, kCmpSiteIdBytes);
-        std::memcpy(cmp_snapshot_.data() + kCmpHeaderBytes + kCmpSiteIdBytes,
-                    cmp_ptr_ + kCmpHeaderBytes + kCmpLogBytes + kCmpSiteIdBytes,
-                    kCmpAttributeBytes);
     }
 }
 
@@ -116,11 +110,6 @@ void MapWindow::restore() {
     }
     if (cmp_ptr_ != nullptr) {
         std::memcpy(cmp_ptr_, cmp_snapshot_.data(), kCmpHeaderBytes);
-        std::memcpy(cmp_ptr_ + kCmpHeaderBytes + kCmpLogBytes,
-                    cmp_snapshot_.data() + kCmpHeaderBytes, kCmpSiteIdBytes);
-        std::memcpy(cmp_ptr_ + kCmpHeaderBytes + kCmpLogBytes + kCmpSiteIdBytes,
-                    cmp_snapshot_.data() + kCmpHeaderBytes + kCmpSiteIdBytes,
-                    kCmpAttributeBytes);
     }
 }
 

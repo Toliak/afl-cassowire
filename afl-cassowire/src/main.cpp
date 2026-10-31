@@ -810,37 +810,43 @@ int run_proxy_mode(Config cfg, bool forward_output) {
 
     // Coverage window (afl.cov_discard_probe / cov_discard_probe_cmplog).
     // Attach the very SysV segments afl-fuzz created and the target maps
-    // through the same env vars; the proxy only snapshots/restores them. Best
-    // effort: a layout or id mismatch disables that part of the window with a
-    // WARN instead of failing the run.
+    // through the same env vars; the proxy only snapshots/restores them. With
+    // network.probe disabled there is no target I/O between the exchange and
+    // the health check, so the window is not armed (it would only cost copies).
+    // Best effort: a layout or id mismatch disables that part of the window
+    // with a WARN instead of failing the run.
     coverage::MapWindow cov_window;
-    if (cfg.afl.cov_discard_probe) {
-        int cov_id = -1;
-        std::string err;
-        if (force_final_loc > 0xffffffffULL) {
-            PROXY_LOG_WARN("afl.cov_discard_probe: AFL_CASSOWIRE_FORCE_FINAL_LOC {} exceeds the "
-                           "runtime's u32 map size; coverage window disabled", force_final_loc);
-        } else if (!parse_sysv_shm_id("__AFL_SHM_ID", cov_id)) {
-            PROXY_LOG_WARN("afl.cov_discard_probe: __AFL_SHM_ID is not a SysV id "
-                           "(USEMMAP build?); coverage window disabled");
-        } else if (!cov_window.attach_cov(cov_id, static_cast<std::size_t>(force_final_loc) + 1, err)) {
-            PROXY_LOG_WARN("afl.cov_discard_probe: {}; coverage window disabled", err);
-        } else {
-            PROXY_LOG_DEBUG("coverage window armed ({} bytes)", cov_window.cov_len());
+    if (!cfg.network.probe) {
+        PROXY_LOG_DEBUG("network.probe is disabled; coverage window not needed");
+    } else {
+        if (cfg.afl.cov_discard_probe) {
+            int cov_id = -1;
+            std::string err;
+            if (force_final_loc > 0xffffffffULL) {
+                PROXY_LOG_WARN("afl.cov_discard_probe: AFL_CASSOWIRE_FORCE_FINAL_LOC {} exceeds the "
+                               "runtime's u32 map size; coverage window disabled", force_final_loc);
+            } else if (!parse_sysv_shm_id("__AFL_SHM_ID", cov_id)) {
+                PROXY_LOG_WARN("afl.cov_discard_probe: __AFL_SHM_ID is not a SysV id "
+                               "(USEMMAP build?); coverage window disabled");
+            } else if (!cov_window.attach_cov(cov_id, static_cast<std::size_t>(force_final_loc) + 1, err)) {
+                PROXY_LOG_WARN("afl.cov_discard_probe: {}; coverage window disabled", err);
+            } else {
+                PROXY_LOG_DEBUG("coverage window armed ({} bytes)", cov_window.cov_len());
+            }
         }
-    }
-    if (cfg.afl.cov_discard_probe_cmplog) {
-        int cmp_id = -1;
-        std::string err;
-        if (getenv("__AFL_CMPLOG_SHM_ID") == nullptr) {
-            PROXY_LOG_TRACE("afl.cov_discard_probe_cmplog: not a cmplog instance; nothing to arm");
-        } else if (!parse_sysv_shm_id("__AFL_CMPLOG_SHM_ID", cmp_id)) {
-            PROXY_LOG_WARN("afl.cov_discard_probe_cmplog: __AFL_CMPLOG_SHM_ID is not a SysV id "
-                           "(USEMMAP build?); cmplog window disabled");
-        } else if (!cov_window.attach_cmp(cmp_id, err)) {
-            PROXY_LOG_WARN("afl.cov_discard_probe_cmplog: {}; cmplog window disabled", err);
-        } else {
-            PROXY_LOG_DEBUG("cmplog coverage window armed (metadata only)");
+        if (cfg.afl.cov_discard_probe_cmplog) {
+            int cmp_id = -1;
+            std::string err;
+            if (getenv("__AFL_CMPLOG_SHM_ID") == nullptr) {
+                PROXY_LOG_TRACE("afl.cov_discard_probe_cmplog: not a cmplog instance; nothing to arm");
+            } else if (!parse_sysv_shm_id("__AFL_CMPLOG_SHM_ID", cmp_id)) {
+                PROXY_LOG_WARN("afl.cov_discard_probe_cmplog: __AFL_CMPLOG_SHM_ID is not a SysV id "
+                               "(USEMMAP build?); cmplog window disabled");
+            } else if (!cov_window.attach_cmp(cmp_id, err)) {
+                PROXY_LOG_WARN("afl.cov_discard_probe_cmplog: {}; cmplog window disabled", err);
+            } else {
+                PROXY_LOG_DEBUG("cmplog coverage window armed (headers only)");
+            }
         }
     }
 

@@ -80,9 +80,10 @@ afl:
                                # and restore it after the post-response probe and
                                # health checks, so probe traffic is not attributed to
                                # the testcase. Also drops deferred/late coverage.
-  cov_discard_probe_cmplog: true  # Same window for the cmp_map metadata in the
-                               # cmplog instance (headers/site ids/attributes; the
-                               # log slots are not rewound). Ignored outside cmplog.
+  cov_discard_probe_cmplog: true  # Same window for the cmp_map headers (hits) in
+                               # the cmplog instance; the 151 MB log is not rewound.
+                               # Ignored outside cmplog. Both windows are skipped
+                               # when network.probe is false.
   dump_history: 1              # Retain the last N completed payloads (prefix +
                                # input + suffix) and write them with every
                                # termination dump as <stem>.-1.data (most recent

@@ -232,13 +232,16 @@ are ignored helper-anchor fields (see Important details).
   `round64(AFL_CASSOWIRE_FORCE_FINAL_LOC + 1)`, exactly the view afl-fuzz
   reads (the futex sync word stored past it is never copied).
   `afl.cov_discard_probe_cmplog` (default true, cmplog instance only) does the
-  same for the `cmp_map` metadata — headers with the `hits` counters, site ids
-  and attributes, validated against `sizeof(struct cmp_map)` = 151,519,232.
-  The 151 MB log is deliberately not rewound: the per-key cursor lives inside
-  the target, so probe-written operands are simply not referenced by the
-  restored `hits`. Both parts are best-effort: a non-SysV `__AFL_SHM_ID`
-  (USEMMAP build) or a layout/size mismatch logs a WARN and disables that part
-  of the window. Trade-offs: coverage from deferred target work that finishes
+  same for the `cmp_map` headers — the 128 KB `hits` array that gates how many
+  records redqueen reads — validated against `sizeof(struct cmp_map)` =
+  151,519,232. site_ids/attributes are left as the probe set them: the target's
+  `cmplog_reserve()` only writes them when a key's `hits` is 0, which makes them
+  unreachable after the restored `hits`; the 151 MB log is deliberately not
+  rewound (the per-key cursor lives inside the target). Both parts are
+  best-effort: a non-SysV `__AFL_SHM_ID` (USEMMAP build) or a layout/size
+  mismatch logs a WARN and disables that part of the window. Neither window is
+  armed when `network.probe: false` (nothing is written between the exchange
+  and the health check, so the copies would be pure cost). Trade-offs: coverage from deferred target work that finishes
   after the response is dropped too (disable the key to keep it), and the
   target's `__afl_prev_loc` is not rewound, so a probe can still shift the
   first edge of the next exchange even though its own coverage is gone.

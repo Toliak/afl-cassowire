@@ -219,7 +219,7 @@
         "cov_discard_probe_cmplog": {
           "type": "boolean",
           "default": true,
-          "description": "Same window for the compare-log map in the cmplog instance: snapshot and restore the cmp_map metadata (headers with the hits counters, site ids and attributes) around the probe so the probe's comparisons are not used as redqueen feedback. The log slots are not rewound (the per-key cursor lives in the target), so probe-written operands are simply not referenced by the restored hits. Ignored outside cmplog mode."
+          "description": "Same window for the compare-log map in the cmplog instance: snapshot and restore the cmp_map headers (the hits counters that gate how many records redqueen reads) around the probe, so the probe's comparisons are not used as feedback. site_ids/attributes are left as the probe set them: the target only writes them when a key is idle (hits 0), which makes them unreachable after the restored hits; the 151 MB log is not rewound. Ignored outside cmplog mode."
         },
         "dump_history": {
           "type": "integer",

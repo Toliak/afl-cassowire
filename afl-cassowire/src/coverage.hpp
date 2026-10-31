@@ -31,12 +31,14 @@ constexpr std::size_t map_view_size(std::size_t announced) {
 //   u32                 site_ids[CMP_MAP_W];
 //   u16                 attributes[CMP_MAP_W];
 //
-// Only the metadata is snapshotted: the `hits` counter in each header gates
-// how many log slots the fuzzer reads, while the log is written through a
-// per-key cursor that lives inside the target process and cannot be rewound
-// from here. Rewinding `hits` therefore hides the probe's comparisons from
-// redqueen without touching the 151 MB log; the touched keys re-align within
-// a bounded number of records (and at the next colorization clear).
+// Only the headers are snapshotted: the `hits` counter in each header gates
+// how many log slots the fuzzer reads, so restoring the 128 KB header array is
+// enough to hide the probe's comparisons from redqueen. site_ids/attributes
+// are deliberately left alone: the target's cmplog_reserve() only writes them
+// when a key's hits is 0, so the probe cannot change them for keys the exchange
+// touched; for probe-only keys the restored hits is 0, so the fuzzer does not
+// read them and the next comparison re-initialises the key. Copying all
+// metadata (512 KB) instead would quadruple the per-iteration cost.
 constexpr std::size_t kCmpMapW = 65536;
 constexpr std::size_t kCmpMapH = 32;
 constexpr std::size_t kCmpHeaderBytes = kCmpMapW * 2;
@@ -82,17 +84,17 @@ public:
     bool attach_cov(int shm_id, std::size_t announced_map_size, std::string& error);
 
     /**
-     * @brief Attaches the compare-log segment and sizes the metadata buffer.
+     * @brief Attaches the compare-log segment and sizes the header snapshot.
      *
      * @param shm_id Numeric SysV id from `__AFL_CMPLOG_SHM_ID`.
      * @param error  Receives the reason on failure.
-     * @return true when the compare-log metadata window is armed.
+     * @return true when the compare-log header window is armed.
      */
     bool attach_cmp(int shm_id, std::string& error);
 
     /// @brief True when the coverage snapshot is armed.
     [[nodiscard]] bool cov_attached() const noexcept { return cov_ptr_ != nullptr; }
-    /// @brief True when the compare-log metadata snapshot is armed.
+    /// @brief True when the compare-log header snapshot is armed.
     [[nodiscard]] bool cmp_attached() const noexcept { return cmp_ptr_ != nullptr; }
     /// @brief True when at least one snapshot is armed.
     [[nodiscard]] bool active() const noexcept { return cov_attached() || cmp_attached(); }
