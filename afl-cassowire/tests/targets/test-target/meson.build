@@ -12,6 +12,15 @@ argparse_dep = dependency('argparse', required : true)
 
 executable(
     'test-target',
-    'src/test_target.cpp',
+    [
+        'src/main.cpp',
+        'src/options.cpp',
+        'src/common.cpp',
+        'src/net.cpp',
+        'src/calc_mode.cpp',
+        'src/http_mode.cpp',
+        'src/cache_mode.cpp',
+        'src/handler.cpp',
+    ],
     dependencies : [argparse_dep],
 )
