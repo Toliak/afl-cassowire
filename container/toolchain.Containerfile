@@ -47,8 +47,8 @@ RUN --mount=type=cache,sharing=locked,target=/var/cache/apt \
 # Python deps for the orc helper (also declared in the root uv workspace).
 RUN pip3 install --break-system-packages jinja2 pyyaml
 
-# LLVM 15 is the last release with the old pass manager; AFLNet's llvm_mode and
-# Nyx's packer need clang-15/llvm-config-15, which Debian trixie no longer ships.
+# LLVM 15 is the last release with the old pass manager; AFLNet's llvm_mode
+# needs clang-15/llvm-config-15, which Debian trixie no longer ships.
 # The deb is built on the host by `make -C container/clang deb`.
 # RUN --mount=type=cache,sharing=locked,target=/var/cache/apt \
 #    --mount=type=bind,source=clang/pkg/llvm-15_15.0.7-1_amd64.deb,target=/tmp/llvm-15.deb \
