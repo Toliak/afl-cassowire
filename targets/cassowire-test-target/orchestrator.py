@@ -37,6 +37,16 @@ PROFILES = {
             "corpus": ["in/calc", "out/calc/*/queue"],
         },
     },
+    # Stateful cache server: identical requests take different paths depending
+    # on the cache/history, which is the instability under study.
+    "cache": {
+        "seeds": {"aflpp": ["_fuzz/in_cache"]},
+        "coverage": {
+            "args": ["cache", "--port", "8050", "--startup-delay-ms", "100"],
+            "payload_suffix": "\r\n\r\n",
+            "corpus": ["in/cache", "out/cache/*/queue"],
+        },
+    },
 }
 
 # No data_template/ -> no RENDER.

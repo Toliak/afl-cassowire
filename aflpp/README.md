@@ -12,6 +12,7 @@ support the **afl-cassowire** project (a proxy/fork-server bridge for fuzzing ne
 | --- | --- |
 | `force_loc.patch` | Required for the `afl-cassowire` binary. Adds `AFL_CASSOWIRE_LLVM_ONLY_FSRV` to disable LLVM PC-guard coverage writes (removing coverage noise) while preserving fork-server/persistence mode, and `AFL_CASSOWIRE_FORCE_FINAL_LOC` to force the `afl_area_map` size via `__afl_final_loc` so the map can be passed through to the target unchanged. |
 | `qemu_bridge_cmplog_log.patch` | Adds opt-in debug logging to the QEMU bridge cmplog implementation. Setting `AFL_QEMU_CMPLOG_DEBUG` prints cmplog map attach info, RTN enablement, and the first INS/RTN comparison operands per map slot. |
+| `instability_admission.patch` | Experimental instability-aware coverage admission (PoC). Keeps a second, presence-only `virgin_unstable` channel for edges that calibration retires as variable. With `AFL_STAB_ADMIT=repro`, an execution that finds no new stable coverage is re-run `AFL_STAB_REPRO_RUNS` times (default 2); edges reproducing on every run are claimed and the input is queued with `+stab`. Such entries are marked `stab_only`, excluded from `top_rated`/favoured scoring, and do not advance the coverage find clock. Adds `stab_admitted`, `stab_rejected`, `stab_gate_execs` to `fuzzer_stats`. Off by default; `virgin_unstable` is not yet persisted across resume. |
 | `debug.patch.disabled` | Disabled. Instruments `updateCoverageBitmap` to `fprintf` every PC-guard index to stderr; very noisy, kept for reference only. |
 
 New env vars introduced by the patches:
@@ -19,6 +20,9 @@ New env vars introduced by the patches:
 - `AFL_CASSOWIRE_LLVM_ONLY_FSRV` — skip LLVM coverage instrumentation (fork-server only).
 - `AFL_CASSOWIRE_FORCE_FINAL_LOC` — override the coverage map size (`__afl_final_loc`).
 - `AFL_QEMU_CMPLOG_DEBUG` — enable QEMU bridge cmplog debug output.
+- `AFL_STAB_ADMIT` — set to `repro` (or `1`/`on`) to enable instability-aware
+  coverage admission (see `instability_admission.patch`). Default: disabled.
+- `AFL_STAB_REPRO_RUNS` — re-executions per admission candidate, 1-8 (default 2).
 
 ## Usage
 

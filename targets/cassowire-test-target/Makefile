@@ -15,7 +15,7 @@ TEST_TARGET_BUILD := $(TARGET_DIR)/src/build
 # ---------------------------------------------------------------------------
 
 DEFAULT_PROFILE := http
-PROFILES := http calc
+PROFILES := http calc cache
 
 # Coverage/triage goals without an explicit profile aggregate every profile;
 # seed/fuzz goals default to the target's primary profile.

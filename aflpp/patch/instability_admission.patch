@@ -1,0 +1,358 @@
+diff --git a/include/afl-fuzz.h b/include/afl-fuzz.h
+index 4c5f774..ecc2285 100644
+--- a/include/afl-fuzz.h
++++ b/include/afl-fuzz.h
+@@ -278,7 +278,8 @@ struct queue_entry {
+ 
+   u8 colorized,                         /* Do not run redqueen stage again  */
+       cal_failed,                       /* Calibration failed?              */
+-      vp_only;                          /* Added only due to VP guidance?   */
++      vp_only,                          /* Added only due to VP guidance?   */
++      stab_only;                        /* Added only via instability gate? */
+ 
+   u32 vp_ref_cnt,                      /* Number of owned VP frontier slots */
+       vp_unresolved_ref_cnt;           /* Owned unresolved VP frontier slots*/
+@@ -772,6 +773,17 @@ typedef struct afl_state {
+   long double coe_fuzz_mu;              /* COE mean log2(n_fuzz) of queue   */
+ 
+   u8 *var_bytes;                        /* Bytes that appear to be variable */
++  u8 *virgin_unstable;                  /* Edges retired as variable that can
++                                           still be claimed through the
++                                           instability repro gate           */
++  u8 *stab_cand;                        /* Gate scratch: candidate mask     */
++  u8 *stab_inter;                       /* Gate scratch: reproduced mask    */
++  u64 stab_admitted,                    /* Queue entries admitted by gate   */
++      stab_rejected,                    /* Gate candidates rejected         */
++      stab_gate_execs;                  /* Extra executions spent in gate   */
++  u8  stab_admit_repro;                 /* AFL_STAB_ADMIT=repro enabled     */
++  u32 stab_repro_runs;                  /* Re-executions per gate candidate */
++  u32 stab_only_items;                  /* Queue entries added by gate only */
+ 
+ #define N_FUZZ_SIZE (1 << 21)
+   u32   *n_fuzz;
+diff --git a/src/afl-fuzz-bitmap.c b/src/afl-fuzz-bitmap.c
+index b7295d4..1d37b01 100644
+--- a/src/afl-fuzz-bitmap.c
++++ b/src/afl-fuzz-bitmap.c
+@@ -89,11 +89,94 @@ static const u8 count_class_lookup8[256] = {
+ /* new_bits layout used by save_if_interesting()/describe_op().
+    - low 2 bits: coverage novelty class from has_new_bits() (0,1,2)
+    - 3rd bit: value-profile-only queue save marker
++   - 4th bit: instability-gate-only queue save marker
+    - 8th bit: timeout marker */
+ #define NEW_BITS_COVERAGE_MASK 0x03
+ #define NEW_BITS_VP_MASK 0x04
++#define NEW_BITS_STAB_MASK 0x08
+ #define NEW_BITS_TIMEOUT_MASK 0x80
+ 
++/* Instability-aware coverage admission (AFL_STAB_ADMIT=repro).
++   Called when an execution produced no new stable coverage but hit edges that
++   calibration retired as variable. The input is re-executed stab_repro_runs
++   times; the edges that reproduce on *every* run (the reproducible core of the
++   unstable novelty) are claimed in the presence-only unstable channel and the
++   input is admitted to the queue. If nothing reproduces, the candidate is
++   rejected and nothing is claimed, so a later execution can try again. */
++static u8 stab_repro_admit(afl_state_t *afl, void *mem, u32 len) {
++
++  u32 n = 0, i;
++
++  memset(afl->stab_cand, 0, afl->fsrv.map_size);
++  for (i = 0; i < afl->fsrv.map_size; ++i) {
++
++    if (afl->fsrv.trace_bits[i] && afl->virgin_unstable[i]) {
++
++      afl->stab_cand[i] = 1;
++      ++n;
++
++    }
++
++  }
++
++  if (!n) { return 0; }
++
++  memcpy(afl->stab_inter, afl->stab_cand, afl->fsrv.map_size);
++
++  for (u32 r = 0; r < afl->stab_repro_runs; ++r) {
++
++    void *use_mem = mem;
++    (void)write_to_testcase(afl, &use_mem, len, 1);
++    fsrv_run_result_t fault =
++        fuzz_run_target(afl, &afl->fsrv, afl->fsrv.exec_tmout);
++    ++afl->stab_gate_execs;
++
++    if (afl->stop_soon || fault != afl->crash_mode) {
++
++      ++afl->stab_rejected;
++      return 0;
++
++    }
++
++    u32 left = 0;
++    for (i = 0; i < afl->fsrv.map_size; ++i) {
++
++      if (afl->stab_inter[i]) {
++
++        if (!afl->fsrv.trace_bits[i]) {
++
++          afl->stab_inter[i] = 0;
++
++        } else {
++
++          ++left;
++
++        }
++
++      }
++
++    }
++
++    if (!left) {
++
++      ++afl->stab_rejected;
++      return 0;
++
++    }
++
++  }
++
++  for (i = 0; i < afl->fsrv.map_size; ++i) {
++
++    if (afl->stab_inter[i]) { afl->virgin_unstable[i] = 0; }
++
++  }
++
++  ++afl->stab_admitted;
++  return 1;
++
++}
++
+ /* Write bitmap to file. The bitmap is useful mostly for the secret
+    -B option, to focus a separate fuzzing session on a particular
+    interesting input without rediscovering all the others. */
+@@ -477,7 +560,8 @@ u8 *describe_op(afl_state_t *afl, u8 new_bits, size_t max_description_len) {
+       ret[len_current++] = ',';
+       ret[len_current] = '\0';
+ 
+-      ssize_t size_left = real_max_len - len_current - strlen(",+cov,+vp") - 2;
++      ssize_t size_left =
++          real_max_len - len_current - strlen(",+cov,+vp,+stab") - 2;
+       if (is_timeout) { size_left -= strlen(",+tout"); }
+       if (unlikely(size_left <= 0)) FATAL("filename got too long");
+ 
+@@ -530,6 +614,8 @@ u8 *describe_op(afl_state_t *afl, u8 new_bits, size_t max_description_len) {
+ 
+   if (is_vp) { strcat(ret, ",+vp"); }
+ 
++  if (new_bits & NEW_BITS_STAB_MASK) { strcat(ret, ",+stab"); }
++
+   if (san_crash_only) { strcat(ret, ",+san"); }
+ 
+   if (non_cov_incr) { strcat(ret, ",+noncov"); }
+@@ -949,6 +1035,7 @@ u8 __attribute__((hot)) save_if_interesting(afl_state_t *afl, void *mem,
+   u8  fn[PATH_MAX];
+   u8 *queue_fn = "";
+   u8  keeping = 0, res, is_timeout = 0, vp_entry = 0, vp_sample_ready = 0;
++  u8  stab_entry = 0;
+   u8  is_crash_save = 0;
+   u8  vp_restore_suppressed = 0;
+   u8  san_fault = 0, san_idx = 0, feed_san = 0;
+@@ -1125,6 +1212,17 @@ u8 __attribute__((hot)) save_if_interesting(afl_state_t *afl, void *mem,
+ 
+       if (san_fault == FSRV_RUN_OK) {
+ 
++        /* Instability-aware admission: no new stable coverage, but the input
++           reproduced edges that calibration retired as variable. */
++        if (unlikely(afl->stab_admit_repro && afl->var_byte_count) &&
++            stab_repro_admit(afl, mem, len)) {
++
++          new_bits |= NEW_BITS_STAB_MASK;
++          stab_entry = 1;
++          goto save_to_queue;
++
++        }
++
+         /* Value profiling on non-coverage-producing executions.
+            VP-only admission is strict-distance-only by design. */
+         if (afl->shm.vp_map && afl->shm.vp_map->enabled &&
+@@ -1218,22 +1316,34 @@ u8 __attribute__((hot)) save_if_interesting(afl_state_t *afl, void *mem,
+     }
+ 
+     /* add_to_queue() always advances the find clock and clears the
+-       cycles-without-finds counter, but a value-profile-only entry is not a
+-       coverage find. Snapshot both here and restore them below so
+-       AFL_EXIT_ON_TIME, the explore/exploit switch and the havoc escalation
+-       stay driven by coverage alone. */
++       cycles-without-finds counter, but a value-profile-only or
++       instability-gate-only entry is not a coverage find. Snapshot both here
++       and restore them below so AFL_EXIT_ON_TIME, the explore/exploit switch
++       and the havoc escalation stay driven by coverage alone. */
+     u64 saved_find_time = afl->last_find_time;
+     u64 saved_find_execs = afl->last_find_execs;
+     u64 saved_longest_find = afl->longest_find_time;
+     u64 saved_cycles_wo_finds = afl->cycles_wo_finds;
+ 
+     u8 file_modified = add_to_queue(afl, queue_fn, len, 0);
+-    if (vp_entry) {
++    if (vp_entry || stab_entry) {
+ 
+       afl->last_find_time = saved_find_time;
+       afl->last_find_execs = saved_find_execs;
+       afl->longest_find_time = saved_longest_find;
+       afl->cycles_wo_finds = saved_cycles_wo_finds;
++
++    }
++
++    if (stab_entry) {
++
++      afl->queue_top->stab_only = 1;
++      ++afl->stab_only_items;
++
++    }
++
++    if (vp_entry) {
++
+       vp_mark_entry_vp_only(afl, afl->queue_top);
+       afl->queue_top->vp_last_ref_cycle = afl->queue_cycle;
+ 
+diff --git a/src/afl-fuzz-queue.c b/src/afl-fuzz-queue.c
+index 7ffdf54..474f943 100644
+--- a/src/afl-fuzz-queue.c
++++ b/src/afl-fuzz-queue.c
+@@ -1293,6 +1293,7 @@ void update_bitmap_score(afl_state_t *afl, struct queue_entry *q,
+ 
+   if (unlikely(q->disabled)) { return; }
+   if (unlikely(q->vp_only && !q->has_new_cov)) { return; }
++  if (unlikely(q->stab_only && !q->has_new_cov)) { return; }
+ 
+   if (unlikely(afl->saved_schedule >= FAST && afl->saved_schedule < RARE)) {
+ 
+diff --git a/src/afl-fuzz-run.c b/src/afl-fuzz-run.c
+index 4fc3509..25cf9f3 100644
+--- a/src/afl-fuzz-run.c
++++ b/src/afl-fuzz-run.c
+@@ -538,6 +538,15 @@ u8 calibrate_case(afl_state_t *afl, struct queue_entry *q, u8 *use_mem,
+             afl->var_bytes[i] = 1;
+             // ignore the variable edge by setting it to fully discovered
+             afl->virgin_bits[i] = 0;
++            /* Keep a second, presence-only channel for the edge: it may still
++               be admitted into the queue if a later execution reproduces it
++               (AFL_STAB_ADMIT=repro). */
++            if (unlikely(afl->stab_admit_repro)) {
++
++              afl->virgin_unstable[i] = 0xff;
++
++            }
++
+             new_var = 1;
+ 
+           }
+diff --git a/src/afl-fuzz-state.c b/src/afl-fuzz-state.c
+index f737e6b..97d687a 100644
+--- a/src/afl-fuzz-state.c
++++ b/src/afl-fuzz-state.c
+@@ -84,6 +84,10 @@ void afl_state_init(afl_state_t *afl, uint32_t map_size) {
+   afl->virgin_undo = ck_alloc(map_size);
+   afl->virgin_reclaim = ck_alloc(map_size);
+   afl->var_bytes = ck_alloc(map_size);
++  afl->virgin_unstable = ck_alloc(map_size);
++  afl->stab_cand = ck_alloc(map_size);
++  afl->stab_inter = ck_alloc(map_size);
++  afl->stab_repro_runs = 2;
+   afl->top_rated = ck_alloc(map_size * sizeof(void *));
+   afl->clean_trace = ck_alloc(map_size);
+   afl->clean_trace_custom = ck_alloc(map_size);
+@@ -135,6 +139,9 @@ void afl_resize_map_buffers(afl_state_t *afl, u32 old_size, u32 new_size) {
+   afl->virgin_reclaim = ck_realloc(afl->virgin_reclaim, new_size);
+   afl->virgin_undo_valid = 0;
+   afl->var_bytes = ck_realloc(afl->var_bytes, new_size);
++  afl->virgin_unstable = ck_realloc(afl->virgin_unstable, new_size);
++  afl->stab_cand = ck_realloc(afl->stab_cand, new_size);
++  afl->stab_inter = ck_realloc(afl->stab_inter, new_size);
+   afl->top_rated = ck_realloc(afl->top_rated, new_size * sizeof(void *));
+ 
+   afl->clean_trace = ck_realloc(afl->clean_trace, new_size);
+@@ -147,6 +154,7 @@ void afl_resize_map_buffers(afl_state_t *afl, u32 old_size, u32 new_size) {
+     u32 size_diff = new_size - old_size;
+ 
+     memset(afl->var_bytes + old_size, 0, size_diff);
++    memset(afl->virgin_unstable + old_size, 0, size_diff);
+     memset(afl->virgin_reclaim + old_size, 0, size_diff);
+     memset(afl->top_rated + old_size, 0, size_diff * sizeof(void *));
+ 
+@@ -240,6 +248,32 @@ void read_afl_environment(afl_state_t *afl, char **envp) {
+             afl->afl_env.afl_no_warn_instability =
+                 get_afl_env(afl_environment_variables[i]) ? 1 : 0;
+ 
++          } else if (!strncmp(env, "AFL_STAB_ADMIT",
++
++                              afl_environment_variable_len)) {
++
++            u8 *stab_mode = (u8 *)get_afl_env("AFL_STAB_ADMIT");
++            afl->stab_admit_repro =
++                (stab_mode && (!strcmp((char *)stab_mode, "repro") ||
++                               !strcmp((char *)stab_mode, "1") ||
++                               !strcmp((char *)stab_mode, "on")))
++                    ? 1
++                    : 0;
++
++          } else if (!strncmp(env, "AFL_STAB_REPRO_RUNS",
++
++                              afl_environment_variable_len)) {
++
++            u8 *runs = (u8 *)get_afl_env("AFL_STAB_REPRO_RUNS");
++            if (runs) {
++
++              int n = atoi((char *)runs);
++              if (n < 1) { n = 1; }
++              if (n > 8) { n = 8; }
++              afl->stab_repro_runs = (u32)n;
++
++            }
++
+           } else if (!strncmp(env, "AFL_TRY_AFFINITY",
+ 
+                               afl_environment_variable_len)) {
+@@ -943,6 +977,9 @@ void afl_state_deinit(afl_state_t *afl) {
+   ck_free(afl->virgin_tmout);
+   ck_free(afl->virgin_crash);
+   ck_free(afl->var_bytes);
++  ck_free(afl->virgin_unstable);
++  ck_free(afl->stab_cand);
++  ck_free(afl->stab_inter);
+   ck_free(afl->top_rated);
+   if (afl->vp_frontier) { ck_free(afl->vp_frontier); }
+   if (afl->vp_focus_bitmap) { ck_free(afl->vp_focus_bitmap); }
+diff --git a/src/afl-fuzz-stats.c b/src/afl-fuzz-stats.c
+index fc80764..455c2d8 100644
+--- a/src/afl-fuzz-stats.c
++++ b/src/afl-fuzz-stats.c
+@@ -509,6 +509,9 @@ void write_stats_file(afl_state_t *afl, u32 t_bytes, double bitmap_cvg,
+       "edges_found       : %u\n"
+       "total_edges       : %u\n"
+       "var_byte_count    : %u\n"
++      "stab_admitted     : %llu\n"
++      "stab_rejected     : %llu\n"
++      "stab_gate_execs   : %llu\n"
+       "havoc_expansion   : %u\n"
+       "auto_dict_entries : %u\n"
+       "testcache_size    : %llu\n"
+@@ -554,7 +557,8 @@ void write_stats_file(afl_state_t *afl, u32 t_bytes, double bitmap_cvg,
+ #else
+       -1,
+ #endif
+-      t_bytes, afl->fsrv.real_map_size, afl->var_byte_count, afl->expand_havoc,
++      t_bytes, afl->fsrv.real_map_size, afl->var_byte_count, afl->stab_admitted,
++      afl->stab_rejected, afl->stab_gate_execs, afl->expand_havoc,
+       afl->a_extras_cnt, afl->q_testcase_cache_size,
+       afl->q_testcase_cache_count, afl->q_testcase_evictions,
+       afl->q_testcase_hits, afl->q_testcase_misses, afl->use_banner,
+--- a/include/envs.h
++++ b/include/envs.h
+@@ -117,6 +117,7 @@
+     "AFL_NO_CFG_FUZZING",  // afl.rs rust crate option
+     "AFL_NO_CRASH_README", "AFL_NO_FORKSRV", "AFL_NO_UI", "AFL_NO_PYTHON",
+     "AFL_NO_STARTUP_CALIBRATION", "AFL_NO_WARN_INSTABILITY",
++    "AFL_STAB_ADMIT", "AFL_STAB_REPRO_RUNS",
+     "AFL_UNTRACER_FILE", "AFL_LLVM_USE_TRACE_PC", "AFL_MAP_SIZE", "AFL_MAPSIZE",
+     "AFL_MAX_DET_EXTRAS",
+     "AFL_NO_X86",  // not really an env but we dont want to warn on it

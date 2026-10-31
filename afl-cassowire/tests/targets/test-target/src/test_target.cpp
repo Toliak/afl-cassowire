@@ -78,7 +78,7 @@ Options parse_options(int argc, char* argv[]) {
     program.add_description("AFL++ test target: raw TCP calculator or minimal HTTP server.");
 
     program.add_argument("mode")
-        .help("server mode: calc (default) or http")
+        .help("server mode: calc (default), http or cache (stateful HTTP-like server)")
         .default_value(std::string("calc"));
 
     program.add_argument("--host")
@@ -154,8 +154,8 @@ Options parse_options(int argc, char* argv[]) {
 
     Options opts;
     opts.mode = program.get<std::string>("mode");
-    if (opts.mode != "calc" && opts.mode != "http") {
-        fatal("invalid mode '" + opts.mode + "': expected 'calc' or 'http'");
+    if (opts.mode != "calc" && opts.mode != "http" && opts.mode != "cache") {
+        fatal("invalid mode '" + opts.mode + "': expected 'calc', 'http' or 'cache'");
     }
     opts.host = program.get<std::string>("--host");
 
@@ -405,6 +405,172 @@ std::string http_response(const std::string& raw) {
         std::to_string(std::strlen(body)) + "\r\nConnection: close\r\n\r\n" + body;
 }
 
+// ---------------------------------------------------------------------------
+// cache mode: a deliberately stateful HTTP-like server.
+// The same request takes different paths depending on the server state (cold
+// fill, warm hit, LRU eviction, periodic revalidation, admin unlock), which is
+// exactly the coverage instability that AFL++ calibration marks as variable.
+// All state transitions are deterministic given the request history, so the
+// mode provides ground truth for instability-aware fuzzing experiments.
+// ---------------------------------------------------------------------------
+
+constexpr size_t kCacheCapacity = 4;
+
+struct CacheEntry {
+    std::string key;
+    std::string body;
+    uint64_t uses = 0;
+    uint64_t stamp = 0;
+    bool compressed = false;
+};
+
+std::vector<CacheEntry> g_cache;
+uint64_t g_clock = 0;
+uint64_t g_requests = 0;
+uint64_t g_fills = 0;
+
+__attribute__((noinline)) std::string cache_compress_body(const std::string& key) {
+    std::string out;
+    for (const unsigned char c : key) {
+        if (c >= 'a' && c <= 'z') {
+            out.push_back(static_cast<char>(c - 32));
+        } else if (c >= '0' && c <= '9') {
+            out.push_back('#');
+        } else if (c == '/') {
+            out.push_back('|');
+        } else {
+            out.push_back(static_cast<char>(c));
+        }
+    }
+    return out;
+}
+
+__attribute__((noinline)) std::string cache_fill_body(const std::string& key, bool& compressed) {
+    std::string body = "fill:";
+    // Hit-count instability: the loop trip count depends on server history.
+    const uint64_t rounds = (g_fills % 4) + 1;
+    for (uint64_t i = 0; i < rounds; ++i) {
+        body += std::to_string((g_fills + i) % 10);
+        body += '.';
+    }
+    body += key;
+    if (key.size() > 6 && key.find("/zip") != std::string::npos) {
+        compressed = true;
+        body = cache_compress_body(key);
+    }
+    return body;
+}
+
+__attribute__((noinline)) void cache_insert(const std::string& key, const std::string& body,
+                                            bool compressed) {
+    if (g_cache.size() >= kCacheCapacity) {
+        size_t victim = 0;
+        for (size_t i = 1; i < g_cache.size(); ++i) {
+            if (g_cache[i].stamp < g_cache[victim].stamp) {
+                victim = i;
+            }
+        }
+        g_cache.erase(g_cache.begin() + static_cast<long>(victim));
+    }
+    CacheEntry entry;
+    entry.key = key;
+    entry.body = body;
+    entry.compressed = compressed;
+    entry.stamp = ++g_clock;
+    g_cache.push_back(entry);
+    ++g_fills;
+}
+
+__attribute__((noinline)) std::string cache_serve_hit(CacheEntry& entry) {
+    ++entry.uses;
+    entry.stamp = ++g_clock;
+    std::string body = entry.body;
+    if (entry.uses % 3 == 0) {
+        body += "|revalidated";
+        if (entry.compressed) {
+            body += "|z";
+        }
+    }
+    if (entry.uses % 5 == 0) {
+        body += "|stale-check";
+    }
+    return body;
+}
+
+__attribute__((noinline)) std::string cache_admin(uint64_t fills) {
+    std::string body = "admin:";
+    if (fills >= 8) {
+        body += "many";
+    } else if (fills >= 4) {
+        body += "some";
+    } else {
+        body += "few";
+    }
+    for (const auto& entry : g_cache) {
+        body += "|" + std::to_string(entry.uses);
+    }
+    return body;
+}
+
+std::string cache_response(const std::string& raw) {
+    size_t line_end = raw.find('\n');
+    if (line_end == std::string::npos) {
+        line_end = raw.size();
+    }
+    std::string first = raw.substr(0, line_end);
+    while (!first.empty() && (first.back() == '\r' || first.back() == ' ')) {
+        first.pop_back();
+    }
+
+    const size_t method_end = first.find(' ');
+    if (method_end == std::string::npos) {
+        return http_bad_request();
+    }
+    const std::string method = first.substr(0, method_end);
+    const std::string rest = first.substr(method_end + 1);
+    const size_t path_end = rest.find(' ');
+    const std::string path = path_end == std::string::npos ? rest : rest.substr(0, path_end);
+    if (path.empty()) {
+        return http_bad_request();
+    }
+    if (method != "GET") {
+        return "HTTP/1.1 405 Method Not Allowed\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
+    }
+
+    ++g_requests;
+    std::string body;
+    std::string cache_status = "MISS";
+    if (path == "/admin") {
+        if (g_fills >= 3) {
+            body = cache_admin(g_fills);
+            cache_status = "ADMIN";
+        } else {
+            body = "forbidden";
+            cache_status = "ADMIN-COLD";
+        }
+    } else {
+        CacheEntry* found = nullptr;
+        for (auto& entry : g_cache) {
+            if (entry.key == path) {
+                found = &entry;
+                break;
+            }
+        }
+        if (found != nullptr) {
+            cache_status = "HIT";
+            body = cache_serve_hit(*found);
+        } else {
+            bool compressed = false;
+            body = cache_fill_body(path, compressed);
+            cache_insert(path, body, compressed);
+        }
+    }
+
+    return std::string("HTTP/1.1 200 OK\r\nContent-Length: ") +
+        std::to_string(body.size()) + "\r\nX-Cache: " + cache_status +
+        "\r\nConnection: close\r\n\r\n" + body;
+}
+
 bool parse_slow_ms(const std::string& line, long& out_ms) {
     size_t index = 5;
     unsigned long long value = 0;
@@ -429,26 +595,33 @@ void handle_message(int fd, const Options& opts, const std::string& data) {
     if (line.empty()) {
         return;
     }
-    if (line == "CRASH") {
-        abort();
-    }
-    if (line == "HANG") {
-        pause();
-    }
-    if (line.rfind("SLOW ", 0) == 0) {
-        long ms = 0;
-        if (parse_slow_ms(line, ms)) {
-            sleep_ms(ms);
-            if (opts.mode == "calc") {
-                send_all(fd, "OK\n");
-            } else {
-                send_all(fd, "HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nOK");
+    // The CRASH/HANG/SLOW hooks exercise the proxy's fault handling. They are
+    // disabled in cache mode, which is a coverage/instability experiment target
+    // where slow or crashing inputs would only add measurement noise.
+    if (opts.mode != "cache") {
+        if (line == "CRASH") {
+            abort();
+        }
+        if (line == "HANG") {
+            pause();
+        }
+        if (line.rfind("SLOW ", 0) == 0) {
+            long ms = 0;
+            if (parse_slow_ms(line, ms)) {
+                sleep_ms(ms);
+                if (opts.mode == "calc") {
+                    send_all(fd, "OK\n");
+                } else {
+                    send_all(fd, "HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nOK");
+                }
+                return;
             }
-            return;
         }
     }
     if (opts.mode == "calc") {
         send_all(fd, calc_response(line, opts.with_crash));
+    } else if (opts.mode == "cache") {
+        send_all(fd, cache_response(data));
     } else {
         send_all(fd, http_response(data));
     }
