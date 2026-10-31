@@ -181,6 +181,13 @@ CASES: list[Case] = [
         _build_cmplog_alias,
     ),
     Case(
+        "valid_cov_discard_probe",
+        True,
+        # Post-exchange coverage window toggles (both default true); the cmplog
+        # one is ignored outside cmplog mode but still validated.
+        lambda: base_config(afl=afl_block(cov_discard_probe=True, cov_discard_probe_cmplog=False)),
+    ),
+    Case(
         "valid_cmplog_ignored_when_disabled",
         True,
         _build_cmplog_ignored_when_disabled,
@@ -252,6 +259,18 @@ CASES: list[Case] = [
         False,
         # afl.loop_count must be > 0.
         lambda: base_config(afl=afl_block(loop_count=0)),
+    ),
+    Case(
+        "invalid_cov_discard_probe_type",
+        False,
+        # afl.cov_discard_probe is a strict boolean.
+        lambda: base_config(afl=afl_block(cov_discard_probe="yes")),
+    ),
+    Case(
+        "invalid_cov_discard_probe_cmplog_type",
+        False,
+        # afl.cov_discard_probe_cmplog is a strict boolean.
+        lambda: base_config(afl=afl_block(cov_discard_probe_cmplog=1)),
     ),
     Case(
         "invalid_sequence_missing_delimiter",

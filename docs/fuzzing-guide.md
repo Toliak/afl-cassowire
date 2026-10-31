@@ -103,6 +103,17 @@ The generated config is `data/cassowire.seq.yaml`; the knobs live in its
 byte-level, keep the dictionary (`_fuzz/dict/http-seq.dict`) close at hand and
 prefer `response_poll_us` low for throughput.
 
+### Probe coverage isolation
+
+The post-response health probe opens a throwaway connection, and a real server
+runs instrumented code for it, so its coverage would be attributed to the
+testcase. `afl.cov_discard_probe: true` (default) snapshots the shared coverage
+map right after the input exchange and restores it after the probe and health
+checks; `afl.cov_discard_probe_cmplog: true` does the same for the CmpLog map
+metadata in the cmplog instance. Set either to `false` to keep probe (and any
+deferred/late) feedback. Cost is two map copies per iteration (70 KB - 256 KB
+for the usual targets); the proxy logs the armed window at debug level.
+
 ## 6. Coverage
 
 ```sh

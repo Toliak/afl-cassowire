@@ -73,6 +73,13 @@ Options parse_options(int argc, char* argv[]) {
         .default_value(false)
         .implicit_value(true);
 
+    program.add_argument("--cmplog-canary")
+        .help("compare the received byte count on every accepted connection "
+              "(including request-less health-probe connections), so CmpLog "
+              "records a comparison the e2e coverage-window test can discard")
+        .default_value(false)
+        .implicit_value(true);
+
     program.add_argument("--log-requests")
         .help("append one '<n> <bytes>' line per received message to this file "
               "(lets e2e tests verify how many messages arrived)")
@@ -118,6 +125,7 @@ Options parse_options(int argc, char* argv[]) {
     opts.keep_alive = program.get<bool>("--keep-alive");
     opts.with_crash = program.get<bool>("--with-crash");
     opts.multi_request = program.get<bool>("--multi-request");
+    opts.cmplog_canary = program.get<bool>("--cmplog-canary");
     opts.request_log = program.get<std::string>("--log-requests");
     opts.stdin_marker = program.get<std::string>("--stdin-marker");
     return opts;

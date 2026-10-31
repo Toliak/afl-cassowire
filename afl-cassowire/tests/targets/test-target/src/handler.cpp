@@ -18,6 +18,20 @@ namespace {
 
 constexpr long kMaxSlowMs = 60000;
 
+// CmpLog canary (--cmplog-canary): one comparison per accepted connection,
+// including the request-less connections afl-cassowire's post-response health
+// probe opens (received bytes == 0). Real servers compare protocol tokens on
+// every connection, so this mirrors a realistic probe-side comparison; the
+// e2e coverage-window test uses it to check that probe-time comparisons are
+// discarded. The volatile load keeps the compare instrumetable (never folded
+// by the compiler) and the value is unreachable for a real request length.
+[[gnu::noinline]] void cmplog_canary(size_t received_bytes) {
+    volatile unsigned long long expected = 0x2a2a2a2a2a2a2a2aULL;
+    if (received_bytes == expected) {
+        abort();
+    }
+}
+
 bool parse_slow_ms(const std::string& line, long& out_ms) {
     size_t index = 5;
     unsigned long long value = 0;
@@ -80,13 +94,18 @@ void handle_connection(int fd, const Options& opts) {
     RequestReader reader(fd, opts.mode == "calc");
     std::string data;
     size_t index = 0;
+    size_t received_bytes = 0;
     while (reader.next(data)) {
         ++index;
+        received_bytes += data.size();
         log_request(index, data.size());
         handle_message(fd, opts, data);
         if (!opts.multi_request) {
             break;
         }
+    }
+    if (opts.cmplog_canary) {
+        cmplog_canary(received_bytes);
     }
 }
 

@@ -95,6 +95,9 @@ def write_config(
     sequence: dict[str, Any] | None = None,
     stdin_path: str | None = None,
     target_extra_args: list[str] | None = None,
+    probe: bool = True,
+    cov_discard_probe: bool = True,
+    cov_discard_probe_cmplog: bool = True,
 ) -> Path:
     """Write a proxy-mode config for the test-target (calc, http or cache mode).
 
@@ -104,6 +107,9 @@ def write_config(
     __AFL_CMPLOG_SHM_ID. Like in production, the target is NOT given
     AFL_CASSOWIRE_FORCE_FINAL_LOC (env_preserve: afl_only does not forward
     it), so only the proxy's map size is forced.
+
+    `probe` toggles network.probe; `cov_discard_probe`/`cov_discard_probe_cmplog`
+    toggle the post-exchange coverage window used by the probe-isolation tests.
     """
     normal_binary = str(test_target_bin(NORMAL_VARIANT))
     network: dict[str, Any] = {
@@ -111,7 +117,7 @@ def write_config(
         "port": port,
         "timeout_ms": NETWORK_TIMEOUT_MS,
         "initial_ms": INITIAL_MS,
-        "probe": True,
+        "probe": probe,
     }
     target_section: dict[str, Any] = {
         "binary": normal_binary,
@@ -122,7 +128,12 @@ def write_config(
     config: dict[str, Any] = {
         "target": target_section,
         "network": network,
-        "afl": {"loop_count": loop_count, "enable_cmplog": cmplog},
+        "afl": {
+            "loop_count": loop_count,
+            "enable_cmplog": cmplog,
+            "cov_discard_probe": cov_discard_probe,
+            "cov_discard_probe_cmplog": cov_discard_probe_cmplog,
+        },
         "port_detection": {"primary": primary},
         "cleanup": {"enabled": False},
     }
@@ -134,7 +145,7 @@ def write_config(
         cmplog_binary = str(test_target_bin(CMPLOG_VARIANT))
         config["target_cmplog"] = {
             "binary": cmplog_binary,
-            "args": [cmplog_binary, mode, "--port", str(port)],
+            "args": [cmplog_binary, mode, "--port", str(port)] + (target_extra_args or []),
         }
         config["network_cmplog"] = dict(network)
     path = tmp_path / "cassowire.yaml"

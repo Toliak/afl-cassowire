@@ -211,6 +211,16 @@
           "default": true,
           "description": "Emit __AFL_COVERAGE_DISCARD() right before the first __AFL_LOOP pass so startup coverage (proxy init + target init in the shared map, plus the cmplog map) is not attributed to the first fuzzed testcase; the main stability knob. Requires the file-scope __AFL_COVERAGE() declaration. Setting this to false keeps the startup feedback from both the proxy and the target in the shared coverage map."
         },
+        "cov_discard_probe": {
+          "type": "boolean",
+          "default": true,
+          "description": "Snapshot the shared coverage map right after the input exchange and restore it after the post-response quiescence probe and the health checks, so coverage written by the probe (a throwaway connection) is not attributed to the testcase. Covers every exchange outcome, including connect/send/receive failures. Also drops coverage from deferred target work that finishes after the response; set to false to keep the probe and any late coverage. Proxy mode only; the snapshot length is round64(AFL_CASSOWIRE_FORCE_FINAL_LOC + 1)."
+        },
+        "cov_discard_probe_cmplog": {
+          "type": "boolean",
+          "default": true,
+          "description": "Same window for the compare-log map in the cmplog instance: snapshot and restore the cmp_map metadata (headers with the hits counters, site ids and attributes) around the probe so the probe's comparisons are not used as redqueen feedback. The log slots are not rewound (the per-key cursor lives in the target), so probe-written operands are simply not referenced by the restored hits. Ignored outside cmplog mode."
+        },
         "dump_history": {
           "type": "integer",
           "minimum": 0,

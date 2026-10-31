@@ -72,6 +72,21 @@ struct AflConfig {
     // afl-fuzz does not attribute the startup snapshot to the first fuzzed
     // testcase (low stability).
     bool cov_discard_init = true;
+    // Snapshot the shared coverage map right after the input exchange and
+    // restore it after the post-response quiescence probe and the health
+    // checks, so coverage written by the probe (a throwaway connection) is not
+    // attributed to the testcase. The window covers every exchange outcome
+    // (connect/send/receive failure included). It also drops coverage from
+    // deferred target work that finishes after the response; set false to keep
+    // the probe and any late coverage in the map. Requires proxy mode and
+    // AFL_CASSOWIRE_FORCE_FINAL_LOC.
+    bool cov_discard_probe = true;
+    // Same window for the compare-log map in the cmplog instance: snapshot and
+    // restore the cmp_map metadata (headers with the `hits` counters, site ids
+    // and attributes) around the probe. The log slots are not rewound (the
+    // per-key cursor is target-private), so probe-written operands are simply
+    // not referenced by the restored `hits`. Ignored outside cmplog mode.
+    bool cov_discard_probe_cmplog = true;
     // Number of completed iterations whose payloads are retained and written
     // alongside a termination dump (crash_proxy()/abort_proxy()) as
     // <stem>.-1.data, <stem>.-2.data, ... (-1 = most recent previous

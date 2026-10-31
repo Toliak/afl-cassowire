@@ -115,6 +115,96 @@ def test_cmplog_tracks_input(proxy_runner: Callable[..., ProxyRun]) -> None:
     assert mul_add.cmp_bytes() != div.cmp_bytes(), "cmplog feedback did not change with the corpus"
 
 
+# --- post-exchange coverage window (afl.cov_discard_probe) ------------------
+#
+# The window snapshots the map(s) right after the input exchange and restores
+# them after the post-response probe, so probe-only feedback never reaches
+# afl-fuzz. The probe still perturbs the target's __afl_prev_loc (the target is
+# a long-lived process), so edge *counts* and even a few indices of the next
+# exchange can differ between runs; the assertions therefore work on the
+# presence of edges (counts are monotonic, u8 wrap notwithstanding) and on the
+# cmp_map `hits` counters, which only grow.
+
+CMP_HEADER_BYTES = CMP_MAP_W * 2
+
+
+def _window_run(
+    tmp_path: Path,
+    *,
+    probe: bool,
+    discard: bool,
+    cmplog: bool = False,
+    iterations: int = LOOP_COUNT,
+    target_extra_args: list[str] | None = None,
+    discard_cmplog: bool = True,
+) -> ProxyRun:
+    tmp_path.mkdir(parents=True, exist_ok=True)
+    config = write_config(
+        tmp_path,
+        mode="calc",
+        port=free_port(),
+        loop_count=iterations,
+        cmplog=cmplog,
+        probe=probe,
+        cov_discard_probe=discard,
+        cov_discard_probe_cmplog=discard_cmplog,
+        target_extra_args=target_extra_args,
+    )
+    return run_proxy_mode(tmp_path / "run", config, "calc/set1", cmplog=cmplog, iterations=iterations)
+
+
+def _presence(raw: bytes) -> set[int]:
+    """Indices with a non-zero map byte (an edge was hit at least once)."""
+    return {index for index, value in enumerate(raw) if value}
+
+
+def _cmp_hits(raw: bytes) -> list[int]:
+    """The 6-bit `hits` field of every cmp_map header (u16, little endian)."""
+    return [int.from_bytes(raw[2 * key:2 * key + 2], "little") & 0x3F for key in range(CMP_MAP_W)]
+
+
+def test_probe_coverage_window_removes_probe_edges(tmp_path: Path) -> None:
+    window = _window_run(tmp_path / "window", probe=True, discard=True)
+    unwindowed = _window_run(tmp_path / "unwindowed", probe=True, discard=False)
+    _assert_clean_run(window)
+    _assert_clean_run(unwindowed)
+    window_edges = _presence(window.cov_bytes())
+    unwindowed_edges = _presence(unwindowed.cov_bytes())
+    extra = sorted(window_edges - unwindowed_edges)
+    assert not extra, f"afl.cov_discard_probe produced edges absent without the window: {extra[:10]}"
+    probe_only = sorted(unwindowed_edges - window_edges)
+    assert probe_only, "the probe contributed no unique edge; nothing was discarded"
+
+
+def test_probe_cmplog_window_removes_probe_comparisons(tmp_path: Path) -> None:
+    skip_unless_shm_available()
+    # The target's own request path does not compare anything on an empty
+    # request, so --cmplog-canary adds one comparison per accepted connection:
+    # the exchange connections and the request-less health probes both run it.
+    # CmpLog keys are PC hashes (ASLR differs between runs), so compare the
+    # aggregate hits, which is layout independent: the window removes the
+    # probe's extra hits.
+    iterations = 4
+    extra = ["--cmplog-canary"]
+    window = _window_run(
+        tmp_path / "window", probe=True, discard=True, cmplog=True,
+        iterations=iterations, target_extra_args=extra,
+    )
+    unwindowed = _window_run(
+        tmp_path / "unwindowed", probe=True, discard=True, cmplog=True,
+        iterations=iterations, target_extra_args=extra, discard_cmplog=False,
+    )
+    _assert_clean_run(window, iterations=iterations)
+    _assert_clean_run(unwindowed, iterations=iterations)
+    _assert_cmplog_written(window)
+    window_hits = sum(_cmp_hits(window.cmp_bytes()))
+    unwindowed_hits = sum(_cmp_hits(unwindowed.cmp_bytes()))
+    assert window_hits < unwindowed_hits, (
+        f"afl.cov_discard_probe_cmplog kept the probe's comparison: "
+        f"window hits {window_hits}, unwindowed {unwindowed_hits}"
+    )
+
+
 def test_cache_prng_gate_coverage(proxy_runner: Callable[..., ProxyRun]) -> None:
     near = proxy_runner("cache", "cache_prng/near")
     solved = proxy_runner("cache", "cache_prng/solved")

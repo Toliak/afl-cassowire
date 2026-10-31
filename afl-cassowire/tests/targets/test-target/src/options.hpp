@@ -20,6 +20,7 @@ struct Options {
     bool keep_alive = false;
     bool with_crash = false;
     bool multi_request = false;
+    bool cmplog_canary = false;
     std::string stdin_marker;   // empty: never touch stdin
     std::string request_log;    // empty: do not log received messages
 };

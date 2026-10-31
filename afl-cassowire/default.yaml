@@ -76,6 +76,13 @@ afl:
                                # __AFL_LOOP pass: drop the startup coverage (proxy +
                                # target init, shared map) so afl-fuzz does not
                                # attribute it to the first fuzzed testcase
+  cov_discard_probe: true      # Snapshot the coverage map after the input exchange
+                               # and restore it after the post-response probe and
+                               # health checks, so probe traffic is not attributed to
+                               # the testcase. Also drops deferred/late coverage.
+  cov_discard_probe_cmplog: true  # Same window for the cmp_map metadata in the
+                               # cmplog instance (headers/site ids/attributes; the
+                               # log slots are not rewound). Ignored outside cmplog.
   dump_history: 1              # Retain the last N completed payloads (prefix +
                                # input + suffix) and write them with every
                                # termination dump as <stem>.-1.data (most recent

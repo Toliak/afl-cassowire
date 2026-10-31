@@ -221,6 +221,31 @@ are ignored helper-anchor fields (see Important details).
   (`__afl_coverage_discard()` zeroes `__afl_area_ptr_backup`, plus the cmplog map), so
   startup feedback from the proxy and the instrumented target (NGINX init included) is
   not attributed to the first testcase. With `cov_discard_init: false` nothing clears it.
+- Post-exchange coverage window (probe isolation): `afl.cov_discard_probe`
+  (default true) makes the proxy `shmat()` the same SysV coverage segment
+  afl-fuzz created (numeric `__AFL_SHM_ID`) and snapshot it right after
+  `exchange_once()` returns — response received, or connect/send/wait failed.
+  After the post-response quiescence probe, its retries, the `probe_retry_ms`
+  sleeps and `check_target_state()`, the snapshot is copied back, so probe
+  traffic is not attributed to the testcase; the restore is the last map
+  operation before `__AFL_LOOP` signals DONE. The snapshot length is
+  `round64(AFL_CASSOWIRE_FORCE_FINAL_LOC + 1)`, exactly the view afl-fuzz
+  reads (the futex sync word stored past it is never copied).
+  `afl.cov_discard_probe_cmplog` (default true, cmplog instance only) does the
+  same for the `cmp_map` metadata — headers with the `hits` counters, site ids
+  and attributes, validated against `sizeof(struct cmp_map)` = 151,519,232.
+  The 151 MB log is deliberately not rewound: the per-key cursor lives inside
+  the target, so probe-written operands are simply not referenced by the
+  restored `hits`. Both parts are best-effort: a non-SysV `__AFL_SHM_ID`
+  (USEMMAP build) or a layout/size mismatch logs a WARN and disables that part
+  of the window. Trade-offs: coverage from deferred target work that finishes
+  after the response is dropped too (disable the key to keep it), and the
+  target's `__afl_prev_loc` is not rewound, so a probe can still shift the
+  first edge of the next exchange even though its own coverage is gone.
+  E2e coverage: `proxy_mode/test_proxy_mode.py` (`_presence`/`_cmp_hits`
+  assertions) plus the test-target's `--cmplog-canary`, which adds one
+  comparison per accepted connection so the cmplog window has probe-time
+  comparisons to discard.
 - Root config keys starting with `__` (e.g. `__helpers: &anchor`) are ignored by
   `load_config()` and exempted in `config.schema.json` (root `patternProperties
   "^__"`): a reserved namespace for YAML anchor/merge (`<<`) helper fragments.
@@ -292,7 +317,8 @@ are ignored helper-anchor fields (see Important details).
   the "must use an AFL++ compiler" enforcement lives in the `meson.build` compiler
   probe. Don't add an `#error` guard to the header.
 - Config keys added after the original design: `target.env`, `target.env_preserve`, `target.stdin_path`, `payload.*`, `sequence.*`,
-  `afl.cov_discard_init`, `afl.dump_history`, `afl.msg_log_level`,
+  `afl.cov_discard_init`, `afl.cov_discard_probe`, `afl.cov_discard_probe_cmplog`,
+  `afl.dump_history`, `afl.msg_log_level`,
   `target_cmplog.*`, `network_cmplog.*`, and the required
   `AFL_CASSOWIRE_FORCE_FINAL_LOC` env var. `target_cmplog`/`network_cmplog` are standalone
   (no key falls back to `target`/`network`) and required when `afl.enable_cmplog: true`;

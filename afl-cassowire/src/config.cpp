@@ -610,7 +610,10 @@ std::variant<Config, ConfigError> load_config(const std::string& path) {
             // --- Check for unknown keys in afl ---
             {
                 static const std::unordered_set<std::string> afl_allowed = {"loop_count", "enable_cmplog",
-                                                                            "cov_discard_init", "dump_history",
+                                                                            "cov_discard_init",
+                                                                            "cov_discard_probe",
+                                                                            "cov_discard_probe_cmplog",
+                                                                            "dump_history",
                                                                             "msg_log_level"};
                 ConfigError err = check_unknown_keys(afl_node, afl_allowed, "afl");
                 if (!err.message.empty()) {
@@ -640,6 +643,20 @@ std::variant<Config, ConfigError> load_config(const std::string& path) {
                     cfg.afl.cov_discard_init = afl_node["cov_discard_init"].as<bool>();
                 } catch (const YAML::BadConversion&) {
                     return ConfigError{"afl.cov_discard_init", "Invalid type", "boolean", afl_node["cov_discard_init"].Scalar()};
+                }
+            }
+            if (afl_node["cov_discard_probe"]) {
+                try {
+                    cfg.afl.cov_discard_probe = afl_node["cov_discard_probe"].as<bool>();
+                } catch (const YAML::BadConversion&) {
+                    return ConfigError{"afl.cov_discard_probe", "Invalid type", "boolean", afl_node["cov_discard_probe"].Scalar()};
+                }
+            }
+            if (afl_node["cov_discard_probe_cmplog"]) {
+                try {
+                    cfg.afl.cov_discard_probe_cmplog = afl_node["cov_discard_probe_cmplog"].as<bool>();
+                } catch (const YAML::BadConversion&) {
+                    return ConfigError{"afl.cov_discard_probe_cmplog", "Invalid type", "boolean", afl_node["cov_discard_probe_cmplog"].Scalar()};
                 }
             }
             if (afl_node["dump_history"]) {

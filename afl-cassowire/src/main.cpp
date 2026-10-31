@@ -4,6 +4,7 @@
 #include <iostream>
 #include <string>
 #include <string_view>
+#include <limits>
 #include <sys/prctl.h>
 #include <linux/prctl.h>
 #include <sys/socket.h>
@@ -26,6 +27,7 @@
 
 #include "args.hpp"
 #include "config.hpp"
+#include "coverage.hpp"
 #include "log.hpp"
 #include "process.hpp"
 #include "network.hpp"
@@ -460,13 +462,21 @@ ExchangeOutcome exchange_once(const Config& cfg, const uint8_t* input, size_t in
  *        with the target, then health-check the target (race-free).
  */
 void run_fuzz_iteration(const Config& cfg, pid_t child_pid, int target_pidfd,
-                        std::vector<uint8_t>& payload_buf, IterationStats& stats) {
+                        std::vector<uint8_t>& payload_buf, coverage::MapWindow& cov_window,
+                        IterationStats& stats) {
     PROXY_LOG_TRACE("loop beginning");
     int len = __AFL_FUZZ_TESTCASE_LEN;
     uint8_t* buf = __AFL_FUZZ_TESTCASE_BUF;
     const uint64_t budget_ms = static_cast<uint64_t>(cfg.network.timeout_ms);
 
     ExchangeOutcome ex = exchange_once(cfg, buf, static_cast<size_t>(len), payload_buf);
+
+    // Coverage window: the exchange is over (response received, or the
+    // connect/send/wait failed), so the testcase's coverage is complete. Keep
+    // a snapshot and write it back after the quiescence probe and the health
+    // checks below, whose target-side coverage must not be attributed to this
+    // input. No-op when afl.cov_discard_probe[_cmplog] left the window disarmed.
+    cov_window.capture();
 
     if (ex.connect_error) {
         // Rate-limited: a target that is alive but refuses connections would
@@ -721,8 +731,34 @@ void run_fuzz_iteration(const Config& cfg, pid_t child_pid, int target_pidfd,
         break; // normal case, keep fuzzing
     }
 
+    // End of the coverage window: restore the map(s) as the exchange left
+    // them, so neither the probe connection(s) above nor anything the target
+    // did while they were being serviced is visible to afl-fuzz for this
+    // testcase. Done after the health check (and before the __AFL_LOOP DONE
+    // signal) so the restore is the last map operation of the iteration.
+    cov_window.restore();
+
     update_iteration_stats(stats, ex.connect_ms, ex.send_ms, ex.wait_ms, probe_ms,
                            ex.messages_built, budget_ms);
+}
+
+/**
+ * @brief Parses a SysV shm id from an AFL++ environment variable.
+ *
+ * On Linux AFL++ passes the coverage and cmplog maps as numeric SysV ids
+ * (`__AFL_SHM_ID`, `__AFL_CMPLOG_SHM_ID`). USEMMAP builds pass a file
+ * descriptor / path instead; the coverage window needs an id, so callers
+ * treat a non-numeric value as "window unavailable" rather than an error.
+ */
+static bool parse_sysv_shm_id(const char* env_name, int& out_id) {
+    const char* value = getenv(env_name);
+    if (value == nullptr) return false;
+    auto parsed = utils::parse_u64_strict(value);
+    if (!std::holds_alternative<uint64_t>(parsed)) return false;
+    const uint64_t id = std::get<uint64_t>(parsed);
+    if (id > static_cast<uint64_t>(std::numeric_limits<int>::max())) return false;
+    out_id = static_cast<int>(id);
+    return true;
 }
 
 int run_proxy_mode(Config cfg, bool forward_output) {
@@ -771,6 +807,42 @@ int run_proxy_mode(Config cfg, bool forward_output) {
     }
 
     PROXY_LOG_INFO("AFL_CASSOWIRE_FORCE_FINAL_LOC = {}", force_final_loc);
+
+    // Coverage window (afl.cov_discard_probe / cov_discard_probe_cmplog).
+    // Attach the very SysV segments afl-fuzz created and the target maps
+    // through the same env vars; the proxy only snapshots/restores them. Best
+    // effort: a layout or id mismatch disables that part of the window with a
+    // WARN instead of failing the run.
+    coverage::MapWindow cov_window;
+    if (cfg.afl.cov_discard_probe) {
+        int cov_id = -1;
+        std::string err;
+        if (force_final_loc > 0xffffffffULL) {
+            PROXY_LOG_WARN("afl.cov_discard_probe: AFL_CASSOWIRE_FORCE_FINAL_LOC {} exceeds the "
+                           "runtime's u32 map size; coverage window disabled", force_final_loc);
+        } else if (!parse_sysv_shm_id("__AFL_SHM_ID", cov_id)) {
+            PROXY_LOG_WARN("afl.cov_discard_probe: __AFL_SHM_ID is not a SysV id "
+                           "(USEMMAP build?); coverage window disabled");
+        } else if (!cov_window.attach_cov(cov_id, static_cast<std::size_t>(force_final_loc) + 1, err)) {
+            PROXY_LOG_WARN("afl.cov_discard_probe: {}; coverage window disabled", err);
+        } else {
+            PROXY_LOG_DEBUG("coverage window armed ({} bytes)", cov_window.cov_len());
+        }
+    }
+    if (cfg.afl.cov_discard_probe_cmplog) {
+        int cmp_id = -1;
+        std::string err;
+        if (getenv("__AFL_CMPLOG_SHM_ID") == nullptr) {
+            PROXY_LOG_TRACE("afl.cov_discard_probe_cmplog: not a cmplog instance; nothing to arm");
+        } else if (!parse_sysv_shm_id("__AFL_CMPLOG_SHM_ID", cmp_id)) {
+            PROXY_LOG_WARN("afl.cov_discard_probe_cmplog: __AFL_CMPLOG_SHM_ID is not a SysV id "
+                           "(USEMMAP build?); cmplog window disabled");
+        } else if (!cov_window.attach_cmp(cmp_id, err)) {
+            PROXY_LOG_WARN("afl.cov_discard_probe_cmplog: {}; cmplog window disabled", err);
+        } else {
+            PROXY_LOG_DEBUG("cmplog coverage window armed (metadata only)");
+        }
+    }
 
     // Pre-spawn cleanup: only in a validated proxy invocation, against the
     // already-selected normal/cmplog target and port.
@@ -855,7 +927,7 @@ int run_proxy_mode(Config cfg, bool forward_output) {
         // before run_fuzz_iteration() so every failure path inside it
         // reports the same, current iteration.
         utils::set_current_iteration(stats.iterations + 1);
-        run_fuzz_iteration(cfg, g_child_pid, target_pidfd.get(), payload_buf, stats);
+        run_fuzz_iteration(cfg, g_child_pid, target_pidfd.get(), payload_buf, cov_window, stats);
         // Record this completed iteration's payload so a later termination
         // dump can preserve it (a deferred/async crash detected on the next
         // iteration then finds the input that likely caused it). payload_buf

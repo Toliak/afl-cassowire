@@ -56,6 +56,7 @@ sources = files(
     'src/main.cpp',
     'src/args.cpp',
     'src/config.cpp',
+    'src/coverage.cpp',
     'src/log.cpp',
     'src/process.cpp',
     'src/network.cpp',
