@@ -12,6 +12,8 @@ tracks the fuzzed input.
 from __future__ import annotations
 
 import os
+import re
+import subprocess
 import sys
 from collections.abc import Callable
 from pathlib import Path
@@ -20,6 +22,7 @@ import pytest
 from emul import CMP_MAP_H, CMP_MAP_SIZE, CMP_MAP_W, CMP_OPERANDS_SIZE
 from runner import (
     ProxyRun,
+    cassowire_bin,
     corpus_dir,
     free_port,
     run_proxy_mode,
@@ -468,3 +471,179 @@ def test_sequence_crash_dump_has_full_session(tmp_path: Path) -> None:
     dumps = sorted((run.out_dir / "afl-cassowire-data").glob("*.data"))
     assert dumps, "no termination dump written"
     assert b"2 + 2\nCRASH\n" in [path.read_bytes() for path in dumps]
+
+
+# ---------------------------------------------------------------------------
+# Termination-dump history (afl.dump_history / afl.history_dedup)
+# ---------------------------------------------------------------------------
+#
+# cache_dedup warms up with two CmpLog-gated PRNG requests (deterministic,
+# state-free coverage), repeats the second one five more times, then sends two
+# lottery requests; the second lottery request is the warm hit that aborts the
+# target. With one poke per input the crash lands on iteration 9 and the
+# 6-entry history ring holds iterations 3..8: five identical PRNG iterations
+# plus the lottery miss. Dedup must keep only the PRNG group's first and last
+# member (plus the two newest entries), i.e. 3 of 6.
+
+DEDUP_ITERATIONS = 9
+DEDUP_HISTORY = 6
+
+
+def _dump_files(run: ProxyRun, suffix: str) -> list[Path]:
+    return sorted((run.out_dir / "afl-cassowire-data").glob(f"*{suffix}"))
+
+
+def _dedup_run(
+    tmp_path: Path,
+    *,
+    dedup: bool,
+    method: str | None,
+    stats_path: str | None = None,
+    emul_extra: list[str] | None = None,
+) -> ProxyRun:
+    port = free_port()
+    request_log = tmp_path / "requests.log"
+    config = write_config(
+        tmp_path,
+        mode="cache",
+        port=port,
+        loop_count=DEDUP_ITERATIONS,
+        dump_history=DEDUP_HISTORY,
+        history_dedup=dedup,
+        var_bytes_method=method,
+        var_bytes_stats_path=stats_path,
+        target_extra_args=["--with-crash", "--log-requests", str(request_log)],
+    )
+    return run_proxy_mode(
+        tmp_path / "run",
+        config,
+        "cache_dedup",
+        iterations=DEDUP_ITERATIONS,
+        emul_extra=emul_extra,
+    )
+
+
+def _assert_crash_dump(run: ProxyRun) -> str:
+    events = run.summary["events"]
+    assert [event["kind"] for event in events] == ["stopped"] * (DEDUP_ITERATIONS - 1) + ["signaled"], (
+        run.summary,
+        run.proxy_log[-2000:],
+    )
+    assert events[-1]["signal"] == "SIGSEGV", run.summary
+    msgs = _dump_files(run, ".msg")
+    assert len(msgs) == 1, msgs
+    return msgs[0].read_text()
+
+
+def test_history_without_dedup_writes_every_entry(tmp_path: Path) -> None:
+    run = _dedup_run(tmp_path, dedup=False, method=None)
+    msg = _assert_crash_dump(run)
+    # Six history entries plus the current iteration.
+    assert len(_dump_files(run, ".data")) == DEDUP_HISTORY + 1
+    assert len(_dump_files(run, ".input")) == DEDUP_HISTORY + 1
+    assert "dedup: off" in msg
+    # The raw testcases are dumped verbatim next to the built payloads.
+    current = _dump_files(run, ".input")[-1]
+    assert current.name.endswith(".input") and ".-" not in current.name
+    assert current.read_bytes() == corpus_dir("cache_dedup/09-lottery.txt").read_bytes()
+
+
+def test_history_dedup_keeps_first_and_last_per_footprint(tmp_path: Path) -> None:
+    run = _dedup_run(tmp_path, dedup=True, method="off")
+    msg = _assert_crash_dump(run)
+    assert "dedup: on (afl.history_dedup)" in msg
+    assert "mask: off" in msg
+    # The five repeated PRNG iterations form one (sometimes two, because the
+    # target's read path can fork on TCP segmentation) footprint group; dedup
+    # keeps its first and last member. The exact count is therefore 3-5, but
+    # the structural guarantees are stable.
+    match = re.search(r"kept (\d+) of 6 history entries", msg)
+    assert match, msg
+    kept = int(match.group(1))
+    assert 3 <= kept <= 5, msg
+    data = _dump_files(run, ".data")
+    inputs = _dump_files(run, ".input")
+    assert len(data) == kept + 1  # history entries + current
+    assert len(inputs) == kept + 1
+    # Original .-N suffix distances survive (1 = newest previous iteration),
+    # and the two newest history entries are always kept.
+    names = {path.name for path in data}
+    assert any(name.endswith(".-1.data") for name in names)
+    assert any(name.endswith(".-2.data") for name in names)
+    assert any(name.endswith(".-6.data") for name in names)
+    # Only old members of a repeated footprint are dropped.
+    dropped = re.findall(r"^\.-(\d+)\.data = iteration \d+.*\[dropped:", msg, re.MULTILINE)
+    assert dropped, msg
+    assert all(int(distance) >= 3 for distance in dropped), msg
+
+
+def test_history_dedup_shm_mask_is_attached(tmp_path: Path) -> None:
+    # An all-unstable mask erases every footprint, so the no-information guard
+    # keeps the whole history. What this verifies is the shm attach + load path
+    # (__AFL_VARBYTES_SHM_ID) and its reporting.
+    run = _dedup_run(tmp_path, dedup=True, method="shm", emul_extra=["--varbytes-all"])
+    msg = _assert_crash_dump(run)
+    assert "history dedup enabled (var_bytes_method: shm)" in run.proxy_log
+    assert "mask: shm" in msg
+    assert len(_dump_files(run, ".data")) == DEDUP_HISTORY + 1
+
+
+def test_history_dedup_stats_mask_fallback(tmp_path: Path) -> None:
+    stats = tmp_path / "fuzzer_stats"
+    stats.write_text(
+        "start_time        : 1\n"
+        "var_byte_count    : 3\n"
+        "var_bytes        : 0 1 2\n"
+    )
+    run = _dedup_run(tmp_path, dedup=True, method="stats", stats_path=str(stats))
+    msg = _assert_crash_dump(run)
+    assert "mask: stats (" in msg and str(stats) in msg
+    assert "3 byte(s)" in msg
+    # Masking a handful of entry edges does not merge every footprint.
+    assert re.search(r"kept \d+ of 6 history entries", msg), msg
+
+
+def test_history_dedup_requires_explicit_method(tmp_path: Path) -> None:
+    config = write_config(
+        tmp_path,
+        mode="cache",
+        port=free_port(),
+        history_dedup=True,
+    )
+    input_file = corpus_dir("cache_dedup/01-prng.txt")
+    proc = subprocess.run(
+        [str(cassowire_bin()), "-c", str(config), "test", "--input", str(input_file)],
+        capture_output=True,
+        text=True,
+        timeout=60,
+        check=False,
+    )
+    assert proc.returncode == 1, proc.stdout + proc.stderr
+    assert "afl.var_bytes_method" in proc.stdout + proc.stderr
+    assert "Required when afl.history_dedup is true" in proc.stdout + proc.stderr
+
+
+def test_test_replay_reproduces_multi_iteration_crash(tmp_path: Path) -> None:
+    run = _dedup_run(tmp_path, dedup=True, method="off")
+    _assert_crash_dump(run)
+    dump_dir = run.out_dir / "afl-cassowire-data"
+    # The deduped history drops the middle PRNG repeats; the surviving order
+    # (first PRNG, lottery miss, lottery hit) must still crash the target.
+    proc = subprocess.run(
+        [
+            str(cassowire_bin()),
+            "-c",
+            str(tmp_path / "cassowire.yaml"),
+            "test",
+            "--replay",
+            str(dump_dir),
+            "--retries",
+            "2",
+        ],
+        capture_output=True,
+        text=True,
+        timeout=120,
+        check=False,
+    )
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert "crash reproduced" in proc.stdout

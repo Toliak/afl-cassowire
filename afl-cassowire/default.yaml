@@ -93,6 +93,26 @@ afl:
                                # that caused it; the history preserves the likely
                                # culprit. 0 disables the history (only <stem>.data
                                # is written). Allowed range: 0-64.
+  # history_dedup: false       # Write only one history file per coverage
+                               # footprint: the oldest and the newest iteration
+                               # of each footprint, plus the two newest entries
+                               # regardless. Affects only the <stem>.-N.data /
+                               # .-N.input history files; the current .data and
+                               # .input are always written. Requires
+                               # var_bytes_method to be set explicitly.
+  # var_bytes_method: off      # Unstable-edge mask used by history_dedup:
+                               #   off   - no mask (raw presence edge sets)
+                               #   shm   - SysV bitmap afl-fuzz publishes as
+                               #           __AFL_VARBYTES_SHM_ID (needs the
+                               #           cassowire AFL++ patch)
+                               #   stats - parse the 'var_bytes :' line of
+                               #           fuzzer_stats (<=60 s stale; stock
+                               #           AFL++ needs AFL_DEBUG=1 for it)
+                               # No implicit default: required when
+                               # history_dedup is true.
+  # var_bytes_stats_path: ""   # fuzzer_stats path for var_bytes_method: stats.
+                               # Empty = use $AFL_CASSOWIRE_STATS_PATH; empty
+                               # there too = no mask (dedup runs unmasked).
   msg_log_level: warn          # Log level for the warn/error ring whose captured
                                # lines are embedded into termination .msg dumps.
                                # Dump content only - the console level is the

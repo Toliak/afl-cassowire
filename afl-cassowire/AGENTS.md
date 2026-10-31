@@ -69,6 +69,7 @@ For C++ changes the only default verification is the documented build sequence a
 ```sh
 ./build/afl-cassowire [-c config.yaml] [proxy]        # default mode, needs __AFL_SHM_ID
 ./build/afl-cassowire [-c config.yaml] test --input f # or '-' for stdin
+./build/afl-cassowire [-c config.yaml] test --replay d [--retries N]
 ```
 `proxy` also requires `AFL_CASSOWIRE_FORCE_FINAL_LOC=<uint64>` in the environment.
 Global options (`-c/--config`, `--log-level`, `--child-output`, `--data-dir`) must
@@ -76,7 +77,8 @@ precede the subcommand. `--data-dir` selects where termination dumps are written
 (default `afl-cassowire-data`, created recursively if missing).
 argv/yaml split: **argv** carries logging (`--log-level`), environmental,
 fuzzing-unrelated settings (`-c/--config`, `--data-dir`, `--child-output`), and
-mode-specific extras (`test --input`; `proxy` takes none of its own). Everything
+mode-specific extras (`test --input`, `test --replay`, `test --retries`;
+`proxy` takes none of its own). Everything
 that affects the fuzzing process itself — target, network, AFL loop, port
 detection, payload wrapping, dump *content* such as `afl.msg_log_level` — lives in
 config.yaml.
@@ -176,11 +178,13 @@ are ignored helper-anchor fields (see Important details).
   mode. Delivery is immediate SIGKILL — by design, since the proxy is already
   dead when it fires. It relies on the proxy staying single-threaded
   (PDEATHSIG watches the forking thread).
-- `crash_proxy(message, payload)`/`abort_proxy(message, payload)` share `terminate_proxy()`
-  and, before raising `SIGSEGV`/`SIGABRT`, write a termination pair into `--data-dir`
-  (default `afl-cassowire-data`, created recursively): `{timestamp}-{tag}.msg` (reason)
-  and `{timestamp}-{tag}.data` (the full payload built for the iteration: prefix + input
-  + suffix), sharing one `YYYYmmdd-HHMMSS-mmm` stem. `-tag` is the instance kind set in
+- `crash_proxy(message, payload, raw, edges)`/`abort_proxy(...)` share
+  `terminate_proxy()` and, before raising `SIGSEGV`/`SIGABRT`, write a termination
+  set into `--data-dir` (default `afl-cassowire-data`, created recursively):
+  `{timestamp}-{tag}.msg` (reason), `{timestamp}-{tag}.data` (the full payload
+  built for the iteration: prefix + input + suffix) and `{timestamp}-{tag}.input`
+  (the raw AFL testcase, i.e. what `test --input`/AFL itself consume), sharing
+  one `YYYYmmdd-HHMMSS-mmm` stem. `-tag` is the instance kind set in
   `main()` (`normal` | `cmplog` | `test`, via `utils::set_instance_tag()`), so dumps from
   concurrently running instances stay attributable; the `.msg` content and the
   termination log line embed it as `{kind}[{tag}]: {reason}`. The `.msg` additionally
@@ -192,8 +196,10 @@ are ignored helper-anchor fields (see Important details).
    current 1-based `__AFL_LOOP` iteration as an `iteration: N` line (set once per
    loop pass via `utils::set_current_iteration()` in `run_proxy_mode()`; `0` =
    termination outside the loop or test mode). Dumps are best-effort and never fatal.
-   With `afl.dump_history > 0` the dump also writes the retained previous-iteration
-   payloads as `{stem}.-1.data`, `{stem}.-2.data`, ... (see "Crash detection gaps").
+   With `afl.dump_history > 0` the dump also writes the retained
+   previous-iteration entries as `{stem}.-1.data`/`.input` (most recent previous
+   iteration), `{stem}.-2.data`/`.input`, ...; `afl.history_dedup` filters that
+   ring by coverage footprint (see "Crash detection gaps").
 - Payload sent over TCP is `payload.prefix + fuzz input + payload.suffix`
   (`PayloadConfig::wrap()`); values may be `!!binary` and are base64-decoded by
   `read_bytes_value()` in config.cpp (the same helper reads the sequence
@@ -239,9 +245,12 @@ are ignored helper-anchor fields (see Important details).
   unreachable after the restored `hits`; the 151 MB log is deliberately not
   rewound (the per-key cursor lives inside the target). Both parts are
   best-effort: a non-SysV `__AFL_SHM_ID` (USEMMAP build) or a layout/size
-  mismatch logs a WARN and disables that part of the window. Neither window is
-  armed when `network.probe: false` (nothing is written between the exchange
-  and the health check, so the copies would be pure cost). Trade-offs: coverage from deferred target work that finishes
+  mismatch logs a WARN and disables that part of the window. Neither restore
+  window is armed when `network.probe: false` (nothing is written between the
+  exchange and the health check, so writing the snapshot back would be pure
+  cost). The coverage snapshot itself is still taken when `afl.history_dedup`
+  is on, which needs the post-exchange map regardless of the probe; the restore
+  stays tied to the probe window. Trade-offs: coverage from deferred target work that finishes
   after the response is dropped too (disable the key to keep it), and the
   target's `__afl_prev_loc` is not rewound, so a probe can still shift the
   first edge of the next exchange even though its own coverage is gone.
@@ -305,10 +314,33 @@ are ignored helper-anchor fields (see Important details).
   `.data` payload may be the wrong one. This is inherent: a top-of-iteration check
   would only move the window, not close it; a full fix needs idle detection (e.g. a
   procfs syscall whitelist). The proxy mitigates it with `afl.dump_history` (default
-  `1`): the last N completed payloads (prefix + input + suffix) are retained and
-  written with every termination dump as `{stem}.-1.data` (most recent previous
-  iteration), `{stem}.-2.data`, ... so the likely culprit survives alongside the
-  current input. `0` disables the history (only `{stem}.data` is written).
+  `1`): the last N completed iterations are retained (raw testcase, built payload
+  and, when dedup is on, their presence edge ids) and written with every
+  termination dump as `{stem}.-1.data`/`.input` (most recent previous iteration),
+  `{stem}.-2.data`/`.input`, ... so the likely culprit survives alongside the
+  current input. `0` disables the history (only the current `.data`/`.input`).
+- History dedup (`afl.history_dedup`, default false) filters that ring at dump
+  time. A footprint is the iteration's presence edge set (`coverage::presence_edges`)
+  minus the edges marked unstable by the configured `afl.var_bytes_method`
+  (`off` = no mask, `shm` = the SysV bitmap afl-fuzz publishes as
+  `__AFL_VARBYTES_SHM_ID` via `aflpp/patch/var_bytes_shm.patch`, `stats` = the
+  `var_bytes :` indices line of `fuzzer_stats`, up to 60 s stale and emitted by
+  stock AFL++ only with `AFL_DEBUG=1`). The method has **no implicit default**:
+  `history_dedup: true` without it is a config error. The dump keeps the first
+  and the last iteration of each footprint and always the two newest entries
+  (deferred-crash window); the current iteration is never filtered. If the
+  coverage snapshot is unavailable or every footprint is empty (e.g. an
+  all-ones mask), the whole ring is kept. The `.msg` lists every history entry
+  with its distance, iteration, edge count, footprint hash and kept/dropped
+  reason, plus the mask source/size. Footprints are inherently noisy on
+  stateful targets (TCP segmentation alone changes the read path), so the
+  filter reduces triage noise; it is not a proof that a dropped iteration was
+  irrelevant.
+- `test --replay <dir>` replays the `.input` files of the newest dump stem in
+  `<dir>` against one fresh target instance, in order (`. -N` first, the
+  current `.input` last), which is what multi-iteration state-dependent crashes
+  need; `--retries N` retries with a fresh target and reports success when any
+  attempt reproduces a target crash (probabilistic crashes, see AC2.7).
 - Crashes in worker children of the target (nginx workers, QEMU child processes) are
   not detected directly: only the direct child pid is watched
   (`process::check_target_state`). A dead worker stops servicing, so it surfaces as
@@ -321,7 +353,8 @@ are ignored helper-anchor fields (see Important details).
   probe. Don't add an `#error` guard to the header.
 - Config keys added after the original design: `target.env`, `target.env_preserve`, `target.stdin_path`, `payload.*`, `sequence.*`,
   `afl.cov_discard_init`, `afl.cov_discard_probe`, `afl.cov_discard_probe_cmplog`,
-  `afl.dump_history`, `afl.msg_log_level`,
+  `afl.dump_history`, `afl.history_dedup`, `afl.var_bytes_method`,
+  `afl.var_bytes_stats_path`, `afl.msg_log_level`,
   `target_cmplog.*`, `network_cmplog.*`, and the required
   `AFL_CASSOWIRE_FORCE_FINAL_LOC` env var. `target_cmplog`/`network_cmplog` are standalone
   (no key falls back to `target`/`network`) and required when `afl.enable_cmplog: true`;

@@ -47,7 +47,11 @@ src/.submodules: src/.cloned
 
 src: src/.cloned $(QEMU_SUBMODULE_DEP)
 
-src/.patched: src/.cloned $(QEMU_SUBMODULE_DEP)
+# Every patch file is a dependency: adding or editing one must re-apply the
+# whole series to a fresh clone (the series is ordered and not idempotent).
+PATCH_FILES := $(wildcard patch/*.patch)
+
+src/.patched: src/.cloned $(QEMU_SUBMODULE_DEP) $(PATCH_FILES)
 	cd "./src" && \
 		for F in "../patch"/*.patch; do \
 			patch -p1 -i "$$F" || exit 1; \

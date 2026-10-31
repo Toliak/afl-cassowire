@@ -42,12 +42,22 @@ namespace args {
 
         // --input belongs to the `test` subcommand only: it is accepted as
         // `afl-cassowire test --input <file>` and rejected everywhere else.
-        // required() enforces it at parse time (argparse only validates a
-        // subparser's arguments when that subcommand is used), so test mode
-        // can never run without an input.
+        // Exactly one of --input/--replay is enforced below (argparse only
+        // validates a subparser's arguments when that subcommand is used).
         test_cmd.add_argument("--input")
-            .help("Input file for test mode (use '-' for stdin)")
-            .required();
+            .help("Input file for test mode (use '-' for stdin); one exchange");
+
+        // Replay a dumped iteration history against one target instance:
+        // <dir> holds the .input files of a single termination dump. They are
+        // replayed in their original order (.-N, ..., .-1, current), which is
+        // what multi-iteration state-dependent crashes (e.g. the test-target's
+        // cache lottery) need to reproduce.
+        test_cmd.add_argument("--replay")
+            .help("Directory with the .input files of one dump; replays them in order");
+        test_cmd.add_argument("--retries")
+            .help("Fresh-target replay attempts for --replay (default 1)")
+            .default_value(1)
+            .scan<'i', int>();
 
         program.add_subparser(proxy_cmd);
         program.add_subparser(test_cmd);
@@ -65,7 +75,30 @@ namespace args {
         parsed.data_dir = program.get<std::string>("--data-dir");
         parsed.is_test_mode = program.is_subcommand_used("test");
         if (parsed.is_test_mode) {
-            parsed.input_path = test_cmd.get<std::string>("--input");
+            const bool has_input = test_cmd.is_used("--input");
+            const bool has_replay = test_cmd.is_used("--replay");
+            if (has_input == has_replay) {
+                return ArgParseError{
+                    "test mode needs exactly one of --input <file> or --replay <dir>",
+                    program.help().str()};
+            }
+            if (has_input) {
+                parsed.input_path = test_cmd.get<std::string>("--input");
+                if (test_cmd.is_used("--retries")) {
+                    return ArgParseError{
+                        "--retries is only valid with --replay (--input is a single exchange)",
+                        program.help().str()};
+                }
+            } else {
+                parsed.replay_dir = test_cmd.get<std::string>("--replay");
+            }
+            parsed.replay_retries = test_cmd.get<int>("--retries");
+            if (parsed.replay_retries < 1 || parsed.replay_retries > 100) {
+                return ArgParseError{
+                    "invalid --retries '" + std::to_string(parsed.replay_retries) +
+                        "': expected an integer 1-100",
+                    program.help().str()};
+            }
         }
 
         // Validate the level name here so the error path can still render the

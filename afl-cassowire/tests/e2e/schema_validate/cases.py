@@ -193,6 +193,29 @@ CASES: list[Case] = [
         _build_cmplog_ignored_when_disabled,
     ),
     Case(
+        "valid_history_dedup_off",
+        True,
+        # History dedup with the explicit no-mask method (off/shm/stats are the
+        # only accepted values; there is no implicit default).
+        lambda: base_config(afl=afl_block(history_dedup=True, var_bytes_method="off")),
+    ),
+    Case(
+        "valid_history_dedup_shm",
+        True,
+        lambda: base_config(afl=afl_block(history_dedup=True, var_bytes_method="shm")),
+    ),
+    Case(
+        "valid_history_dedup_stats_path",
+        True,
+        lambda: base_config(
+            afl=afl_block(
+                history_dedup=True,
+                var_bytes_method="stats",
+                var_bytes_stats_path="/out/default/fuzzer_stats",
+            )
+        ),
+    ),
+    Case(
         "valid_helper_anchors",
         True,
         _build_helper_anchors,
@@ -259,6 +282,28 @@ CASES: list[Case] = [
         False,
         # afl.loop_count must be > 0.
         lambda: base_config(afl=afl_block(loop_count=0)),
+    ),
+    Case(
+        "invalid_var_bytes_method_auto",
+        False,
+        # There is deliberately no implicit/auto mask source: the user must pick
+        # off, shm or stats.
+        lambda: base_config(afl=afl_block(history_dedup=True, var_bytes_method="auto")),
+    ),
+    Case(
+        "invalid_var_bytes_method_type",
+        False,
+        lambda: base_config(afl=afl_block(var_bytes_method=1)),
+    ),
+    Case(
+        "invalid_history_dedup_type",
+        False,
+        lambda: base_config(afl=afl_block(history_dedup="yes")),
+    ),
+    Case(
+        "invalid_var_bytes_stats_path_type",
+        False,
+        lambda: base_config(afl=afl_block(var_bytes_stats_path=1)),
     ),
     Case(
         "invalid_cov_discard_probe_type",

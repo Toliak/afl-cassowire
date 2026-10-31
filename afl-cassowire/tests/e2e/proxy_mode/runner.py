@@ -98,6 +98,10 @@ def write_config(
     probe: bool = True,
     cov_discard_probe: bool = True,
     cov_discard_probe_cmplog: bool = True,
+    dump_history: int = 1,
+    history_dedup: bool = False,
+    var_bytes_method: str | None = None,
+    var_bytes_stats_path: str | None = None,
 ) -> Path:
     """Write a proxy-mode config for the test-target (calc, http or cache mode).
 
@@ -110,6 +114,9 @@ def write_config(
 
     `probe` toggles network.probe; `cov_discard_probe`/`cov_discard_probe_cmplog`
     toggle the post-exchange coverage window used by the probe-isolation tests.
+    `dump_history`/`history_dedup`/`var_bytes_*` drive the termination-dump
+    history tests (the loader rejects history_dedup without an explicit
+    var_bytes_method, so pass both).
     """
     normal_binary = str(test_target_bin(NORMAL_VARIANT))
     network: dict[str, Any] = {
@@ -125,15 +132,23 @@ def write_config(
     }
     if stdin_path is not None:
         target_section["stdin_path"] = stdin_path
+    afl: dict[str, Any] = {
+        "loop_count": loop_count,
+        "enable_cmplog": cmplog,
+        "cov_discard_probe": cov_discard_probe,
+        "cov_discard_probe_cmplog": cov_discard_probe_cmplog,
+        "dump_history": dump_history,
+    }
+    if history_dedup:
+        afl["history_dedup"] = True
+    if var_bytes_method is not None:
+        afl["var_bytes_method"] = var_bytes_method
+    if var_bytes_stats_path is not None:
+        afl["var_bytes_stats_path"] = var_bytes_stats_path
     config: dict[str, Any] = {
         "target": target_section,
         "network": network,
-        "afl": {
-            "loop_count": loop_count,
-            "enable_cmplog": cmplog,
-            "cov_discard_probe": cov_discard_probe,
-            "cov_discard_probe_cmplog": cov_discard_probe_cmplog,
-        },
+        "afl": afl,
         "port_detection": {"primary": primary},
         "cleanup": {"enabled": False},
     }
@@ -190,7 +205,8 @@ class ProxyRun:
 
 
 def run_proxy_mode(out_dir: Path, config_path: Path, corpus: str, *,
-                   cmplog: bool = False, iterations: int = LOOP_COUNT) -> ProxyRun:
+                   cmplog: bool = False, iterations: int = LOOP_COUNT,
+                   emul_extra: list[str] | None = None) -> ProxyRun:
     """Drive one emulator run; raises AssertionError when the emulator itself crashes.
 
     `iterations` must match the config's afl.loop_count. Tests that expect the
@@ -211,6 +227,7 @@ def run_proxy_mode(out_dir: Path, config_path: Path, corpus: str, *,
         str(out_dir),
         "--input",
         str(corpus_dir(corpus)),
+        *(emul_extra or []),
     ]
     proc = subprocess.run(command, capture_output=True, text=True, timeout=RUN_TIMEOUT_SECONDS, check=False)
     summary_path = out_dir / "summary.json"

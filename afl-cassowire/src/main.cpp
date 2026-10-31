@@ -1,6 +1,7 @@
 // src/main.cpp
 
 #include <algorithm>
+#include <filesystem>
 #include <iostream>
 #include <string>
 #include <string_view>
@@ -478,6 +479,16 @@ void run_fuzz_iteration(const Config& cfg, pid_t child_pid, int target_pidfd,
     // input. No-op when afl.cov_discard_probe[_cmplog] left the window disarmed.
     cov_window.capture();
 
+    // Raw testcase of this iteration (what AFL/test --input consume) and, when
+    // history dedup is on, its presence edge ids for the dump footprint. Both
+    // are passed to every termination path below so the dump carries the exact
+    // input and coverage of the failed iteration.
+    const std::span<const std::uint8_t> raw_input(buf, static_cast<std::size_t>(len));
+    std::vector<std::uint32_t> iter_edges;
+    if (cfg.afl.history_dedup && cfg.afl.dump_history > 0) {
+        iter_edges = coverage::presence_edges(cov_window.cov_snapshot(), cov_window.cov_len());
+    }
+
     if (ex.connect_error) {
         // Rate-limited: a target that is alive but refuses connections would
         // otherwise log this every iteration and drown the useful WARNs.
@@ -501,7 +512,7 @@ void run_fuzz_iteration(const Config& cfg, pid_t child_pid, int target_pidfd,
                            st.to_string());
             utils::crash_proxy("target crashed after connect failure: " + st.to_string()
                                    + sequence_summary(cfg, ex),
-                               payload_buf);
+                               payload_buf, raw_input, iter_edges);
             break;
         case process::TargetState::Kind::Exited:
         case process::TargetState::Kind::Unknown:
@@ -509,7 +520,7 @@ void run_fuzz_iteration(const Config& cfg, pid_t child_pid, int target_pidfd,
                            st.to_string());
             utils::abort_proxy("target " + st.to_string() + " after connect failure"
                                    + sequence_summary(cfg, ex),
-                               payload_buf);
+                               payload_buf, raw_input, iter_edges);
             break;
         case process::TargetState::Kind::Alive:
             break; // live target: the quiescence probe below decides
@@ -645,7 +656,7 @@ void run_fuzz_iteration(const Config& cfg, pid_t child_pid, int target_pidfd,
                 utils::crash_proxy("target " + st.to_string() + " after probe failure ("
                                        + network::probe_outcome_to_string(pr.outcome) + ")"
                                        + sequence_summary(cfg, ex),
-                                   payload_buf);
+                                   payload_buf, raw_input, iter_edges);
                 break;
             case process::TargetState::Kind::Exited:
             case process::TargetState::Kind::Unknown:
@@ -654,7 +665,7 @@ void run_fuzz_iteration(const Config& cfg, pid_t child_pid, int target_pidfd,
                 utils::abort_proxy("target " + st.to_string() + " after probe failure ("
                                        + network::probe_outcome_to_string(pr.outcome) + ")"
                                        + sequence_summary(cfg, ex),
-                                   payload_buf);
+                                   payload_buf, raw_input, iter_edges);
                 break;
             case process::TargetState::Kind::Alive:
                 break; // transient failure, handled below (retry)
@@ -683,7 +694,7 @@ void run_fuzz_iteration(const Config& cfg, pid_t child_pid, int target_pidfd,
                                        + " attempts in one iteration (total " + std::to_string(probe_ms)
                                        + " ms" + err_detail + ") - target listener is gone"
                                        + sequence_summary(cfg, ex),
-                                   payload_buf);
+                                   payload_buf, raw_input, iter_edges);
             }
 
             // Apply retry delay if configured
@@ -720,12 +731,14 @@ void run_fuzz_iteration(const Config& cfg, pid_t child_pid, int target_pidfd,
     switch (st.kind) {
     case process::TargetState::Kind::Crashed:
         PROXY_LOG_WARN("target {}, crashing the proxy so AFL records the finding", st.to_string());
-        utils::crash_proxy("target " + st.to_string() + sequence_summary(cfg, ex), payload_buf);
+        utils::crash_proxy("target " + st.to_string() + sequence_summary(cfg, ex), payload_buf,
+                           raw_input, iter_edges);
         break;
     case process::TargetState::Kind::Exited:
     case process::TargetState::Kind::Unknown:
         PROXY_LOG_WARN("target {}, aborting the proxy so AFL records the finding", st.to_string());
-        utils::abort_proxy("target " + st.to_string() + sequence_summary(cfg, ex), payload_buf);
+        utils::abort_proxy("target " + st.to_string() + sequence_summary(cfg, ex), payload_buf,
+                           raw_input, iter_edges);
         break;
     case process::TargetState::Kind::Alive:
         break; // normal case, keep fuzzing
@@ -737,6 +750,12 @@ void run_fuzz_iteration(const Config& cfg, pid_t child_pid, int target_pidfd,
     // testcase. Done after the health check (and before the __AFL_LOOP DONE
     // signal) so the restore is the last map operation of the iteration.
     cov_window.restore();
+
+    // Retain this iteration for a later termination dump. The current
+    // iteration is always written as .data/.input; this ring feeds the
+    // .-N.data/.-N.input history (filtered by afl.history_dedup at dump time).
+    // record_dump_input() copies, so payload_buf is free for the next pass.
+    utils::record_dump_input(raw_input, payload_buf, iter_edges);
 
     update_iteration_stats(stats, ex.connect_ms, ex.send_ms, ex.wait_ms, probe_ms,
                            ex.messages_built, budget_ms);
@@ -808,46 +827,88 @@ int run_proxy_mode(Config cfg, bool forward_output) {
 
     PROXY_LOG_INFO("AFL_CASSOWIRE_FORCE_FINAL_LOC = {}", force_final_loc);
 
-    // Coverage window (afl.cov_discard_probe / cov_discard_probe_cmplog).
+    // Coverage snapshot. Two independent users share one attachment:
+    //  - the post-exchange probe window (afl.cov_discard_probe[*]), which
+    //    snapshots AND restores around the probe and the health checks;
+    //  - history dedup (afl.history_dedup), which only needs the snapshot of
+    //    the post-exchange map to derive the iteration's presence edge set.
+    //    It is armed regardless of network.probe; only the restore stays tied
+    //    to the probe window (nothing else writes the map, so restoring would
+    //    be a pure copy).
     // Attach the very SysV segments afl-fuzz created and the target maps
-    // through the same env vars; the proxy only snapshots/restores them. With
-    // network.probe disabled there is no target I/O between the exchange and
-    // the health check, so the window is not armed (it would only cost copies).
-    // Best effort: a layout or id mismatch disables that part of the window
-    // with a WARN instead of failing the run.
+    // through the same env vars. Best effort: a layout or id mismatch disables
+    // the snapshot with a WARN instead of failing the run.
     coverage::MapWindow cov_window;
-    if (!cfg.network.probe) {
-        PROXY_LOG_DEBUG("network.probe is disabled; coverage window not needed");
+    const bool want_probe_cov = cfg.network.probe && cfg.afl.cov_discard_probe;
+    const bool want_cov_snapshot = want_probe_cov || cfg.afl.history_dedup;
+    if (want_cov_snapshot) {
+        int cov_id = -1;
+        std::string err;
+        if (force_final_loc > 0xffffffffULL) {
+            PROXY_LOG_WARN("coverage snapshot: AFL_CASSOWIRE_FORCE_FINAL_LOC {} exceeds the "
+                           "runtime's u32 map size; coverage snapshot disabled", force_final_loc);
+        } else if (!parse_sysv_shm_id("__AFL_SHM_ID", cov_id)) {
+            PROXY_LOG_WARN("coverage snapshot: __AFL_SHM_ID is not a SysV id "
+                           "(USEMMAP build?); coverage snapshot disabled");
+        } else if (!cov_window.attach_cov(cov_id, static_cast<std::size_t>(force_final_loc) + 1, err)) {
+            PROXY_LOG_WARN("coverage snapshot: {}; coverage snapshot disabled", err);
+        } else {
+            PROXY_LOG_DEBUG("coverage snapshot armed ({} bytes)", cov_window.cov_len());
+        }
     } else {
-        if (cfg.afl.cov_discard_probe) {
-            int cov_id = -1;
-            std::string err;
-            if (force_final_loc > 0xffffffffULL) {
-                PROXY_LOG_WARN("afl.cov_discard_probe: AFL_CASSOWIRE_FORCE_FINAL_LOC {} exceeds the "
-                               "runtime's u32 map size; coverage window disabled", force_final_loc);
-            } else if (!parse_sysv_shm_id("__AFL_SHM_ID", cov_id)) {
-                PROXY_LOG_WARN("afl.cov_discard_probe: __AFL_SHM_ID is not a SysV id "
-                               "(USEMMAP build?); coverage window disabled");
-            } else if (!cov_window.attach_cov(cov_id, static_cast<std::size_t>(force_final_loc) + 1, err)) {
-                PROXY_LOG_WARN("afl.cov_discard_probe: {}; coverage window disabled", err);
-            } else {
-                PROXY_LOG_DEBUG("coverage window armed ({} bytes)", cov_window.cov_len());
-            }
+        PROXY_LOG_DEBUG("coverage snapshot not needed");
+    }
+    cov_window.set_cov_restore(want_probe_cov);
+
+    if (cfg.network.probe && cfg.afl.cov_discard_probe_cmplog) {
+        int cmp_id = -1;
+        std::string err;
+        if (getenv("__AFL_CMPLOG_SHM_ID") == nullptr) {
+            PROXY_LOG_TRACE("afl.cov_discard_probe_cmplog: not a cmplog instance; nothing to arm");
+        } else if (!parse_sysv_shm_id("__AFL_CMPLOG_SHM_ID", cmp_id)) {
+            PROXY_LOG_WARN("afl.cov_discard_probe_cmplog: __AFL_CMPLOG_SHM_ID is not a SysV id "
+                           "(USEMMAP build?); cmplog window disabled");
+        } else if (!cov_window.attach_cmp(cmp_id, err)) {
+            PROXY_LOG_WARN("afl.cov_discard_probe_cmplog: {}; cmplog window disabled", err);
+        } else {
+            PROXY_LOG_DEBUG("cmplog coverage window armed (headers only)");
         }
-        if (cfg.afl.cov_discard_probe_cmplog) {
-            int cmp_id = -1;
+    }
+
+    // Unstable-edge mask for history dedup (afl.var_bytes_method). The source
+    // is an explicit config choice (no implicit fallback): `shm` reads the
+    // afl-fuzz-published SysV bitmap, `stats` parses fuzzer_stats at dump time,
+    // `off` compares raw presence footprints. A source that cannot be read
+    // leaves the mask empty (WARN) but keeps dedup running.
+    coverage::VarBytesMask var_bytes_mask;
+    if (cfg.afl.history_dedup) {
+        const AflConfig::VarBytesMethod method = *cfg.afl.var_bytes_method;
+        if (method == AflConfig::VarBytesMethod::shm) {
+            int vb_id = -1;
             std::string err;
-            if (getenv("__AFL_CMPLOG_SHM_ID") == nullptr) {
-                PROXY_LOG_TRACE("afl.cov_discard_probe_cmplog: not a cmplog instance; nothing to arm");
-            } else if (!parse_sysv_shm_id("__AFL_CMPLOG_SHM_ID", cmp_id)) {
-                PROXY_LOG_WARN("afl.cov_discard_probe_cmplog: __AFL_CMPLOG_SHM_ID is not a SysV id "
-                               "(USEMMAP build?); cmplog window disabled");
-            } else if (!cov_window.attach_cmp(cmp_id, err)) {
-                PROXY_LOG_WARN("afl.cov_discard_probe_cmplog: {}; cmplog window disabled", err);
-            } else {
-                PROXY_LOG_DEBUG("cmplog coverage window armed (headers only)");
+            if (!parse_sysv_shm_id("__AFL_VARBYTES_SHM_ID", vb_id)) {
+                PROXY_LOG_WARN("history dedup: __AFL_VARBYTES_SHM_ID is not a SysV id "
+                               "(afl-fuzz built without aflpp/patch/var_bytes_shm.patch?); "
+                               "running with an empty mask");
+                var_bytes_mask.use_off();
+            } else if (!var_bytes_mask.attach_shm(vb_id, err)) {
+                PROXY_LOG_WARN("history dedup: {}; running with an empty mask", err);
+                var_bytes_mask.use_off();
             }
+        } else if (method == AflConfig::VarBytesMethod::stats) {
+            std::string path = cfg.afl.var_bytes_stats_path;
+            if (path.empty()) {
+                if (const char* env_path = getenv("AFL_CASSOWIRE_STATS_PATH")) {
+                    path = env_path;
+                }
+            }
+            var_bytes_mask.use_stats(std::move(path));
+        } else {
+            var_bytes_mask.use_off();
         }
+        utils::set_var_bytes_mask(&var_bytes_mask);
+        PROXY_LOG_INFO("history dedup enabled (var_bytes_method: {})",
+                       var_bytes_mask.source_name());
     }
 
     // Pre-spawn cleanup: only in a validated proxy invocation, against the
@@ -934,12 +995,6 @@ int run_proxy_mode(Config cfg, bool forward_output) {
         // reports the same, current iteration.
         utils::set_current_iteration(stats.iterations + 1);
         run_fuzz_iteration(cfg, g_child_pid, target_pidfd.get(), payload_buf, cov_window, stats);
-        // Record this completed iteration's payload so a later termination
-        // dump can preserve it (a deferred/async crash detected on the next
-        // iteration then finds the input that likely caused it). payload_buf
-        // still holds the just-finished payload here; the next iteration
-        // overwrites it inside exchange_once().
-        utils::record_dump_input(payload_buf);
     }
 
     // Clean exit of AFL loop: hard-stop the target's process group. The
@@ -951,27 +1006,13 @@ int run_proxy_mode(Config cfg, bool forward_output) {
     return 0;
 }
 
-int run_test_mode(const Config& cfg, const std::string& input_path, bool forward_output) {
-    // input_path is guaranteed non-empty: the parser makes --input mandatory
-    // for the `test` subcommand (src/args.cpp), long before this point.
-
-    // Read the payload up front, before Pass 1 spawns the target: an
-    // unreadable --input must fail without paying the spawn/port-detection
-    // cost. A successful read of zero bytes is a valid empty input (the
-    // configured prefix/suffix still produce a payload).
-    std::vector<uint8_t> input_data;
-    if (auto input_res = utils::read_input_file(input_path);
-        std::holds_alternative<std::error_code>(input_res)) {
-        PROXY_LOG_ERROR("failed to read payload from {}: {}",
-                        input_path, std::get<std::error_code>(input_res).message());
-        return 1;
-    } else {
-        input_data = std::get<std::vector<uint8_t>>(std::move(input_res));
-    }
-
-    // --- Pass 1: Map Size Extraction ---
-    // prepare_target() injects AFL_DUMP_MAP_SIZE=1 into the child's envp for
-    // SpawnMode::MapSizePass; the proxy's own environment is not touched.
+// Extracts the instrumented map size from the target (Pass 1 of test mode).
+//
+// prepare_target() injects AFL_DUMP_MAP_SIZE=1 into the child's envp for
+// SpawnMode::MapSizePass; the proxy's own environment is not touched. The wait
+// is bounded by network.initial_ms. A target that cannot produce a valid dump
+// is not properly AFL-instrumented, so this is a hard gate.
+static bool extract_map_size(const Config& cfg) {
     auto prep_opt1 = process::prepare_target(cfg, process::SpawnMode::MapSizePass);
     if (!prep_opt1) {
         PROXY_LOG_ERROR("failed to prepare target for map size extraction.");
@@ -1020,6 +1061,30 @@ int run_test_mode(const Config& cfg, const std::string& input_path, bool forward
         return 1;
     }
     PROXY_LOG_INFO("Pass 1 (Map Size) completed.");
+    return true;
+}
+
+int run_test_mode(const Config& cfg, const std::string& input_path, bool forward_output) {
+    // input_path is guaranteed non-empty: the parser requires exactly one of
+    // --input/--replay and only dispatches here for --input (src/args.cpp).
+
+    // Read the payload up front, before Pass 1 spawns the target: an
+    // unreadable --input must fail without paying the spawn/port-detection
+    // cost. A successful read of zero bytes is a valid empty input (the
+    // configured prefix/suffix still produce a payload).
+    std::vector<uint8_t> input_data;
+    if (auto input_res = utils::read_input_file(input_path);
+        std::holds_alternative<std::error_code>(input_res)) {
+        PROXY_LOG_ERROR("failed to read payload from {}: {}",
+                        input_path, std::get<std::error_code>(input_res).message());
+        return 1;
+    } else {
+        input_data = std::get<std::vector<uint8_t>>(std::move(input_res));
+    }
+
+    if (!extract_map_size(cfg)) {
+        return 1;
+    }
 
     // --- Pass 2: Single Iteration ---
     // Scratch buffer for the final payload = configured prefix + input data
@@ -1121,6 +1186,201 @@ int run_test_mode(const Config& cfg, const std::string& input_path, bool forward
     return 0;
 }
 
+
+/**
+ * @brief One raw testcase file from a termination-dump directory.
+ */
+struct ReplayInput {
+    std::string path;           ///< file name (for logging)
+    std::vector<uint8_t> data;  ///< raw testcase bytes
+};
+
+/**
+ * @brief Collects the .input files of the newest dump stem in @p dir.
+ *
+ * Files are named <stem>.input (the current iteration), <stem>.-1.input (the
+ * most recent previous iteration), <stem>.-2.input, ... Multiple dumps may
+ * share a directory (one per crash); the lexicographically greatest stem wins,
+ * which is the newest one because the stem starts with a sortable timestamp.
+ *
+ * @return The inputs in replay order (oldest history first, current last), or
+ *         a human-readable error string.
+ */
+static std::variant<std::vector<ReplayInput>, std::string>
+collect_replay_inputs(const std::string& dir) {
+    namespace fs = std::filesystem;
+    std::error_code ec;
+    if (!fs::is_directory(dir, ec)) {
+        return "replay directory '" + dir + "' does not exist or is not a directory";
+    }
+
+    struct Found {
+        std::string base;
+        unsigned long distance;  // 0 = current iteration (bare .input)
+        fs::path path;
+    };
+    std::vector<Found> found;
+    for (fs::directory_iterator it(dir, ec), end; !ec && it != end; it.increment(ec)) {
+        if (!it->is_regular_file(ec)) continue;
+        const std::string name = it->path().filename().string();
+        if (name.size() <= 6 || name.compare(name.size() - 6, 6, ".input") != 0) continue;
+        std::string stem = name.substr(0, name.size() - 6);
+        unsigned long distance = 0;
+        const std::size_t dot = stem.rfind(".-");
+        if (dot != std::string::npos && dot + 2 < stem.size()) {
+            const std::string digits = stem.substr(dot + 2);
+            if (std::all_of(digits.begin(), digits.end(),
+                            [](unsigned char c) { return c >= '0' && c <= '9'; })) {
+                try {
+                    distance = std::stoul(digits);
+                } catch (const std::exception&) {
+                    continue;  // out-of-range suffix: foreign file
+                }
+                stem.resize(dot);
+            }
+        }
+        found.push_back(Found{stem, distance, it->path()});
+    }
+    if (ec) {
+        return "cannot read replay directory '" + dir + "': " + ec.message();
+    }
+    if (found.empty()) {
+        return "no .input files in '" + dir + "'";
+    }
+
+    std::string newest = found.front().base;
+    for (const Found& f : found) {
+        if (f.base > newest) newest = f.base;
+    }
+
+    std::vector<Found> selected;
+    for (Found& f : found) {
+        if (f.base == newest) selected.push_back(std::move(f));
+    }
+    // Oldest history first, the current iteration (distance 0) last.
+    std::stable_sort(selected.begin(), selected.end(),
+                     [](const Found& a, const Found& b) { return a.distance > b.distance; });
+
+    std::vector<ReplayInput> inputs;
+    inputs.reserve(selected.size());
+    for (const Found& f : selected) {
+        auto data = utils::read_input_file(f.path.string());
+        if (std::holds_alternative<std::error_code>(data)) {
+            return "cannot read '" + f.path.string() + "': " +
+                   std::get<std::error_code>(data).message();
+        }
+        inputs.push_back(ReplayInput{f.path.filename().string(),
+                                     std::get<std::vector<uint8_t>>(std::move(data))});
+    }
+    return inputs;
+}
+
+/**
+ * @brief Replays one dump's raw testcases against a single (fresh) target.
+ *
+ * Multi-iteration crashes (state built up by earlier iterations, the crashing
+ * one last) cannot be reproduced by `test --input` (one exchange per spawn).
+ * This mode spawns the target once per attempt and sends the collected inputs
+ * in order on separate connections; the first attempt whose target dies with a
+ * signal is a successful reproduction. Fresh-target attempts make probabilistic
+ * crashes (AC2.7) measurable: `--retries N` reports success if any attempt
+ * reproduces.
+ *
+ * @return 0 when a crash was reproduced, 1 otherwise.
+ */
+int run_replay_mode(const Config& cfg, const std::string& replay_dir, int retries,
+                    bool forward_output) {
+    auto collected = collect_replay_inputs(replay_dir);
+    if (std::holds_alternative<std::string>(collected)) {
+        PROXY_LOG_ERROR("{}", std::get<std::string>(collected));
+        return 1;
+    }
+    const std::vector<ReplayInput>& inputs = std::get<std::vector<ReplayInput>>(collected);
+    if (!extract_map_size(cfg)) {
+        return 1;
+    }
+
+    PROXY_LOG_INFO("Replaying {} input(s) from '{}' against one target instance "
+                   "({} attempt(s) max)", inputs.size(), replay_dir, retries);
+
+    for (int attempt = 1; attempt <= retries; ++attempt) {
+        auto prep = process::prepare_target(cfg, process::SpawnMode::PlainTest);
+        if (!prep) {
+            PROXY_LOG_ERROR("failed to prepare target for replay");
+            return 1;
+        }
+        process::SpawnedTarget spawned = process::fork_target(
+            cfg, *prep, process::SpawnMode::PlainTest, forward_output);
+        if (spawned.pid <= 0) {
+            PROXY_LOG_ERROR("failed to spawn target for replay");
+            return 1;
+        }
+        g_child_pid = spawned.pid;
+        utils::FdGuard notif_guard{spawned.notif_fd};
+        utils::FdGuard pidfd{process::open_pidfd(g_child_pid)};
+
+        auto port_res = network::wait_for_port(g_child_pid, cfg, spawned.notif_fd);
+        if (std::holds_alternative<network::DetectError>(port_res)) {
+            PROXY_LOG_WARN("attempt {}/{}: failed to detect port {}: {}", attempt, retries,
+                           cfg.network.port, std::get<network::DetectError>(port_res).to_string());
+            network::set_notif_listener(-1);
+            kill_and_reap_pgid(g_child_pid);
+            continue;
+        }
+        network::set_notif_listener(spawned.notif_fd);
+
+        bool reproduced = false;
+        bool aborted = false;
+        std::vector<uint8_t> payload_buf;
+        for (std::size_t i = 0; i < inputs.size() && !reproduced && !aborted; ++i) {
+            const ReplayInput& input = inputs[i];
+            ExchangeOutcome ex = exchange_once(cfg, input.data.data(), input.data.size(), payload_buf);
+            if (ex.connect_error) {
+                // The previous input may have killed the target only now (a
+                // deferred/async crash usually surfaces as a refused connect).
+                auto st = process::check_target_state(g_child_pid, pidfd.get(), kTargetDeathGraceMs);
+                if (st.kind == process::TargetState::Kind::Crashed) {
+                    PROXY_LOG_INFO("crash reproduced on attempt {}/{} at input {}/{} ({}): {}",
+                                   attempt, retries, i + 1, inputs.size(), input.path, st.to_string());
+                    reproduced = true;
+                    break;
+                }
+                PROXY_LOG_WARN("attempt {}/{}: input {}/{} ({}) connect failed: {}",
+                               attempt, retries, i + 1, inputs.size(), input.path,
+                               ex.connect_error->to_string());
+                aborted = true;
+                break;
+            }
+            if (ex.send_error) {
+                PROXY_LOG_WARN("attempt {}/{}: input {}/{} ({}) send failed: {}",
+                               attempt, retries, i + 1, inputs.size(), input.path,
+                               ex.send_error->to_string());
+            }
+
+            auto st = process::check_target_state(g_child_pid, pidfd.get(), kTargetDeathGraceMs);
+            if (st.kind == process::TargetState::Kind::Crashed) {
+                PROXY_LOG_INFO("crash reproduced on attempt {}/{} at input {}/{} ({}): {}",
+                               attempt, retries, i + 1, inputs.size(), input.path, st.to_string());
+                reproduced = true;
+            } else if (st.kind != process::TargetState::Kind::Alive) {
+                PROXY_LOG_WARN("attempt {}/{}: target {} after input {}/{} ({})",
+                               attempt, retries, st.to_string(), i + 1, inputs.size(), input.path);
+                aborted = true;
+            }
+        }
+
+        network::set_notif_listener(-1);
+        kill_and_reap_pgid(g_child_pid);
+        if (reproduced) {
+            return 0;
+        }
+        PROXY_LOG_WARN("attempt {}/{} did not reproduce a crash{}", attempt, retries,
+                       aborted ? " (target died without a signal)" : "");
+    }
+    PROXY_LOG_ERROR("no crash reproduced in {} attempt(s)", retries);
+    return 1;
+}
+
 int main(int argc, char* argv[]) {
     // Initialize logging first so that CLI/config errors are reported through
     // the logger; --log-level reconfigures the console after parsing, and the
@@ -1181,12 +1441,18 @@ int main(int argc, char* argv[]) {
     }
     casslog::init(*log_level, *crash_msg_level);
 
-    // Retain the last N completed payloads so a termination dump can preserve
-    // the input that likely caused a deferred/async crash (see
-    // afl.dump_history). 0 disables the history.
+    // Retain the last N completed iterations so a termination dump can
+    // preserve the input that likely caused a deferred/async crash (see
+    // afl.dump_history). 0 disables the history. history_dedup additionally
+    // filters that ring by coverage footprint at dump time.
     utils::set_dump_history_size(cfg.afl.dump_history);
+    utils::set_history_dedup(cfg.afl.history_dedup);
 
     if (parsed.is_test_mode) {
+        if (parsed.replay_dir) {
+            return run_replay_mode(cfg, *parsed.replay_dir, parsed.replay_retries,
+                                   parsed.forward_output);
+        }
         return run_test_mode(cfg, parsed.input_path, parsed.forward_output);
     } else {
         return run_proxy_mode(std::move(cfg), parsed.forward_output);

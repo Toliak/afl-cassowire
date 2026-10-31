@@ -149,6 +149,9 @@ class SysvShm:
     def read(self) -> bytes:
         return ctypes.string_at(self.addr, self.size)
 
+    def zero(self) -> None:
+        ctypes.memset(self.addr, 0, self.size)
+
     def close(self) -> None:
         if self.addr:
             int(_shmdt(ctypes.c_void_p(self.addr)))
@@ -213,6 +216,7 @@ def do_handshake(sock: socket.socket, timeout_s: float) -> dict[str, Any]:
 def drive_iterations(
     sock: socket.socket,
     fuzz_shm: SysvShm,
+    cov_shm: SysvShm,
     inputs: list[bytes],
     iterations: int,
     poke_timeout_s: float,
@@ -220,6 +224,9 @@ def drive_iterations(
     events: list[dict[str, Any]] = []
     for i in range(1, iterations + 1):
         data = inputs[(i - 1) % len(inputs)]
+        # Like afl-fuzz: the coverage map is zeroed before every persistent
+        # iteration, so an iteration's footprint is its own (not cumulative).
+        cov_shm.zero()
         fuzz_shm.write(struct.pack("=I", len(data)) + data)
         _send_u32(sock, 0, f"poke {i}")
         pid = _recv_u32(sock, f"child pid (poke {i})", poke_timeout_s)
@@ -261,7 +268,8 @@ def _exit_fields(raw: int) -> dict[str, Any]:
 
 
 # --- proxy process management ---
-def build_env(args: argparse.Namespace, cov_id: int, fuzz_id: int, cmplog_id: int | None) -> dict[str, str]:
+def build_env(args: argparse.Namespace, cov_id: int, fuzz_id: int, cmplog_id: int | None,
+              varbytes_id: int | None) -> dict[str, str]:
     env = {key: os.environ[key] for key in _ENV_KEEP if key in os.environ}
     env["__AFL_SHM_ID"] = str(cov_id)
     env["__AFL_SHM_FUZZ_ID"] = str(fuzz_id)
@@ -274,6 +282,8 @@ def build_env(args: argparse.Namespace, cov_id: int, fuzz_id: int, cmplog_id: in
     env["AFL_NO_C11"] = "1"
     if cmplog_id is not None:
         env["__AFL_CMPLOG_SHM_ID"] = str(cmplog_id)
+    if varbytes_id is not None:
+        env["__AFL_VARBYTES_SHM_ID"] = str(varbytes_id)
     for item in args.env:
         key, sep, value = item.partition("=")
         if not sep or not key:
@@ -381,6 +391,7 @@ def run_proxy(args: argparse.Namespace, out_dir: Path, inputs: list[bytes]) -> d
     cov: SysvShm | None = None
     fuzz: SysvShm | None = None
     cmp_shm: SysvShm | None = None
+    varbytes: SysvShm | None = None
     proxy_pid = 0
     last_child_pid = 0
     sock: socket.socket | None = None
@@ -389,9 +400,19 @@ def run_proxy(args: argparse.Namespace, out_dir: Path, inputs: list[bytes]) -> d
         fuzz = SysvShm(args.fuzz_shm_size)
         if args.mode == "cmplog":
             cmp_shm = SysvShm(CMP_MAP_SIZE)
+        # Optional unstable-edge bitmap, as published by afl-fuzz with
+        # aflpp/patch/var_bytes_shm.patch (__AFL_VARBYTES_SHM_ID).
+        if args.varbytes_all or args.varbytes_indices.strip():
+            varbytes = SysvShm(args.varbytes_size or args.cov_shm_size)
+            if args.varbytes_all:
+                varbytes.write(b"\x01" * varbytes.size)
+            for token in args.varbytes_indices.replace(",", " ").split():
+                varbytes.write(b"\x01", int(token, 0))
         parent_sock, child_sock = socket.socketpair()
         try:
-            env = build_env(args, cov.id, fuzz.id, cmp_shm.id if cmp_shm is not None else None)
+            env = build_env(args, cov.id, fuzz.id,
+                            cmp_shm.id if cmp_shm is not None else None,
+                            varbytes.id if varbytes is not None else None)
             proxy_argv = [str(args.proxy), *args.proxy_arg, "-c", str(args.config), "proxy"]
             proxy_pid = os.fork()
             if proxy_pid == 0:
@@ -402,7 +423,7 @@ def run_proxy(args: argparse.Namespace, out_dir: Path, inputs: list[bytes]) -> d
         sock = parent_sock
 
         summary["handshake"] = do_handshake(parent_sock, args.handshake_timeout)
-        events = drive_iterations(parent_sock, fuzz, inputs, args.iterations, args.poke_timeout)
+        events = drive_iterations(parent_sock, fuzz, cov, inputs, args.iterations, args.poke_timeout)
         summary["events"] = events
         summary["iterations_completed"] = len(events)
         if events:
@@ -445,7 +466,7 @@ def run_proxy(args: argparse.Namespace, out_dir: Path, inputs: list[bytes]) -> d
                 summary["proxy_exit"] = {"killed": True, **_exit_fields(status)}
             except ChildProcessError:
                 pass
-        for shm in (cov, fuzz, cmp_shm):
+        for shm in (cov, fuzz, cmp_shm, varbytes):
             if shm is not None:
                 shm.close()
     return summary
@@ -464,6 +485,12 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--cov-shm-size", type=int, default=DEFAULT_COV_SHM_SIZE)
     parser.add_argument("--fuzz-shm-size", type=int, default=DEFAULT_FUZZ_SHM_SIZE)
     parser.add_argument("--force-final-loc", type=int, default=DEFAULT_FORCE_FINAL_LOC)
+    parser.add_argument("--varbytes-all", action="store_true",
+                        help="publish an all-ones var_bytes map (__AFL_VARBYTES_SHM_ID)")
+    parser.add_argument("--varbytes-indices", default="",
+                        help="comma/space separated edge ids to mark unstable in the var_bytes map")
+    parser.add_argument("--varbytes-size", type=int, default=0,
+                        help="var_bytes map size (default: --cov-shm-size)")
     parser.add_argument("--handshake-timeout", type=float, default=DEFAULT_HANDSHAKE_TIMEOUT_S)
     parser.add_argument("--poke-timeout", type=float, default=DEFAULT_POKE_TIMEOUT_S)
     parser.add_argument("--proxy-wait-timeout", type=float, default=DEFAULT_PROXY_WAIT_TIMEOUT_S)

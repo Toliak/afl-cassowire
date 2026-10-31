@@ -7,7 +7,10 @@
   "patternProperties": {
     "^__": {}
   },
-  "required": ["target", "network"],
+  "required": [
+    "target",
+    "network"
+  ],
   "properties": {
     "target": {
       "$ref": "#/definitions/target_section"
@@ -56,13 +59,20 @@
                 "const": true
               }
             },
-            "required": ["enable_cmplog"]
+            "required": [
+              "enable_cmplog"
+            ]
           }
         },
-        "required": ["afl"]
+        "required": [
+          "afl"
+        ]
       },
       "then": {
-        "required": ["target_cmplog", "network_cmplog"],
+        "required": [
+          "target_cmplog",
+          "network_cmplog"
+        ],
         "properties": {
           "target_cmplog": {
             "$ref": "#/definitions/target_section"
@@ -75,7 +85,9 @@
     },
     {
       "if": {
-        "required": ["sequence"],
+        "required": [
+          "sequence"
+        ],
         "properties": {
           "sequence": {
             "type": "object",
@@ -84,14 +96,18 @@
                 "const": true
               }
             },
-            "required": ["enabled"]
+            "required": [
+              "enabled"
+            ]
           }
         }
       },
       "then": {
         "properties": {
           "sequence": {
-            "required": ["delimiter"],
+            "required": [
+              "delimiter"
+            ],
             "properties": {
               "delimiter": {
                 "type": "string",
@@ -107,7 +123,9 @@
     "target_section": {
       "type": "object",
       "additionalProperties": false,
-      "required": ["binary"],
+      "required": [
+        "binary"
+      ],
       "properties": {
         "binary": {
           "type": "string",
@@ -132,7 +150,11 @@
           "description": "Environment variables set for the target process (string -> string)."
         },
         "env_preserve": {
-          "enum": ["nothing", "afl_only", "all"],
+          "enum": [
+            "nothing",
+            "afl_only",
+            "all"
+          ],
           "default": "afl_only",
           "description": "Parent environment inheritance: \"nothing\" (no vars), \"afl_only\" (PATH plus the AFL vars __AFL_SHM_ID, __AFL_CMPLOG_SHM_ID, ___AFL_EINS_ZWEI_POLIZEI___, AFL_DEBUG, AFL_DEBUG_CHILD, AFL_MAP_SIZE, AFL_NO_UI, AFL_QEMU_COMPCOV_DEBUG, AFL_QEMU_CMPLOG_DEBUG, AFL_QEMU_MAP_SIZE), or \"all\" (entire parent environment)."
         },
@@ -146,7 +168,9 @@
     "network_section": {
       "type": "object",
       "additionalProperties": false,
-      "required": ["port"],
+      "required": [
+        "port"
+      ],
       "properties": {
         "host": {
           "type": "string",
@@ -228,9 +252,36 @@
           "default": 1,
           "description": "Number of completed iterations whose payloads (prefix + input + suffix) are retained and written alongside a termination dump as <stem>.-1.data, <stem>.-2.data, ... (-1 = most recent previous iteration). A deferred/async crash is detected one iteration late, so the current payload may not be the input that caused it; the retained history preserves the likely culprit. 0 disables the history (only <stem>.data is written)."
         },
+        "history_dedup": {
+          "type": "boolean",
+          "default": false,
+          "description": "Keep only one entry per coverage footprint in the termination-dump history: the oldest and the newest iteration of each footprint, plus the two newest entries regardless. A footprint is the set of edges the iteration hit, minus the edges masked by afl.var_bytes_method. Only affects which <stem>.-N.data/.input history files are written; the current iteration's dump is always exact. Requires afl.var_bytes_method."
+        },
+        "var_bytes_method": {
+          "type": "string",
+          "enum": [
+            "off",
+            "shm",
+            "stats"
+          ],
+          "description": "Unstable-edge mask source for afl.history_dedup: 'shm' reads the SysV bitmap afl-fuzz publishes as __AFL_VARBYTES_SHM_ID (cassowire AFL++ patch); 'stats' parses the 'var_bytes : ...' line of fuzzer_stats (up to 60 s stale; stock AFL++ only emits it with AFL_DEBUG=1); 'off' hashes the raw presence edge sets. No implicit default: required when afl.history_dedup is true."
+        },
+        "var_bytes_stats_path": {
+          "type": "string",
+          "default": "",
+          "description": "fuzzer_stats path for afl.var_bytes_method: stats. When empty, the AFL_CASSOWIRE_STATS_PATH environment variable is used; when that is empty too, the mask is unavailable and history dedup runs unmasked."
+        },
         "msg_log_level": {
           "type": "string",
-          "enum": ["trace", "debug", "info", "warn", "error", "critical", "off"],
+          "enum": [
+            "trace",
+            "debug",
+            "info",
+            "warn",
+            "error",
+            "critical",
+            "off"
+          ],
           "default": "warn",
           "description": "Log level for the warn/error ring sink whose captured lines are embedded into termination .msg dumps. Affects dump content only; the console level is the --log-level CLI flag."
         }
@@ -241,7 +292,10 @@
       "additionalProperties": false,
       "properties": {
         "primary": {
-          "enum": ["procfs", "seccomp"],
+          "enum": [
+            "procfs",
+            "seccomp"
+          ],
           "default": "procfs",
           "description": "Port detection method: \"procfs\" (scan /proc/net/tcp{,6}; polls waitpid(WNOHANG) every pass so a dying target is reported, and with verify_ownership: true the LISTEN entry must be owned by the target's process tree), or \"seccomp\" (the target runs with a SECCOMP_RET_USER_NOTIF filter on bind()/listen() installed before its execve(); the proxy polls the notification fd, which aggregates those syscalls from every thread and forked descendant - kernel >= 5.0; readiness is confirmed with a bounded /proc scan, and subsequent socket poll() calls multiplex the notification fd alongside the data socket so later bind()/listen() notifications are answered immediately). Both methods work with QEMU-mode targets (threads and grandchild processes included); the old ptrace-based methods were removed."
         },
@@ -263,7 +317,10 @@
         },
         "on_port_conflict": {
           "type": "string",
-          "enum": ["error", "kill_orphan"],
+          "enum": [
+            "error",
+            "kill_orphan"
+          ],
           "default": "error",
           "description": "Behavior when cleanup.enabled and the configured port already has a LISTEN socket. \"error\": report the holder and refuse to start. \"kill_orphan\": SIGKILL only orphaned holders (no live parent: not a cmplog target, another campaign, or a service) of this exact port, provided the process matches the configured target binary/argv[0]; their process trees are killed too. There is no SIGTERM/grace phase. Live holders are never killed; the preflight refuses to start instead. Ignored when cleanup.enabled is false."
         }

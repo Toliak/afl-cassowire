@@ -95,6 +95,27 @@ struct AflConfig {
     // preserves the likely culprit. 0 disables the history (only <stem>.data is
     // written). Must be 0-64.
     std::size_t dump_history = 1;
+    // Keep only one entry per coverage footprint in the termination-dump
+    // history: the oldest and the newest iteration of each footprint, plus the
+    // two newest entries regardless. A footprint is the set of edges the
+    // iteration hit, minus the edges masked by afl.var_bytes_method. Only
+    // affects which <stem>.-N.data/.input history files are written; the
+    // current iteration's dump and every payload it writes stay exact.
+    // Requires afl.var_bytes_method (see below) to be set explicitly.
+    bool history_dedup = false;
+    // Source of the unstable-edge mask used by history_dedup:
+    //   off   - no mask; footprints are the raw presence edge sets
+    //   shm   - read the SysV bitmap afl-fuzz publishes as
+    //           __AFL_VARBYTES_SHM_ID (requires the cassowire AFL++ patch)
+    //   stats - parse the `var_bytes : ...` line of afl-fuzz's fuzzer_stats
+    //           (up to 60 s stale; stock AFL++ only emits it with AFL_DEBUG=1)
+    // No implicit default: history_dedup without this key is a config error.
+    enum class VarBytesMethod { off, shm, stats };
+    std::optional<VarBytesMethod> var_bytes_method;
+    // fuzzer_stats path for var_bytes_method: stats. When empty, the
+    // AFL_CASSOWIRE_STATS_PATH environment variable is used; when that is empty
+    // too, the mask is unavailable and history_dedup runs unmasked (WARN).
+    std::string var_bytes_stats_path;
     // Log level for the warn/error ring sink whose captured lines are embedded
     // into termination .msg dumps (see casslog::recent_lines()). Only affects the
     // dump content, not the console (that is --log-level). Must be a level name

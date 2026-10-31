@@ -1,6 +1,7 @@
 // src/utils.cpp
 
 #include "utils.hpp"
+#include "coverage.hpp"
 #include "log.hpp"
 #include <ctime>
 #include <csignal>
@@ -58,12 +59,29 @@ std::string g_instance_tag;
 // set_current_iteration().
 uint64_t g_current_iteration = 0;
 
-// Retained payloads of the last completed iterations, oldest first. Written
-// alongside a termination dump as <stem>.-1.data (most recent), -2, ... so a
-// deferred/async crash detected one iteration late still preserves the input
-// that likely caused it. Bounded by g_dump_history_max; empty when disabled.
-std::deque<std::vector<uint8_t>> g_dump_history;
+// One entry per retained completed iteration: the raw AFL testcase, the built
+// payload, and the iteration's presence edge ids (only collected when history
+// dedup is enabled). Written to the dump directory as .data/.input pairs.
+struct DumpRingEntry {
+    std::vector<uint8_t> raw;
+    std::vector<uint8_t> payload;
+    std::vector<uint32_t> edges;
+};
+
+// Retained entries of the last completed iterations, oldest first. Written
+// alongside a termination dump as <stem>.-1.data/.input (most recent), -2, ...
+// so a deferred/async crash detected one iteration late still preserves the
+// input that likely caused it. Bounded by g_dump_history_max; empty when
+// disabled.
+std::deque<DumpRingEntry> g_dump_history;
 std::size_t g_dump_history_max = 0;
+
+// afl.history_dedup: filter the retained entries by coverage footprint at dump
+// time (see set_history_dedup()).
+bool g_history_dedup = false;
+
+// Unstable-edge mask registered by run_proxy_mode(); may be null.
+const coverage::VarBytesMask* g_var_bytes_mask = nullptr;
 
 // Maximum number of bytes of a captured warn/error history line embedded into
 // the .msg file. History lines are short in practice (repeated per-iteration
@@ -126,6 +144,33 @@ void write_named_file(const std::string& path, const void* data, size_t len) {
     write_all(fd, data, len, path);
 }
 
+// 64-bit FNV-1a over the edge ids. Collisions are handled by comparing the
+// filtered edge lists themselves, so this only has to be cheap and stable.
+uint64_t footprint_hash(std::span<const uint32_t> edges) {
+    uint64_t hash = 1469598103934665603ULL;
+    for (const uint32_t edge : edges) {
+        for (int shift = 0; shift < 32; shift += 8) {
+            hash ^= (edge >> shift) & 0xFFu;
+            hash *= 1099511628211ULL;
+        }
+    }
+    return hash;
+}
+
+// Drops edge ids the mask marks unstable. Edge ids past the mask are kept: the
+// var_bytes bitmap may be shorter than the coverage view (it is sized by the
+// fuzzer's map, which can differ while the target is being respawned).
+std::vector<uint32_t> apply_mask(std::span<const uint32_t> edges,
+                                 const std::vector<uint8_t>& mask) {
+    std::vector<uint32_t> out;
+    out.reserve(edges.size());
+    for (const uint32_t edge : edges) {
+        if (edge < mask.size() && mask[edge] != 0) continue;
+        out.push_back(edge);
+    }
+    return out;
+}
+
 // Writes the termination pair into g_data_dir. The `.data` file is created
 // first with O_EXCL to reserve a unique timestamp; on collision the stem gets
 // a numeric suffix so `.msg` and `.data` always share one stem. The instance
@@ -133,7 +178,9 @@ void write_named_file(const std::string& path, const void* data, size_t len) {
 // so dumps from concurrent instances stay attributable. Best-effort: no
 // failure here prevents the subsequent signal.
 void dump_termination_data(std::string_view kind, std::string_view message,
-                           std::span<const uint8_t> data) {
+                           std::span<const uint8_t> data,
+                           std::span<const uint8_t> raw,
+                           std::span<const uint32_t> edges) {
     ensure_data_dir();
 
     std::string stem;
@@ -165,15 +212,97 @@ void dump_termination_data(std::string_view kind, std::string_view message,
     }
 
     write_all(data_fd.get(), data.data(), data.size(), stem + ".data");
+    // The raw testcase (what `test --input` and AFL itself consume) next to the
+    // built payload, so dumps stay replayable through prefix/suffix/sequence
+    // configuration without reconstructing it by hand. Written even when the
+    // testcase is empty (a zero-length input is a valid AFL testcase).
+    write_named_file(stem + ".input", raw.data(), raw.size());
 
-    // History: the payloads of the last completed iterations, newest first, as
-    // <stem>.-1.data, <stem>.-2.data, ... These are the inputs that preceded the
-    // current one, kept because a deferred/async crash is detected one iteration
-    // late and the current payload may not be the culprit.
+    const std::size_t n = g_dump_history.size();
+
+    // Unstable-edge mask (afl.var_bytes_method). Loaded lazily: the afl-fuzz
+    // bitmap grows over the campaign, so a mask read at dump time is the most
+    // complete one available.
+    std::vector<uint8_t> mask;
+    bool have_mask = false;
+    if (g_history_dedup && n > 0 && g_var_bytes_mask != nullptr) {
+        have_mask = g_var_bytes_mask->load(mask);
+    }
+
+    // Footprints: presence edges minus the unstable-edge mask.
+    std::vector<std::vector<uint32_t>> footprints(n);
+    std::vector<uint64_t> hashes(n, 0);
+    bool any_edges = false;
+    for (std::size_t i = 0; i < n; ++i) {
+        if (have_mask) {
+            footprints[i] = apply_mask(g_dump_history[i].edges, mask);
+        } else {
+            footprints[i].assign(g_dump_history[i].edges.begin(),
+                                 g_dump_history[i].edges.end());
+        }
+        hashes[i] = footprint_hash(footprints[i]);
+        if (!footprints[i].empty()) any_edges = true;
+    }
+
+    // Retention: every footprint contributes its oldest and its newest
+    // iteration (so a repeated input that triggers a state-dependent crash in
+    // an older/newer incarnation survives), and the two newest entries are
+    // always kept (deferred-crash window). With no coverage information at all
+    // the filter would only guess, so everything is kept.
+    std::vector<bool> keep(n, true);
+    std::vector<std::string> notes(n);
+    if (g_history_dedup && n > 0 && any_edges) {
+        keep.assign(n, false);
+
+        // Group equal footprints (hash prefilter, exact list compare).
+        std::vector<std::vector<std::size_t>> groups;
+        for (std::size_t i = 0; i < n; ++i) {
+            bool placed = false;
+            for (auto& members : groups) {
+                const std::size_t rep = members.front();
+                if (hashes[rep] == hashes[i] && footprints[rep] == footprints[i]) {
+                    members.push_back(i);
+                    placed = true;
+                    break;
+                }
+            }
+            if (!placed) groups.push_back({i});
+        }
+
+        for (const auto& members : groups) {
+            keep[members.front()] = true;
+            keep[members.back()] = true;
+            if (members.size() > 1) {
+                const std::string first = " (first of footprint)";
+                const std::string last = " (last of footprint)";
+                notes[members.front()] += first;
+                notes[members.back()] += last;
+            }
+        }
+        keep[n - 1] = true;
+        notes[n - 1] += " (newest)";
+        if (n >= 2) {
+            keep[n - 2] = true;
+            notes[n - 2] += " (2nd newest)";
+        }
+    }
+
+    // History: the retained iterations, newest first, as <stem>.-N.data /
+    // <stem>.-N.input. These are the inputs that preceded the current one,
+    // kept because a deferred/async crash is detected one iteration late and
+    // the current payload may not be the culprit.
     std::size_t history_written = 0;
-    for (auto it = g_dump_history.rbegin(); it != g_dump_history.rend(); ++it) {
-        const std::string path = stem + ".-" + std::to_string(history_written + 1) + ".data";
-        write_named_file(path, it->data(), it->size());
+    std::size_t history_dropped = 0;
+    for (std::size_t i = 0; i < n; ++i) {
+        const std::size_t distance = n - i;  // .-1 = newest previous iteration
+        const std::string suffix = ".-" + std::to_string(distance);
+        if (!keep[i]) {
+            ++history_dropped;
+            continue;
+        }
+        const DumpRingEntry& entry = g_dump_history[i];
+        write_named_file(stem + suffix + ".data", entry.payload.data(), entry.payload.size());
+        write_named_file(stem + suffix + ".input", entry.raw.data(), entry.raw.size());
         ++history_written;
     }
 
@@ -187,17 +316,58 @@ void dump_termination_data(std::string_view kind, std::string_view message,
     // loop). Lets a dump be correlated with the periodic heartbeat lines,
     // which count completed iterations.
     msg += "iteration: " + std::to_string(g_current_iteration) + "\n";
+    if (!raw.empty()) {
+        msg += "current input: " + std::to_string(raw.size()) + " raw byte(s) in .input\n";
+    }
+    if (!edges.empty()) {
+        msg += "current coverage: " + std::to_string(edges.size()) + " edge(s)\n";
+    }
 
-    // Map the retained history files to their iteration numbers so a dump can be
-    // read without knowing the file layout: .-1.data is the most recent previous
-    // iteration, .-2.data the one before that, and so on.
-    if (history_written > 0) {
-        msg += "\n--- dump history (previous iterations, same payload format as .data) ---\n";
-        for (std::size_t i = 1; i <= history_written; ++i) {
+    // Map the retained history files to their iteration numbers so a dump can
+    // be read without knowing the file layout: .-1.data is the most recent
+    // previous iteration, .-2.data the one before that, and so on.
+    if (n > 0) {
+        msg += "\n--- dump history (previous iterations; .data = built payload, "
+               ".input = raw testcase) ---\n";
+        if (g_history_dedup) {
+            msg += "dedup: on (afl.history_dedup)";
+            if (g_var_bytes_mask == nullptr) {
+                msg += ", mask: not registered";
+            } else if (have_mask) {
+                msg += ", mask: ";
+                msg += g_var_bytes_mask->source_name();
+                if (g_var_bytes_mask->source() == coverage::VarBytesMask::Source::stats &&
+                    !g_var_bytes_mask->stats_path().empty()) {
+                    msg += " (" + g_var_bytes_mask->stats_path() + ")";
+                }
+                msg += ", " + std::to_string(mask.size()) + " byte(s)";
+            } else if (g_var_bytes_mask->source() == coverage::VarBytesMask::Source::off) {
+                msg += ", mask: off";
+            } else {
+                msg += ", mask: ";
+                msg += g_var_bytes_mask->source_name();
+                msg += " (unavailable; unmasked footprints)";
+            }
+            msg += "\n";
+            msg += "kept " + std::to_string(history_written) + " of " + std::to_string(n) +
+                   " history entr" + (n == 1 ? "y" : "ies") + "\n";
+        } else {
+            msg += "dedup: off\n";
+        }
+        for (std::size_t i = 0; i < n; ++i) {
+            const std::size_t distance = n - i;
             const uint64_t hist_iter =
-                g_current_iteration >= i ? g_current_iteration - static_cast<uint64_t>(i) : 0;
-            msg += ".-" + std::to_string(i) + ".data = iteration "
-                   + std::to_string(hist_iter) + "\n";
+                g_current_iteration >= distance ? g_current_iteration - distance : 0;
+            msg += ".-" + std::to_string(distance) + ".data = iteration " +
+                   std::to_string(hist_iter) + ", " +
+                   std::to_string(g_dump_history[i].edges.size()) + " edge(s), fp " +
+                   std::to_string(hashes[i]);
+            if (keep[i]) {
+                msg += " [kept]" + notes[i];
+            } else {
+                msg += " [dropped: same footprint as an older/newer entry]";
+            }
+            msg += "\n";
         }
     }
 
@@ -220,11 +390,13 @@ void dump_termination_data(std::string_view kind, std::string_view message,
     }
     write_named_file(stem + ".msg", msg.data(), msg.size());
 
-    if (history_written > 0) {
-        PROXY_LOG_INFO("termination dump written: {}.msg / {}.data / {} history file(s) (.-1.data ... .-{}.data)",
-                       stem, stem, history_written, history_written);
+    if (n > 0) {
+        PROXY_LOG_INFO("termination dump written: {}.msg / {}.data / {}.input / {} history entr{} ({} dropped)",
+                       stem, stem, stem, history_written, history_written == 1 ? "y" : "ies",
+                       history_dropped);
     } else {
-        PROXY_LOG_INFO("termination dump written: {}.msg / {}.data", stem, stem);
+        PROXY_LOG_INFO("termination dump written: {}.msg / {}.data / {}.input",
+                       stem, stem, stem);
     }
 }
 
@@ -232,8 +404,10 @@ void dump_termination_data(std::string_view kind, std::string_view message,
 // `sig` (with abort()/_exit() fallbacks in case the signal is blocked/ignored).
 [[noreturn]] void terminate_proxy(int sig, int exit_code, std::string_view kind,
                                   std::string_view message,
-                                  std::span<const uint8_t> input) {
-    dump_termination_data(kind, message, input);
+                                  std::span<const uint8_t> input,
+                                  std::span<const uint8_t> raw,
+                                  std::span<const std::uint32_t> edges) {
+    dump_termination_data(kind, message, input, raw, edges);
     if (g_instance_tag.empty()) {
         PROXY_LOG_ERROR("{}: {}", kind, message);
     } else {
@@ -267,23 +441,39 @@ void set_dump_history_size(std::size_t n) {
     }
 }
 
-void record_dump_input(std::span<const uint8_t> input) {
+void set_history_dedup(bool enabled) {
+    g_history_dedup = enabled;
+}
+
+void set_var_bytes_mask(const coverage::VarBytesMask* mask) {
+    g_var_bytes_mask = mask;
+}
+
+void record_dump_input(std::span<const uint8_t> raw,
+                       std::span<const uint8_t> payload,
+                       std::span<const std::uint32_t> edges) {
     if (g_dump_history_max == 0) return;
-    g_dump_history.emplace_back(input.begin(), input.end());
+    DumpRingEntry entry;
+    entry.raw.assign(raw.begin(), raw.end());
+    entry.payload.assign(payload.begin(), payload.end());
+    entry.edges.assign(edges.begin(), edges.end());
+    g_dump_history.push_back(std::move(entry));
     while (g_dump_history.size() > g_dump_history_max) {
         g_dump_history.pop_front();
     }
 }
 
-[[noreturn]] void crash_proxy(std::string_view message, std::span<const uint8_t> input) {
-    terminate_proxy(SIGSEGV, 139, "crash_proxy", message, input);
+[[noreturn]] void crash_proxy(std::string_view message, std::span<const uint8_t> input,
+                              std::span<const uint8_t> raw,
+                              std::span<const std::uint32_t> edges) {
+    terminate_proxy(SIGSEGV, 139, "crash_proxy", message, input, raw, edges);
 }
 
-[[noreturn]] void abort_proxy(std::string_view message, std::span<const uint8_t> input) {
-    terminate_proxy(SIGABRT, 134, "abort_proxy", message, input);
+[[noreturn]] void abort_proxy(std::string_view message, std::span<const uint8_t> input,
+                              std::span<const uint8_t> raw,
+                              std::span<const std::uint32_t> edges) {
+    terminate_proxy(SIGABRT, 134, "abort_proxy", message, input, raw, edges);
 }
-
-
 
 namespace {
 

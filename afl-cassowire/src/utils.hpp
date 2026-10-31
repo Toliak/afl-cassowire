@@ -13,6 +13,10 @@
 #include <vector>
 #include <sched.h>
 
+namespace coverage {
+class VarBytesMask;
+}
+
 namespace utils {
 
     /**
@@ -135,30 +139,61 @@ namespace utils {
     /**
      * @brief Sets how many completed-iteration payloads are retained for dumps.
      *
-     * record_dump_input() keeps the last @p n payloads (prefix + input + suffix)
-     * of completed proxy iterations. When crash_proxy()/abort_proxy() later fire,
-     * the retained payloads are written next to the current one as
-     * "<stem>.-1.data" (most recent previous iteration), "<stem>.-2.data", ...
-     * A deferred/async crash is detected one iteration late, so the current
+     * record_dump_input() keeps the last @p n iterations of completed proxy
+     * loop passes. When crash_proxy()/abort_proxy() later fire, the retained
+     * entries are written next to the current one as "<stem>.-1.data" /
+     * "<stem>.-1.input" (most recent previous iteration), ".-2", ... A
+     * deferred/async crash is detected one iteration late, so the current
      * payload may not be the input that caused it; the history preserves the
-     * likely culprit. 0 disables the history (only "<stem>.data" is written).
-     * The proxy is single-threaded, so a plain non-atomic store suffices.
+     * likely culprit. 0 disables the history (only the current ".data"/".input"
+     * are written). The proxy is single-threaded, so a plain non-atomic store
+     * suffices.
      *
-     * @param n Number of previous payloads to retain (0 = disabled).
+     * @param n Number of previous iterations to retain (0 = disabled).
      */
     void set_dump_history_size(std::size_t n);
 
     /**
-     * @brief Records one completed iteration's payload for the termination dump.
+     * @brief Enables/disables coverage-footprint dedup of the dump history.
+     *
+     * When enabled, dump_termination_data() keeps only one entry per coverage
+     * footprint: the oldest and the newest iteration of each footprint, plus
+     * the two newest entries regardless. A footprint is the set of edges the
+     * iteration hit, minus the edges the registered VarBytesMask marks
+     * unstable. The current iteration's dump is never filtered.
+     *
+     * @param enabled Whether afl.history_dedup is on.
+     */
+    void set_history_dedup(bool enabled);
+
+    /**
+     * @brief Registers the unstable-edge mask used by history dedup.
+     *
+     * The mask is loaded lazily at dump time (the afl-fuzz bitmap changes over
+     * time). The object must outlive the process; it may be null to disable
+     * masking (dedup then compares the raw presence edge sets).
+     *
+     * @param mask Pointer owned by the caller (run_proxy_mode), or null.
+     */
+    void set_var_bytes_mask(const coverage::VarBytesMask* mask);
+
+    /**
+     * @brief Records one completed iteration for the termination dump.
      *
      * Called by the proxy loop after each completed iteration (see
-     * set_dump_history_size()). No-op when the history is disabled. The payload
-     * is copied, so the caller may reuse its buffer immediately afterwards.
+     * set_dump_history_size()). No-op when the history is disabled. Both the
+     * raw testcase and the built payload, plus the iteration's presence edge
+     * ids, are copied, so the caller may reuse its buffers immediately.
      *
-     * @param input The full payload (prefix + input + suffix) of the iteration
-     *        that just completed.
+     * @param raw     Raw AFL testcase (what `test --input` / AFL expect).
+     * @param payload Built payload actually sent (prefix + input + suffix, or
+     *                the whole sequence session).
+     * @param edges   Presence edge ids of the iteration, or empty when dedup
+     *                is disabled.
      */
-    void record_dump_input(std::span<const uint8_t> input);
+    void record_dump_input(std::span<const std::uint8_t> raw,
+                           std::span<const std::uint8_t> payload,
+                           std::span<const std::uint32_t> edges);
 
     /**
      * @brief Crashes the proxy intentionally (e.g., to trigger AFL respawn).
@@ -169,12 +204,17 @@ namespace utils {
      * also embeds the last warn/error messages captured by the proxy logger
      * (casslog::recent_lines()) - the context that preceded the termination.
      * When a history is enabled (set_dump_history_size()), the retained
-     * previous-iteration payloads are dumped as .-1.data, .-2.data, ...
+     * previous-iteration entries are dumped as .-1.data/.input, .-2.data/.input,
+     * ... (filtered by set_history_dedup()).
      *
      * @param message Human-readable reason for the crash.
      * @param input The full payload built for the failing iteration.
+     * @param raw The raw testcase of the failing iteration (may be empty).
+     * @param edges Presence edge ids of the failing iteration (may be empty).
      */
-    [[noreturn]] void crash_proxy(std::string_view message, std::span<const uint8_t> input);
+    [[noreturn]] void crash_proxy(std::string_view message, std::span<const uint8_t> input,
+                                  std::span<const uint8_t> raw = {},
+                                  std::span<const std::uint32_t> edges = {});
 
     /**
      * @brief Aborts the proxy intentionally (e.g., when the target exited
@@ -185,12 +225,17 @@ namespace utils {
      * also embeds the last warn/error messages captured by the proxy logger
      * (casslog::recent_lines()) - the context that preceded the termination.
      * When a history is enabled (set_dump_history_size()), the retained
-     * previous-iteration payloads are dumped as .-1.data, .-2.data, ...
+     * previous-iteration entries are dumped as .-1.data/.input, .-2.data/.input,
+     * ... (filtered by set_history_dedup()).
      *
      * @param message Human-readable reason for the abort.
      * @param input The full payload built for the failing iteration.
+     * @param raw The raw testcase of the failing iteration (may be empty).
+     * @param edges Presence edge ids of the failing iteration (may be empty).
      */
-    [[noreturn]] void abort_proxy(std::string_view message, std::span<const uint8_t> input);
+    [[noreturn]] void abort_proxy(std::string_view message, std::span<const uint8_t> input,
+                                  std::span<const uint8_t> raw = {},
+                                  std::span<const std::uint32_t> edges = {});
 
     /**
      * @brief Detail carried by ParseError: characters left unconsumed after a

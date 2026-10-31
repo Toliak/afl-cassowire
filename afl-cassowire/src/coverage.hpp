@@ -15,6 +15,18 @@ namespace coverage {
 /// right past it in the same SysV segment.
 constexpr std::size_t kMapSizeGranule = 64;
 
+/// @brief Edge ids (map indices) whose byte is non-zero in a coverage view.
+///
+/// afl-fuzz bucketizes hit counts in the map bytes, so a non-zero byte means
+/// "edge hit at least once". Presence (rather than the raw byte value) is what
+/// the history-dedup footprints compare: hit counts change between otherwise
+/// identical executions far more often than presence does.
+///
+/// @param map Coverage view (may be null when @p len is zero).
+/// @param len Number of bytes in @p map.
+/// @return Ascending edge ids.
+std::vector<std::uint32_t> presence_edges(const std::uint8_t* map, std::size_t len);
+
 /// @brief Size of the coverage view afl-fuzz reads for an announced map size.
 ///
 /// The runtime announces `__afl_final_loc + 1`; afl-fuzz rounds that up to
@@ -106,17 +118,101 @@ public:
     void capture();
 
     /// @brief Writes the snapshots back into the shared map(s).
+    ///
+    /// The coverage part can be disabled with set_cov_restore(): the history
+    /// dedup needs the snapshot after every exchange but must not rewrite the
+    /// map when the probe window is not in use (nothing wrote to it).
     void restore();
+
+    /// @brief Enables/disables the coverage snapshot restore (default on).
+    void set_cov_restore(bool enabled) noexcept { cov_restore_ = enabled; }
+
+    /// @brief Last captured coverage snapshot, or null when nothing was captured.
+    [[nodiscard]] const std::uint8_t* cov_snapshot() const noexcept {
+        return cov_ptr_ != nullptr ? cov_snapshot_.data() : nullptr;
+    }
 
 private:
     void detach() noexcept;
 
     std::uint8_t* cov_ptr_ = nullptr;
     std::size_t cov_len_ = 0;
+    bool cov_restore_ = true;
     std::vector<std::uint8_t> cov_snapshot_;
 
     std::uint8_t* cmp_ptr_ = nullptr;
     std::vector<std::uint8_t> cmp_snapshot_;
+};
+
+/**
+ * @brief Unstable-edge mask published by afl-fuzz, read lazily at dump time.
+ *
+ * afl-fuzz retires an edge as variable (`var_bytes`) during calibration when
+ * its bucketized hit count differs between re-executions of the same queue
+ * entry. The bitmap is global, monotonic and conflationary (stateful targets
+ * also trip it), but it is the only instability signal available to the proxy,
+ * so it is used to mask edge ids out of the history-dedup footprints.
+ *
+ * Sources (afl.var_bytes_method, no implicit default):
+ *  - `shm`:   the SysV segment afl-fuzz publishes as __AFL_VARBYTES_SHM_ID
+ *             (added by aflpp/patch/var_bytes_shm.patch); live, exact.
+ *  - `stats`: the `var_bytes : <indices>` line of afl-fuzz's fuzzer_stats
+ *             (stock AFL++ emits it only with AFL_DEBUG=1; refreshed every
+ *             60 s, so it lags the live bitmap).
+ *  - `off`:   no mask (empty footprints are the raw presence edge sets).
+ *
+ * Not thread-safe; the proxy is single-threaded.
+ */
+class VarBytesMask {
+public:
+    enum class Source { off, shm, stats };
+
+    VarBytesMask() = default;
+    ~VarBytesMask();
+
+    VarBytesMask(const VarBytesMask&) = delete;
+    VarBytesMask& operator=(const VarBytesMask&) = delete;
+
+    /// @brief Selects the `off` source (no mask).
+    void use_off() noexcept;
+
+    /// @brief Selects the `stats` source with the given fuzzer_stats path.
+    void use_stats(std::string stats_path);
+
+    /**
+     * @brief Attaches the SysV segment afl-fuzz published.
+     *
+     * @param shm_id Numeric id from `__AFL_VARBYTES_SHM_ID`.
+     * @param error  Receives the reason on failure.
+     * @return true when the `shm` source is ready.
+     */
+    bool attach_shm(int shm_id, std::string& error);
+
+    /**
+     * @brief Loads the current mask bitmap.
+     *
+     * @param out Receives the bitmap (index i set when edge i is unstable).
+     * @return true when a mask was produced; false when the source is `off`
+     *         or unavailable (parse/layout error, already warned about).
+     */
+    bool load(std::vector<std::uint8_t>& out) const;
+
+    /// @brief Configured source.
+    [[nodiscard]] Source source() const noexcept { return source_; }
+    /// @brief Human-readable source name ("off", "shm", "stats").
+    [[nodiscard]] const char* source_name() const noexcept;
+    /// @brief fuzzer_stats path for the `stats` source (may be empty).
+    [[nodiscard]] const std::string& stats_path() const noexcept { return stats_path_; }
+
+private:
+    void detach() noexcept;
+    bool load_stats(std::vector<std::uint8_t>& out) const;
+
+    Source source_ = Source::off;
+    std::string stats_path_;
+    std::uint8_t* shm_ = nullptr;
+    std::size_t shm_len_ = 0;
+    mutable bool warn_once_ = false;
 };
 
 } // namespace coverage

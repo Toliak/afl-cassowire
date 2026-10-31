@@ -1,0 +1,199 @@
+diff --git a/include/afl-fuzz.h b/include/afl-fuzz.h
+index ecc2285..969b841 100644
+--- a/include/afl-fuzz.h
++++ b/include/afl-fuzz.h
+@@ -773,6 +773,9 @@ typedef struct afl_state {
+   long double coe_fuzz_mu;              /* COE mean log2(n_fuzz) of queue   */
+ 
+   u8 *var_bytes;                        /* Bytes that appear to be variable */
++  u8 *var_bytes_shm;                    /* var_bytes mirrored to the target  */
++  u32 var_bytes_shm_size;               /* var_bytes_shm segment size        */
++  s32 var_bytes_shm_id;                 /* SysV id, -1 when unavailable      */
+   u8 *virgin_unstable;                  /* Edges retired as variable that can
+                                            still be claimed through the
+                                            instability repro gate           */
+diff --git a/include/config.h b/include/config.h
+index 6afdce9..c4bb872 100644
+--- a/include/config.h
++++ b/include/config.h
+@@ -447,6 +447,15 @@
+ 
+ #define SHM_ENV_VAR "__AFL_SHM_ID"
+ 
++/* Environment variable used to pass the id of the unstable-edge map
++   (afl_state.var_bytes) to the called program. afl-cassowire reads it to mask
++   edges AFL++ calibration retired as variable out of its crash-dump history
++   footprints. The map is created in afl_state_init() and kept up to date as
++   calibration retires edges; it is IPC_RMID'ed immediately after the attach so
++   nothing survives the fuzzer. */
++
++#define VARBYTES_SHM_ENV_VAR "__AFL_VARBYTES_SHM_ID"
++
+ /* Environment variable used to pass shared memory fuzz map id
+ and the mapping size to the called program. */
+ 
+diff --git a/src/afl-fuzz-run.c b/src/afl-fuzz-run.c
+index 25cf9f3..8ed6dec 100644
+--- a/src/afl-fuzz-run.c
++++ b/src/afl-fuzz-run.c
+@@ -536,6 +536,8 @@ u8 calibrate_case(afl_state_t *afl, struct queue_entry *q, u8 *use_mem,
+ 
+             virgin_undo_save(afl);
+             afl->var_bytes[i] = 1;
++            /* Keep the afl-cassowire mirror in sync as edges are retired. */
++            if (afl->var_bytes_shm) { afl->var_bytes_shm[i] = 1; }
+             // ignore the variable edge by setting it to fully discovered
+             afl->virgin_bits[i] = 0;
+             /* Keep a second, presence-only channel for the edge: it may still
+diff --git a/src/afl-fuzz-state.c b/src/afl-fuzz-state.c
+index 97d687a..946cac0 100644
+--- a/src/afl-fuzz-state.c
++++ b/src/afl-fuzz-state.c
+@@ -27,6 +27,10 @@
+ 
+ #include <signal.h>
+ #include <limits.h>
++#if defined(__linux__)
++  #include <sys/ipc.h>
++  #include <sys/shm.h>
++#endif
+ #include "afl-fuzz.h"
+ #include "cmplog.h"
+ #include "envs.h"
+@@ -35,6 +39,68 @@ char *power_names[POWER_SCHEDULES_NUM] = {"explore", "mmopt", "exploit",
+                                           "fast",    "coe",   "lin",
+                                           "quad",    "rare",  "seek"};
+ 
++/* Unstable-edge mirror for afl-cassowire.
++ *
++ * afl->var_bytes is the bitmap calibration retires variable edges in. It lives
++ * only in the fuzzer's address space, so a proxy sitting between afl-fuzz and
++ * the target cannot see it. This publishes it in a SysV segment whose id is
++ * handed to the target environment as VARBYTES_SHM_ENV_VAR; the proxy
++ * shmat()s it and masks the corresponding edge ids out of its crash-dump
++ * history footprints. The segment is IPC_RMID'ed right after the attach, so it
++ * disappears when afl-fuzz and every attached proxy exit (no leftover segments
++ * after a SIGKILL). Best effort: on any failure the id stays -1 and the proxy
++ * falls back to its configured mask source. */
++
++static void afl_var_bytes_shm_destroy(afl_state_t *afl) {
++
++  if (afl->var_bytes_shm) {
++
++    shmdt(afl->var_bytes_shm);
++    afl->var_bytes_shm = NULL;
++
++  }
++
++  afl->var_bytes_shm_size = 0;
++  afl->var_bytes_shm_id = -1;
++  unsetenv(VARBYTES_SHM_ENV_VAR);
++
++}
++
++static void afl_var_bytes_shm_create(afl_state_t *afl, u32 size) {
++
++  afl_var_bytes_shm_destroy(afl);
++  if (!size) { return; }
++
++#if defined(__linux__)
++  int id = shmget(IPC_PRIVATE, size, IPC_CREAT | 0600);
++  if (id < 0) { return; }
++
++  void *map = shmat(id, NULL, 0);
++  if (map == (void *)-1) {
++
++    shmctl(id, IPC_RMID, NULL);
++    return;
++
++  }
++
++  /* Remove-on-close: the segment dies once afl-fuzz and every proxy detach. */
++  shmctl(id, IPC_RMID, NULL);
++
++  afl->var_bytes_shm = (u8 *)map;
++  afl->var_bytes_shm_size = size;
++  afl->var_bytes_shm_id = id;
++  memset(afl->var_bytes_shm, 0, size);
++
++  char id_str[32];
++  snprintf(id_str, sizeof(id_str), "%d", id);
++  setenv(VARBYTES_SHM_ENV_VAR, id_str, 1);
++#else
++  (void)afl;
++  (void)size;
++#endif
++
++}
++
+ /* Initializes an afl_state_t. */
+ 
+ void afl_state_init(afl_state_t *afl, uint32_t map_size) {
+@@ -84,6 +150,8 @@ void afl_state_init(afl_state_t *afl, uint32_t map_size) {
+   afl->virgin_undo = ck_alloc(map_size);
+   afl->virgin_reclaim = ck_alloc(map_size);
+   afl->var_bytes = ck_alloc(map_size);
++  afl->var_bytes_shm_id = -1;
++  afl_var_bytes_shm_create(afl, map_size);
+   afl->virgin_unstable = ck_alloc(map_size);
+   afl->stab_cand = ck_alloc(map_size);
+   afl->stab_inter = ck_alloc(map_size);
+@@ -139,6 +207,22 @@ void afl_resize_map_buffers(afl_state_t *afl, u32 old_size, u32 new_size) {
+   afl->virgin_reclaim = ck_realloc(afl->virgin_reclaim, new_size);
+   afl->virgin_undo_valid = 0;
+   afl->var_bytes = ck_realloc(afl->var_bytes, new_size);
++  /* The fuzzer's map size can grow after the target announced it (the initial
++     state is DEFAULT_SHMEM_SIZE). Recreate the mirror so it matches, re-export
++     the id (the target is re-spawned after a resize, so the fresh proxy gets
++     it) and carry the already retired edges over: var_bytes is monotonic and
++     the new tail is zeroed below. */
++  if (afl->var_bytes_shm_size != new_size) {
++
++    afl_var_bytes_shm_create(afl, new_size);
++    if (afl->var_bytes_shm && old_size) {
++
++      memcpy(afl->var_bytes_shm, afl->var_bytes, old_size);
++
++    }
++
++  }
++
+   afl->virgin_unstable = ck_realloc(afl->virgin_unstable, new_size);
+   afl->stab_cand = ck_realloc(afl->stab_cand, new_size);
+   afl->stab_inter = ck_realloc(afl->stab_inter, new_size);
+@@ -977,6 +1061,7 @@ void afl_state_deinit(afl_state_t *afl) {
+   ck_free(afl->virgin_tmout);
+   ck_free(afl->virgin_crash);
+   ck_free(afl->var_bytes);
++  afl_var_bytes_shm_destroy(afl);
+   ck_free(afl->virgin_unstable);
+   ck_free(afl->stab_cand);
+   ck_free(afl->stab_inter);
+diff --git a/src/afl-fuzz-stats.c b/src/afl-fuzz-stats.c
+index 455c2d8..5ec890d 100644
+--- a/src/afl-fuzz-stats.c
++++ b/src/afl-fuzz-stats.c
+@@ -614,6 +614,15 @@ void write_stats_file(afl_state_t *afl, u32 t_bytes, double bitmap_cvg,
+     }
+ 
+     fprintf(f, "\n");
++
++  }
++
++  /* The unstable-edge indices are part of the normal stats output (not only
++     the debug dump): afl-cassowire's `stats` var_bytes method parses them when
++     it cannot attach the SysV mirror. Written every stats interval, so it can
++     lag the live bitmap by up to STATS_UPDATE_SEC seconds. */
++  {
++    u32 i = 0;
+     fprintf(f, "var_bytes        :");
+     for (i = 0; i < afl->fsrv.real_map_size; i++) {
+ 
+@@ -622,7 +631,6 @@ void write_stats_file(afl_state_t *afl, u32 t_bytes, double bitmap_cvg,
+     }
+ 
+     fprintf(f, "\n");
+-
+   }
+ 
+   if (unlikely(afl->value_profile_mode)) {

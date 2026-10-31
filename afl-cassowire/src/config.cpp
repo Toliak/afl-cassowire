@@ -614,6 +614,9 @@ std::variant<Config, ConfigError> load_config(const std::string& path) {
                                                                             "cov_discard_probe",
                                                                             "cov_discard_probe_cmplog",
                                                                             "dump_history",
+                                                                            "history_dedup",
+                                                                            "var_bytes_method",
+                                                                            "var_bytes_stats_path",
                                                                             "msg_log_level"};
                 ConfigError err = check_unknown_keys(afl_node, afl_allowed, "afl");
                 if (!err.message.empty()) {
@@ -669,6 +672,45 @@ std::variant<Config, ConfigError> load_config(const std::string& path) {
                 } catch (const YAML::BadConversion&) {
                     return ConfigError{"afl.dump_history", "Invalid type", "integer", afl_node["dump_history"].Scalar()};
                 }
+            }
+            if (afl_node["history_dedup"]) {
+                try {
+                    cfg.afl.history_dedup = afl_node["history_dedup"].as<bool>();
+                } catch (const YAML::BadConversion&) {
+                    return ConfigError{"afl.history_dedup", "Invalid type", "boolean", afl_node["history_dedup"].Scalar()};
+                }
+            }
+            if (afl_node["var_bytes_method"]) {
+                if (!afl_node["var_bytes_method"].IsScalar()) {
+                    return ConfigError{"afl.var_bytes_method", "Invalid type",
+                                       "off, shm or stats", "not a string"};
+                }
+                const std::string method = afl_node["var_bytes_method"].as<std::string>();
+                if (method == "off") {
+                    cfg.afl.var_bytes_method = AflConfig::VarBytesMethod::off;
+                } else if (method == "shm") {
+                    cfg.afl.var_bytes_method = AflConfig::VarBytesMethod::shm;
+                } else if (method == "stats") {
+                    cfg.afl.var_bytes_method = AflConfig::VarBytesMethod::stats;
+                } else {
+                    return ConfigError{"afl.var_bytes_method", "Invalid enum value",
+                                       "off, shm or stats", method};
+                }
+            }
+            if (afl_node["var_bytes_stats_path"]) {
+                if (!afl_node["var_bytes_stats_path"].IsScalar()) {
+                    return ConfigError{"afl.var_bytes_stats_path", "Invalid type",
+                                       "string", "not a string"};
+                }
+                cfg.afl.var_bytes_stats_path = afl_node["var_bytes_stats_path"].as<std::string>();
+            }
+            // No implicit method: the mask source is a deliberate choice, so a
+            // history_dedup run without it is rejected instead of silently
+            // falling back to an unmasked (or stats) mask.
+            if (cfg.afl.history_dedup && !cfg.afl.var_bytes_method) {
+                return ConfigError{"afl.var_bytes_method",
+                                   "Required when afl.history_dedup is true",
+                                   "off, shm or stats", "missing"};
             }
             if (afl_node["msg_log_level"]) {
                 // Only the type is checked here: the level *name* is validated
