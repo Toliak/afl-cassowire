@@ -567,7 +567,7 @@ std::optional<TargetPrepared> prepare_target(const Config& cfg, SpawnMode mode) 
 
     // Log the execution plan (binary, args, env) - parent-side, before fork(),
     // so it is safe to use spdlog here (unlike the child side of fork_target()).
-    // Index-based loops: with -Dstrip_low_logs=true the PROXY_LOG_DEBUG bodies
+    // Index-based loops: in the optimized build the PROXY_LOG_DEBUG bodies
     // compile out and a loop-variable binding would be flagged as unused.
     PROXY_LOG_DEBUG("execve binary={}", cfg.target.binary.c_str());
     PROXY_LOG_DEBUG("args:");

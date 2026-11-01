@@ -10,9 +10,9 @@
 #include <vector>
 
 // Thin wrappers over the SPDLOG_* macros so that all call sites share the
-// compile-time gating done by SPDLOG_ACTIVE_LEVEL (see meson_options.txt).
-// When SPDLOG_ACTIVE_LEVEL is raised (strip_low_logs=true), the trace and
-// debug calls below compile to no-ops.
+// compile-time gating done by SPDLOG_ACTIVE_LEVEL (set per target in
+// meson.build). The optimized `afl-cassowire` build uses an INFO floor, so the
+// trace and debug calls below compile to no-ops; `afl-cassowire-dbg` keeps them.
 #define PROXY_LOG_TRACE(...) SPDLOG_TRACE(__VA_ARGS__)
 #define PROXY_LOG_DEBUG(...) SPDLOG_DEBUG(__VA_ARGS__)
 #define PROXY_LOG_INFO(...)  SPDLOG_INFO(__VA_ARGS__)

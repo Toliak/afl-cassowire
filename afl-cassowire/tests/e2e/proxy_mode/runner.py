@@ -7,8 +7,10 @@ fds 198/199, so the proxy executes its persistent __AFL_LOOP against the
 prebuilt instrumented test-target. Nothing is built here: a missing binary
 fails the test.
 
-Paths can be overridden with the AFL_CASSOWIRE_BIN, CASSOWIRE_TEST_TARGET_BIN
-and CASSOWIRE_TEST_TARGET_CMPLOG_BIN environment variables.
+The debug build is preferred: these tests exercise trace/debug logging and
+timing-sensitive coverage windows. Paths can be overridden with the
+AFL_CASSOWIRE_BIN, CASSOWIRE_TEST_TARGET_BIN and
+CASSOWIRE_TEST_TARGET_CMPLOG_BIN environment variables.
 """
 
 import json
@@ -40,9 +42,18 @@ CMPLOG_VARIANT = "afl-clang-fast++_cmplog"
 
 
 def cassowire_bin() -> Path:
-    """Path to the prebuilt afl-cassowire proxy binary."""
+    """Path to the prebuilt afl-cassowire proxy binary.
+
+    Prefers the debug build (trace/debug logging enabled, no optimization);
+    falls back to the optimized default binary when it is absent.
+    """
     override = os.environ.get("AFL_CASSOWIRE_BIN")
-    path = Path(override) if override else REPO_ROOT / "build" / "afl-cassowire"
+    if override:
+        path = Path(override)
+    else:
+        path = REPO_ROOT / "build" / "afl-cassowire-dbg"
+        if not path.is_file():
+            path = REPO_ROOT / "build" / "afl-cassowire"
     if not path.is_file():
         pytest.fail(
             f"afl-cassowire binary not found at {path} "

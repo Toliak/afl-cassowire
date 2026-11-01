@@ -20,8 +20,15 @@ make prepare2   # meson setup build with CXX=<aflpp>/src/distrib/bin/afl-clang-f
 make build      # meson compile -C build (sets AFL_CASSOWIRE_LLVM_ONLY_FSRV=1)
 ```
 
+`make build` produces two binaries: `build/afl-cassowire` (the fuzzing build:
+`-O3`, no symbols, trace/debug logging compiled out) and
+`build/afl-cassowire-dbg` (`-O0 -g`, trace/debug logging enabled, for triage).
+Existing build directories configured before the split must be rebuilt from
+scratch (`make clean`) so Meson re-applies the new `buildtype=release`.
+
 The default build is dynamically linked. Pass `STATIC=1` to `prepare2`/`build`
-for a fully static build (Meson `-Dstatic_link=true`); it uses `build-static/`.
+for a fully static build (Meson `-Dstatic_link=true`); it uses `build-static/`
+(both binaries there too).
 
 `AFLPP_DISTRIB_DIR` defaults to `../aflpp/src/distrib`; override if AFL++ lives elsewhere.
 
@@ -33,7 +40,8 @@ End-to-end tests live in `tests/e2e` (a self-contained uv project):
 - `test_mode/` — `afl-cassowire test` mode against the prebuilt instrumented
   `tests/targets/test-target` (dump-map pass + single-iteration pass, payload
   wrapping, stdin input, procfs/seccomp port detection). It expects the binaries
-  to be already built — `build/afl-cassowire` and the target's
+  to be already built — `build/afl-cassowire-dbg` (preferred; the tests assert
+  trace/debug lines, with a fallback to `build/afl-cassowire`) and the target's
   `build/afl-clang-fast++/test-target` (override with `AFL_CASSOWIRE_BIN` /
   `CASSOWIRE_TEST_TARGET_BIN`); it never builds them and fails when missing.
 - `proxy_mode/` — `afl-cassowire proxy` mode driven by an AFL++ "emulator"
@@ -44,7 +52,8 @@ End-to-end tests live in `tests/e2e` (a self-contained uv project):
   procfs + one seccomp config) and asserts the coverage and cmplog maps differ
   between target modes and between corpora; cache cases cover the CmpLog-gated
   PRNG region and the warm-hit lottery crash. Same prebuilt-binary contract as
-  `test_mode` plus the cmplog target variant `build/afl-clang-fast++_cmplog/`
+  `test_mode` (prefers `build/afl-cassowire-dbg`) plus the cmplog target variant
+  `build/afl-clang-fast++_cmplog/`
   (override with `AFL_CASSOWIRE_BIN`, `CASSOWIRE_TEST_TARGET_BIN`,
   `CASSOWIRE_TEST_TARGET_CMPLOG_BIN`); fails when binaries are missing, skips
   cmplog cases when `kernel.shmmax` < ~144 MiB (sizeof of the cmplog map).
@@ -71,6 +80,8 @@ For C++ changes the only default verification is the documented build sequence a
 ./build/afl-cassowire [-c config.yaml] test --input f # or '-' for stdin
 ./build/afl-cassowire [-c config.yaml] test --replay d [--retries N]
 ```
+Use `build/afl-cassowire-dbg` instead for `--log-level trace|debug`: the
+optimized default binary compiles those statements out (INFO floor).
 `proxy` also requires `AFL_CASSOWIRE_FORCE_FINAL_LOC=<uint64>` in the environment.
 Global options (`-c/--config`, `--log-level`, `--child-output`, `--data-dir`) must
 precede the subcommand. `--data-dir` selects where termination dumps are written
@@ -94,8 +105,8 @@ are ignored helper-anchor fields (see Important details).
   collides with the `casslog` namespace in either include order (level-name validation for
   `afl.msg_log_level` therefore lives in `main()`).
 - `src/log.{hpp,cpp}` — namespace `casslog`: spdlog setup (single-threaded stdout logger,
-  flush on warn+), `PROXY_LOG_*` macros gated by `SPDLOG_ACTIVE_LEVEL`
-  (`-Dstrip_low_logs=true` compiles trace/debug out), `parse_level()`, `escape_bytes()`,
+  flush on warn+), `PROXY_LOG_*` macros gated by `SPDLOG_ACTIVE_LEVEL` (INFO floor for
+  the default build, TRACE for `afl-cassowire-dbg`), `parse_level()`, `escape_bytes()`,
   and a warn-level ringbuffer sink (capacity 16) exposing `recent_lines()` for
   termination dumps.
 - `src/process.{hpp,cpp}` — namespace `process`: optional pre-spawn port-conflict

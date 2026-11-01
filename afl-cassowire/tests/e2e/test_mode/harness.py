@@ -1,12 +1,13 @@
 """Test harness for the afl-cassowire `test`-mode e2e tests.
 
-Runs the real binaries: `build/afl-cassowire test --input ...` against the
+Runs the real binaries: `build/afl-cassowire-dbg test --input ...` against the
 prebuilt instrumented test-target (`tests/targets/test-target`, built with
 afl-clang-fast++ - the dump-map pass needs the AFL++ runtime). Nothing is
 built here: a missing binary fails the test.
 
-Paths can be overridden with the AFL_CASSOWIRE_BIN and CASSOWIRE_TEST_TARGET_BIN
-environment variables.
+The debug build is preferred because these tests assert trace/debug log lines,
+which the optimized `build/afl-cassowire` compiles out. Paths can be overridden
+with the AFL_CASSOWIRE_BIN and CASSOWIRE_TEST_TARGET_BIN environment variables.
 """
 
 import os
@@ -29,9 +30,18 @@ NETWORK_TIMEOUT_MS = 2000
 
 
 def cassowire_bin() -> Path:
-    """Path to the prebuilt afl-cassowire proxy binary."""
+    """Path to the prebuilt afl-cassowire proxy binary.
+
+    Prefers the debug build (trace/debug logging enabled, no optimization);
+    falls back to the optimized default binary when it is absent.
+    """
     override = os.environ.get("AFL_CASSOWIRE_BIN")
-    path = Path(override) if override else REPO_ROOT / "build" / "afl-cassowire"
+    if override:
+        path = Path(override)
+    else:
+        path = REPO_ROOT / "build" / "afl-cassowire-dbg"
+        if not path.is_file():
+            path = REPO_ROOT / "build" / "afl-cassowire"
     if not path.is_file():
         pytest.fail(
             f"afl-cassowire binary not found at {path} "
