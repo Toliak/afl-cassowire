@@ -157,12 +157,16 @@ are ignored helper-anchor fields (see Important details).
   between `fork()` and `execve()` — the pre-exec child reports failures with raw
   `dprintf()` to a saved, CLOEXEC stderr fd (async-signal-safety).
 - Target crash detection: `waitpid(WNOHANG)` + `WIFSIGNALED` → proxy raises `SIGSEGV` so
-  AFL registers the finding. Target teardown is a plain SIGKILL to the whole process
-  group plus a bounded (~200 ms) reap of the group leader (`kill_and_reap_pgid()` in
-  `main.cpp`), in all modes and on every exit path — the shared coverage map is
-  shm-backed and written on every edge hit, so a SIGKILL'd target loses nothing AFL
-  reads. `cleanup` is not involved in this teardown; it is only a pre-spawn
-  port-conflict check (see below).
+  AFL registers the finding. The pre-zombie peek at `PF_EXITING`/`PF_SIGNALED` reads
+  `/proc/<pid>/stat` through a cached descriptor (`pread`, reopened only when the pid
+  changes) and parses `num_threads` in the same pass: single-threaded targets skip the
+  per-thread `/proc/<pid>/task/*/stat` walk entirely, while threaded targets keep it
+  (a fatal signal can land on a non-leader thread). Target teardown is a plain SIGKILL
+  to the whole process group plus a bounded (~200 ms) reap of the group leader
+  (`kill_and_reap_pgid()` in `main.cpp`), in all modes and on every exit path — the
+  shared coverage map is shm-backed and written on every edge hit, so a SIGKILL'd target
+  loses nothing AFL reads. `cleanup` is not involved in this teardown; it is only a
+  pre-spawn port-conflict check (see below).
 - Optional pre-spawn port cleanup (`cleanup.enabled`, default `false`): resolves
   the LISTEN socket inode for the configured port and its holders. A holder with a
   live parent is never touched (the cmplog target, another campaign, a service);

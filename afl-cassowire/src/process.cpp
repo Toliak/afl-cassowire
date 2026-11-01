@@ -950,10 +950,13 @@ std::optional<uint64_t> collect_map_size(int pipe_read_fd) {
 static constexpr unsigned long PF_EXITING_LOCAL  = 0x00000004UL;
 static constexpr unsigned long PF_SIGNALISED_LOCAL = 0x00000400UL;
 
-// Parse the `flags` field (whitespace field 9) out of a /proc stat buffer.
-// Returns false if the buffer cannot be parsed. comm (field 2) may contain
+// Parse the `flags` (whitespace field 9) and `num_threads` (field 20) values
+// out of a /proc stat buffer. Both are read in one pass: the flags detect a
+// dying leader, num_threads decides whether the task/ scan is needed at all.
+// Returns false if either field cannot be parsed. comm (field 2) may contain
 // spaces and parentheses, so the field numbering restarts after the LAST ')'.
-static bool parse_proc_flags(const char* buf, size_t len, unsigned long* out) {
+static bool parse_proc_stat(const char* buf, size_t len, unsigned long* flags_out,
+                            unsigned long* threads_out) {
     // Find the LAST ')' without relying on memrchr/_GNU_SOURCE: comm may
     // itself contain ')' characters, so field numbering restarts after it.
     size_t rparen = 0;
@@ -963,24 +966,30 @@ static bool parse_proc_flags(const char* buf, size_t len, unsigned long* out) {
     }
     if (!found) return false;
     const char* p = buf + rparen + 1;
-    // Fields after ')': 0=state 1=ppid 2=pgrp 3=session 4=tty_nr 5=tpgid 6=flags
+    // Fields after ')': 0=state 1=ppid 2=pgrp 3=session 4=tty_nr 5=tpgid
+    // 6=flags ... 17=num_threads.
+    bool have_flags = false;
+    bool have_threads = false;
     int idx = -1;
     while (true) {
         while (*p == ' ' || *p == '\t') p++;
         if (*p == '\0' || *p == '\n') break;
         idx++;
-        if (idx == 6) {
+        if (idx == 6 || idx == 17) {
             unsigned long v = 0;
             while (*p >= '0' && *p <= '9') { v = v * 10UL + static_cast<unsigned long>(*p - '0'); p++; }
-            *out = v;
-            return true;
+            if (idx == 6) { *flags_out = v; have_flags = true; }
+            else          { *threads_out = v; have_threads = true; }
+            if (have_flags && have_threads) return true;
+            continue;  // pointer already at the separator; the top skips spaces
         }
         while (*p && *p != ' ' && *p != '\t' && *p != '\n' && *p != '\0') p++;
     }
-    return false;
+    return have_flags && have_threads;
 }
 
 // Read the flags field of a single /proc stat file (pid, or tid under task/).
+// Used only for the non-leader threads of a multi-threaded target.
 static bool proc_flags_of(const char* path, unsigned long* out) {
     int fd = ::open(path, O_RDONLY | O_CLOEXEC);
     if (fd < 0) return false;
@@ -989,22 +998,68 @@ static bool proc_flags_of(const char* path, unsigned long* out) {
     ::close(fd);
     if (n <= 0) return false;
     buf[n] = '\0';
-    return parse_proc_flags(buf, static_cast<size_t>(n), out);
+    unsigned long threads = 0;
+    return parse_proc_stat(buf, static_cast<size_t>(n), out, &threads);
+}
+
+// Cached /proc/<pid>/stat descriptor for the watched target. The proxy is
+// single-threaded and watches one child at a time; the proc inode keeps
+// returning fresh content from pread(), so the per-iteration open/close is
+// avoidable. A pid change (fresh target) reopens it and a failed read drops it.
+static int g_stat_fd = -1;
+static pid_t g_stat_pid = -1;
+
+static void close_cached_stat() {
+    if (g_stat_fd >= 0) {
+        ::close(g_stat_fd);
+        g_stat_fd = -1;
+    }
+    g_stat_pid = -1;
+}
+
+// Read flags + num_threads from the cached leader stat fd.
+// Returns false when /proc/<pid>/stat cannot be read (target gone): the
+// caller's waitpid() then decides.
+static bool read_leader_stat(pid_t pid, unsigned long* flags, unsigned long* threads) {
+    if (g_stat_pid != pid) {
+        close_cached_stat();
+        char path[64];
+        snprintf(path, sizeof(path), "/proc/%d/stat", pid);
+        int fd = ::open(path, O_RDONLY | O_CLOEXEC);
+        if (fd < 0) return false;
+        g_stat_fd = fd;
+        g_stat_pid = pid;
+    }
+
+    char buf[512];
+    ssize_t n;
+    do {
+        n = ::pread(g_stat_fd, buf, sizeof(buf) - 1, 0);
+    } while (n < 0 && errno == EINTR);
+    if (n <= 0) {
+        close_cached_stat();
+        return false;
+    }
+    buf[n] = '\0';
+    return parse_proc_stat(buf, static_cast<size_t>(n), flags, threads);
 }
 
 // True if the process (or any of its threads) carries dying flags. The leader
-// check is the cheap fast path for single-threaded targets; the task/ scan
-// covers a fatal signal delivered on a non-leader thread of a threaded target.
+// check is the fast path; its num_threads field tells us whether the task/
+// scan can be skipped. The scan stays for threaded targets, where a fatal
+// signal can land on a non-leader thread.
 static bool pid_is_dying(pid_t pid) {
-    char path[64];
     unsigned long flags = 0;
+    unsigned long threads = 0;
 
-    snprintf(path, sizeof(path), "/proc/%d/stat", pid);
-    if (proc_flags_of(path, &flags) &&
-        (flags & (PF_EXITING_LOCAL | PF_SIGNALISED_LOCAL))) {
-        return true;
+    if (read_leader_stat(pid, &flags, &threads)) {
+        if (flags & (PF_EXITING_LOCAL | PF_SIGNALISED_LOCAL)) return true;
+        // Nothing else can be dying when the thread group has one task.
+        if (threads <= 1) return false;
     }
 
+    // Multi-threaded (or the leader stat was unreadable): scan the threads.
+    char path[64];
     snprintf(path, sizeof(path), "/proc/%d/task", pid);
     DIR* d = opendir(path);
     if (!d) return false;  // gone (already a zombie/reaped): caller's waitpid handles it
@@ -1044,8 +1099,14 @@ TargetState check_target_state(pid_t pid, int pidfd, int grace_ms) {
     // 1. Fast reap: the target is already a zombie we can collect.
     int status = 0;
     pid_t r = waitpid(pid, &status, WNOHANG);
-    if (r == pid) return classify(status);
-    if (r == -1 && errno == ECHILD) return {TargetState::Kind::Unknown, 0};
+    if (r == pid) {
+        close_cached_stat();
+        return classify(status);
+    }
+    if (r == -1 && errno == ECHILD) {
+        close_cached_stat();
+        return {TargetState::Kind::Unknown, 0};
+    }
 
     // 2. Not waitable yet: peek at the kernel's exit flags to detect a target
     //    that is mid-exit (fds already closed for a crashed peer, or wedged in
@@ -1071,7 +1132,10 @@ TargetState check_target_state(pid_t pid, int pidfd, int grace_ms) {
     // 4. Reap if the death landed; otherwise the target is wedged (still alive
     //    after grace) and will be re-checked on the next call.
     r = waitpid(pid, &status, WNOHANG);
-    if (r == pid) return classify(status);
+    if (r == pid) {
+        close_cached_stat();
+        return classify(status);
+    }
     return {TargetState::Kind::Alive, 0};
 }
 
