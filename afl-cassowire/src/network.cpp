@@ -290,6 +290,14 @@ const NotifBuffers& notif_buffers() {
 
 // Answers a received notification with CONTINUE. False means the task is gone
 // (ENOENT) or EINTR - both benign; the task simply resumes without us.
+// TODO(kimi)[major]: CONTINUE requires Linux 5.5 (SECCOMP_USER_NOTIF_FLAG_CONTINUE
+// exists only since 5.5; NOTIF_SEND itself is 5.0), although seccomp mode claims
+// kernel >= 5.0 support (see AGENTS.md). On 5.0-5.4 (e.g. the Ubuntu 20.04 GA
+// 5.4 kernel) this response fails with EINVAL; callers ignore false, leaving
+// the notified target task blocked in bind()/listen() (the filter is
+// irremovable), so port detection times out against a healthy target with no
+// hint about the real cause. Fix: feature-check at startup and fall back to
+// procfs (or correct the documented minimum kernel to 5.5).
 bool notif_send_continue(int fd, const struct seccomp_notif& n) {
     struct seccomp_notif_resp resp = notif_buffers().cont;
     resp.id = n.id;

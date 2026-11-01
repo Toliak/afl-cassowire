@@ -265,6 +265,14 @@ SequenceBuild build_sequence(const SequenceConfig& sc, const uint8_t* input, siz
     if (msg_start < input_len) {
         add_message(msg_start, input_len);
     }
+    // TODO(claude,kimi)[major]: an input without any delimiter is sent TWICE.
+    // With no match, msg_start stays 0, so the branch above already adds
+    // [0, input_len); this branch adds the same range again. The target gets
+    // the testcase twice on one connection, and messages_total/discovered is
+    // 2 instead of 1. Most AFL mutations destroy the delimiter, so this hits
+    // a large share of executions. The documented contract is "no delimiter =
+    // one message". Fix: delete this block (the trailing-bytes branch already
+    // covers it).
     if (!found_delimiter && input_len > 0) {
         add_message(0, input_len);
     }
@@ -1012,6 +1020,17 @@ int run_proxy_mode(Config cfg, bool forward_output) {
 // SpawnMode::MapSizePass; the proxy's own environment is not touched. The wait
 // is bounded by network.initial_ms. A target that cannot produce a valid dump
 // is not properly AFL-instrumented, so this is a hard gate.
+// TODO(claude,kimi)[critical]: the hard gate is broken. The function returns
+// bool, but every failure path below still does `return 1;` (left over from
+// when this code was inlined in run_test_mode()). 1 converts to `true`, so
+// all failures (prepare/spawn failure, Pass 1 timeout, Pass 1 killed by a
+// signal, missing pipe, malformed or missing map-size output) report success.
+// Callers (`if (!extract_map_size(cfg)) return 1;` in run_test_mode/
+// run_replay_mode) then continue to Pass 2 / replay against a target that is
+// not properly AFL-instrumented. test_dump_map_rejects_malformed_output only
+// passes by accident: its target never listens, so Pass 2 fails later at
+// port detection. Fix: change every `return 1;` in this function to
+// `return false;`.
 static bool extract_map_size(const Config& cfg) {
     auto prep_opt1 = process::prepare_target(cfg, process::SpawnMode::MapSizePass);
     if (!prep_opt1) {
@@ -1168,6 +1187,13 @@ int run_test_mode(const Config& cfg, const std::string& input_path, bool forward
         PROXY_LOG_INFO("Response: '{}'", casslog::escape_bytes(ex.response));
     }
 
+    // TODO(claude)[major]: the exit code ignores the result. A failed Pass 2
+    // (send/receive error, io_ok == false) and a target that crashed after the
+    // exchange (WIFSIGNALED below) both fall through to `return 0`. Any
+    // script or CI gate that uses `test --input` exit status reports success
+    // for a failed or crashing run (run_replay_mode() in contrast returns 0
+    // only when a crash reproduces). Return non-zero when !io_ok (and decide
+    // explicitly what a crashed target should return).
     if (io_ok) {
         PROXY_LOG_INFO("Pass 2 (Single Iteration) completed successfully.");
     } else {
