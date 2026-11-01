@@ -290,7 +290,7 @@ const NotifBuffers& notif_buffers() {
 
 // Answers a received notification with CONTINUE. False means the task is gone
 // (ENOENT) or EINTR - both benign; the task simply resumes without us.
-// TODO(kimi)[major]: CONTINUE requires Linux 5.5 (SECCOMP_USER_NOTIF_FLAG_CONTINUE
+// TODO#N1(kimi)[major]: CONTINUE requires Linux 5.5 (SECCOMP_USER_NOTIF_FLAG_CONTINUE
 // exists only since 5.5; NOTIF_SEND itself is 5.0), although seccomp mode claims
 // kernel >= 5.0 support (see AGENTS.md). On 5.0-5.4 (e.g. the Ubuntu 20.04 GA
 // 5.4 kernel) this response fails with EINVAL; callers ignore false, leaving
@@ -372,6 +372,17 @@ DetectResult notif_port(int notif_fd, pid_t target_pid, int target_port, uint64_
     // address argument). A failed bind leaves a stale entry until the next
     // confirmation failure clears it; readiness is only ever declared after a
     // /proc confirmation, so this cannot false-positive.
+    // TODO#N3(kimi)[major]: fd numbers are process-local, but notifications from
+    // the whole target tree share this fd-only map. A forked child that closes
+    // the inherited listener fd, opens its own socket on the reused number and
+    // binds a different port overwrites the entry before the parent's listen()
+    // arrives; the lookup then misses the configured port and detection times
+    // out against a healthy target (fails safe). Threads alone cannot trigger
+    // this (one shared fd table per process), and the fix must NOT key by the
+    // notifying tid (n.pid is a TID: bind and listen may come from different
+    // threads of one process) but by the fd-table owner: record (tgid, fd) ->
+    // port, resolving tgid from the tid via /proc/<tid>/status, or verify the
+    // socket inode via readlink(/proc/<tid>/fd/<fd>) at bind and listen.
     std::unordered_map<int, int> bound_ports;
     std::vector<unsigned char> buf(nb.req_size);
     const uint64_t start = utils::get_time_ms();

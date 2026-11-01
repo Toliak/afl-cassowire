@@ -417,6 +417,11 @@ are ignored helper-anchor fields (see Important details).
   pattern for its throwaway connection.
 
 ## Review markers
-Existing review notes are tagged `TODO(claude): ...` (see `grep -rn "TODO(claude)" src/`).
-They mark real, still-open issues; resolved notes are deleted rather than kept as
-"RESOLVED". Preserve the tag when touching those lines; don't silently drop open ones.
+Existing review notes are tagged `TODO#<id>(<finder>)[<value>]: ...` (see
+`grep -rn "TODO#" src/`): `<id>` is a stable per-file prefix + number (`M#` =
+main.cpp, `N#` = network.{cpp,hpp}), `<finder>` records who found the issue
+(e.g. `claude`, `kimi`, or several comma-separated), and `<value>` is the
+reviewed severity (`critical` / `major`; pre-existing notes may predate the
+value mark). They mark real, still-open issues; resolved notes are deleted
+rather than kept as "RESOLVED". Preserve the tag when touching those lines;
+don't silently drop open ones.

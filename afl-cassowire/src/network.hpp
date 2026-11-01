@@ -324,7 +324,7 @@ namespace network {
      *   process::check_target_state() afterwards (this function never decides
      *   by itself).
      *
-     * Known gaps (TODO(claude)): deferred work that runs only after the probe
+     * Known gaps (TODO#N2(claude)): deferred work that runs only after the probe
      * is serviced (timers, async logging) is not covered; on multi-acceptor /
      * threaded targets the probe may be serviced while main-connection cleanup
      * still runs elsewhere; banner-sending servers report Serviced as soon as

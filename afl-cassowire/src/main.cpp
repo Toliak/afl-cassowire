@@ -265,7 +265,7 @@ SequenceBuild build_sequence(const SequenceConfig& sc, const uint8_t* input, siz
     if (msg_start < input_len) {
         add_message(msg_start, input_len);
     }
-    // TODO(claude,kimi)[major]: an input without any delimiter is sent TWICE.
+    // TODO#M1(claude,kimi)[major]: an input without any delimiter is sent TWICE.
     // With no match, msg_start stays 0, so the branch above already adds
     // [0, input_len); this branch adds the same range again. The target gets
     // the testcase twice on one connection, and messages_total/discovered is
@@ -1020,7 +1020,7 @@ int run_proxy_mode(Config cfg, bool forward_output) {
 // SpawnMode::MapSizePass; the proxy's own environment is not touched. The wait
 // is bounded by network.initial_ms. A target that cannot produce a valid dump
 // is not properly AFL-instrumented, so this is a hard gate.
-// TODO(claude,kimi)[critical]: the hard gate is broken. The function returns
+// TODO#M2(claude,kimi)[critical]: the hard gate is broken. The function returns
 // bool, but every failure path below still does `return 1;` (left over from
 // when this code was inlined in run_test_mode()). 1 converts to `true`, so
 // all failures (prepare/spawn failure, Pass 1 timeout, Pass 1 killed by a
@@ -1187,7 +1187,7 @@ int run_test_mode(const Config& cfg, const std::string& input_path, bool forward
         PROXY_LOG_INFO("Response: '{}'", casslog::escape_bytes(ex.response));
     }
 
-    // TODO(claude)[major]: the exit code ignores the result. A failed Pass 2
+    // TODO#M3(claude)[major]: the exit code ignores the result. A failed Pass 2
     // (send/receive error, io_ok == false) and a target that crashed after the
     // exchange (WIFSIGNALED below) both fall through to `return 0`. Any
     // script or CI gate that uses `test --input` exit status reports success
