@@ -774,7 +774,12 @@ RecvWindowResult recv_window(int sock, int idle_poll_us, int cap_ms) {
             return out;
         }
 
-        const int poll_res = poll_with_notif_us(sock, POLLIN, idle_poll_us);
+        // Clamp the idle window to the remaining cap budget so the last poll
+        // cannot sleep past cap_ms (the cap is only re-checked between polls).
+        uint64_t poll_us = static_cast<uint64_t>(idle_poll_us);
+        const uint64_t remaining_us = (cap - elapsed) * 1000;
+        if (poll_us > remaining_us) poll_us = remaining_us;
+        const int poll_res = poll_with_notif_us(sock, POLLIN, static_cast<int>(poll_us));
         if (poll_res < 0) {
             out.error = WaitError{WaitError::Kind::PollFailed, errno};
             out.elapsed_ms = utils::get_time_ms() - start;
