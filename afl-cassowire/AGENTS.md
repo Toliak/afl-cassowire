@@ -80,6 +80,9 @@ For C++ changes the only default verification is the documented build sequence a
 ./build/afl-cassowire [-c config.yaml] test --input f # or '-' for stdin
 ./build/afl-cassowire [-c config.yaml] test --replay d [--retries N]
 ```
+`test --input` exits 0 only when both passes succeed and the target was not
+killed by a signal; an I/O failure or target crash exits 1. `test --replay`
+exits 0 only when a crash is reproduced.
 Use `build/afl-cassowire-dbg` instead for `--log-level trace|debug`: the
 optimized default binary compiles those statements out (INFO floor).
 `proxy` also requires `AFL_CASSOWIRE_FORCE_FINAL_LOC=<uint64>` in the environment.

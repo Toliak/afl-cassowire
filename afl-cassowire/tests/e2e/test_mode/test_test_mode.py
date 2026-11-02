@@ -280,6 +280,43 @@ def test_stdin_path_missing_file_fails(tmp_path: Path) -> None:
     assert "Pass 2 (Single Iteration) completed successfully." not in res.stdout, res.detail()
 
 
+def test_crash_after_exchange_returns_nonzero(tmp_path: Path) -> None:
+    # The test-target's CRASH hook aborts the server while handling the
+    # request. The exchange sees EOF, but the reaped SIGABRT must make the
+    # run fail instead of reporting a successful Pass 2.
+    target = harness.test_target_bin()
+    port = harness.free_port()
+    config = harness.write_config(
+        tmp_path,
+        target_args=[str(target), "calc", "--port", str(port)],
+        port=port,
+    )
+    input_file = tmp_path / "input.bin"
+    input_file.write_bytes(b"CRASH\n")
+    res = harness.run_cassowire(config, "test", "--input", str(input_file))
+    assert res.returncode == 1, res.detail()
+    assert "target crashed after exchange" in res.stdout, res.detail()
+    assert "Pass 2 (Single Iteration) completed successfully." not in res.stdout, res.detail()
+
+
+def test_failed_exchange_returns_nonzero(tmp_path: Path) -> None:
+    # HANG makes the target accept the request but never respond, so
+    # wait_response() times out (io_ok == false). The run must fail.
+    target = harness.test_target_bin()
+    port = harness.free_port()
+    config = harness.write_config(
+        tmp_path,
+        target_args=[str(target), "calc", "--port", str(port)],
+        port=port,
+    )
+    input_file = tmp_path / "input.bin"
+    input_file.write_bytes(b"HANG\n")
+    res = harness.run_cassowire(config, "test", "--input", str(input_file))
+    assert res.returncode == 1, res.detail()
+    assert "Pass 2 (Single Iteration) failed." in res.stdout, res.detail()
+    assert "Pass 2 (Single Iteration) completed successfully." not in res.stdout, res.detail()
+
+
 # --- AFLNet-style sequence mode -------------------------------------------
 
 
