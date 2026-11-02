@@ -11,7 +11,7 @@ index 6a1bee3..de71df1 100644
      "AFL_DUMP_PC_MAP",
  #endif
 diff --git a/instrumentation/SanitizerCoveragePCGUARD.so.cc b/instrumentation/SanitizerCoveragePCGUARD.so.cc
-index f7bb60e..9364f88 100644
+index f7bb60e..ed12750 100644
 --- a/instrumentation/SanitizerCoveragePCGUARD.so.cc
 +++ b/instrumentation/SanitizerCoveragePCGUARD.so.cc
 @@ -714,6 +714,19 @@ bool ModuleSanitizerCoverageAFL::isNoAbortFunction(Function &F) {
@@ -34,11 +34,48 @@ index f7bb60e..9364f88 100644
  
    Value *MapPtrIdx = IRB.CreateGEP(Int8Ty, MapPtr, CoverageIndex);
  
+@@ -963,6 +976,13 @@ void ModuleSanitizerCoverageAFL::updateCoverageForSelect(IRBuilder<> &IRB,
+                                                          Value       *MapPtr,
+                                                          uint32_t &vector_cnt) {
+ 
++  // AFL_CASSOWIRE_LLVM_ONLY_FSRV builds must not emit any bitmap update:
++  // this is the second emitter (select instructions), alongside
++  // updateCoverageBitmap(). Without this guard the instrumented shared
++  // libraries of an ONLY_FSRV binary keep live coverage increments even
++  // though the main executable is clean.
++  if (getenv("AFL_CASSOWIRE_LLVM_ONLY_FSRV")) { return; }
++
+   uint32_t vector_cur = 0;
+ 
+   while (true) {
 diff --git a/instrumentation/afl-compiler-rt.o.c b/instrumentation/afl-compiler-rt.o.c
-index 0ecd43d..348b7e5 100644
+index 0ecd43d..dcc37ab 100644
 --- a/instrumentation/afl-compiler-rt.o.c
 +++ b/instrumentation/afl-compiler-rt.o.c
-@@ -3349,6 +3349,19 @@ void __sanitizer_cov_trace_pc_guard_init(uint32_t *start, uint32_t *stop) {
+@@ -3310,6 +3310,22 @@ void __sanitizer_cov_trace_pc_guard_init(uint32_t *start, uint32_t *stop) {
+      to avoid duplicate calls (which can happen as an artifact of the underlying
+      implementation in LLVM). */
+ 
++  /* AFL_CASSOWIRE_FORCE_FINAL_LOC (forced at the end of every
++     __sanitizer_cov_trace_pc_guard_init call, see below) must not poison the
++     guard numbering of the modules that initialize afterwards: without this
++     restore, every module after the first one would assign guard values
++     starting at the forced location, and any instrumented edge in it (e.g. in
++     the shared libraries of the proxy binary) would write past the end of the
++     shared coverage map whenever the map is sized close to the forced value.
++     Continue from the natural numbering instead. */
++  static u32 cassowire_nat_final_loc = 0;
++  x = getenv("AFL_CASSOWIRE_FORCE_FINAL_LOC");
++  if (x && cassowire_nat_final_loc) {
++
++    __afl_final_loc = cassowire_nat_final_loc;
++
++  }
++
+   if (__afl_final_loc < 4) __afl_final_loc = 4;  // we skip the first 5 entries
+ 
+   *(start++) = ++__afl_final_loc;
+@@ -3349,6 +3365,30 @@ void __sanitizer_cov_trace_pc_guard_init(uint32_t *start, uint32_t *stop) {
  
  #endif  // __AFL_CODE_COVERAGE
  
@@ -51,7 +88,18 @@ index 0ecd43d..348b7e5 100644
 +      abort();
 +    }
 +
-+    __afl_final_loc = proxy_afl_force_final_loc;
++    /* Remember the natural numbering so the next module's guard_init continues
++       from it (see the restore at the top of the numbering path), and only
++       ever grow the announced final location: clamping down would make the
++       announced map smaller than the guard values already handed out, so any
++       instrumented edge (e.g. in the proxy's shared libraries) would write
++       past the end of the shared coverage map. */
++    cassowire_nat_final_loc = __afl_final_loc;
++    if (__afl_final_loc < proxy_afl_force_final_loc) {
++
++      __afl_final_loc = proxy_afl_force_final_loc;
++
++    }
 +
 +  }
 +

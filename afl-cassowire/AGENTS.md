@@ -366,6 +366,34 @@ are ignored helper-anchor fields (see Important details).
 - `src/afl_compat.h` (not `.hpp`) defines *no-op* AFL++ macros instead of `#error`-ing;
   the "must use an AFL++ compiler" enforcement lives in the `meson.build` compiler
   probe. Don't add an `#error` guard to the header.
+- **Map-size contract (fixed 2026-11).** The proxy binary is built with
+  `AFL_CASSOWIRE_LLVM_ONLY_FSRV=1`, and `aflpp/patch/cassowire_compiler.patch`
+  enforces two invariants the whole design depends on:
+  1. *No coverage writes from the proxy process.* The skip guards **both** bitmap
+     emitters of the PCGUARD pass (`updateCoverageBitmap` for basic blocks and
+     `updateCoverageForSelect` for `select` instructions). The select emitter was
+     originally unguarded, so the proxy's instrumented shared libraries (spdlog,
+     yaml-cpp, fmt, built by the same `make build`) kept live coverage increments
+     even though the executable itself was clean.
+  2. *Guard numbering must never exceed the announced map.* The runtime's
+     `AFL_CASSOWIRE_FORCE_FINAL_LOC` handling **clamps `__afl_final_loc` up**
+     (never down) and continues the natural guard numbering across modules
+     (`__sanitizer_cov_trace_pc_guard_init` runs once per module: the executable
+     plus every instrumented `.so`). The original code reset `__afl_final_loc`
+     after *each* module, so every module after the first assigned guard values
+     starting at `FORCE+1` — and any surviving instrumentation (see 1) wrote
+     past the shared coverage map whenever the map was sized close to `FORCE`
+     instead of AFL++'s 8 MiB default.
+  Together these fixed a crash where exporting `AFL_MAP_SIZE=<FORCE>` to
+  afl-fuzz/afl-showmap shrank the coverage segment to `round64(FORCE+1)+4` bytes
+  and the next select-path increment (e.g. in spdlog's `pattern_formatter`,
+  reached from `casslog::init()`) landed in the mapping right after the segment
+  — SIGSEGV (or silent heap corruption when that mapping was writable). With the
+  fixes, `AFL_MAP_SIZE` may be exported to the fuzzer: the tool sizes the
+  segment to `max(AFL_MAP_SIZE, announced)` and every guard value stays below
+  the announced map. Keeping `AFL_MAP_SIZE` only in `target.env` (the historical
+  workaround) remains valid and recommended: the target-side value only
+  satisfies the runtime's `>= MAP_SIZE` check and sizes nothing.
 - Config keys added after the original design: `target.env`, `target.env_preserve`, `target.stdin_path`, `payload.*`, `sequence.*`,
   `afl.cov_discard_init`, `afl.cov_discard_probe`, `afl.cov_discard_probe_cmplog`,
   `afl.dump_history`, `afl.history_dedup`, `afl.var_bytes_method`,
