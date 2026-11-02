@@ -1187,29 +1187,30 @@ int run_test_mode(const Config& cfg, const std::string& input_path, bool forward
         PROXY_LOG_INFO("Response: '{}'", casslog::escape_bytes(ex.response));
     }
 
-    // TODO#M3(claude)[major]: the exit code ignores the result. A failed Pass 2
-    // (send/receive error, io_ok == false) and a target that crashed after the
-    // exchange (WIFSIGNALED below) both fall through to `return 0`. Any
-    // script or CI gate that uses `test --input` exit status reports success
-    // for a failed or crashing run (run_replay_mode() in contrast returns 0
-    // only when a crash reproduces). Return non-zero when !io_ok (and decide
-    // explicitly what a crashed target should return).
-    if (io_ok) {
+    // A failed exchange (send/receive/sequence error) and a target killed by a
+    // signal after the exchange are both failures: `test --input` is used as a
+    // script/CI gate, so only a clean Pass 2 may exit 0. (run_replay_mode() is
+    // the opposite: there a reproduced crash is the success condition.)
+    //
+    // Opportunistic non-blocking probe for a target that already died after
+    // the single exchange. status is only meaningful when waitpid reaps it.
+    int status = 0;
+    pid_t res = waitpid(g_child_pid, &status, WNOHANG);
+    const bool target_crashed = res > 0 && WIFSIGNALED(status);
+    PROXY_LOG_INFO("waitpid res {} status {:x}, signaled={}", res, status, target_crashed);
+    if (target_crashed) {
+        PROXY_LOG_ERROR("target crashed after exchange (signal {})", WTERMSIG(status));
+    }
+
+    if (io_ok && !target_crashed) {
         PROXY_LOG_INFO("Pass 2 (Single Iteration) completed successfully.");
     } else {
         PROXY_LOG_ERROR("Pass 2 (Single Iteration) failed.");
     }
 
-    // Opportunistic non-blocking probe for a target that already died after
-    // the single exchange. status is only meaningful when waitpid reaps it.
-    int status = 0;
-    pid_t res = waitpid(g_child_pid, &status, WNOHANG);
-    PROXY_LOG_INFO("waitpid res {} status {:x}, signaled={}", res, status,
-                   res > 0 && WIFSIGNALED(status));
-    
     // Clean exit
     kill_and_reap_pgid(g_child_pid);
-    return 0;
+    return (io_ok && !target_crashed) ? 0 : 1;
 }
 
 
