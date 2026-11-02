@@ -51,6 +51,15 @@ Options parse_options(int argc, char* argv[]) {
         .default_value(false)
         .implicit_value(true);
 
+    program.add_argument("--fork-bind-collision")
+        .help("bind the configured port, then fork a child that closes the "
+              "inherited listener fd, reuses the number for a socket bound to "
+              "port+1, and only then listen() on the configured port "
+              "(reproduces the cross-process fd-number collision in seccomp "
+              "port detection)")
+        .default_value(false)
+        .implicit_value(true);
+
     program.add_argument("--ignore-sigterm")
         .help("ignore SIGTERM so cleanup must escalate to SIGKILL")
         .default_value(false)
@@ -118,8 +127,10 @@ Options parse_options(int argc, char* argv[]) {
     opts.bind_ephemeral_first = program.get<bool>("--bind-ephemeral-first");
     opts.bind_extra_port = program.get<bool>("--bind-extra-port");
     opts.bind_extra_after = program.get<bool>("--bind-extra-after");
-    if ((opts.bind_extra_port || opts.bind_extra_after) && opts.port == 65535) {
-        fatal("--bind-extra-port/--bind-extra-after require --port < 65535");
+    opts.fork_bind_collision = program.get<bool>("--fork-bind-collision");
+    if ((opts.bind_extra_port || opts.bind_extra_after || opts.fork_bind_collision) &&
+        opts.port == 65535) {
+        fatal("--bind-extra-port/--bind-extra-after/--fork-bind-collision require --port < 65535");
     }
     opts.ignore_sigterm = program.get<bool>("--ignore-sigterm");
     opts.keep_alive = program.get<bool>("--keep-alive");

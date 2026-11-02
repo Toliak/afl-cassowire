@@ -13,6 +13,7 @@ binaries fail instead of being built.
 """
 
 import os
+import socket
 import sys
 from pathlib import Path
 
@@ -57,7 +58,7 @@ def assert_single_iteration_pass(res: harness.RunResult, response: bytes) -> Non
 @pytest.mark.parametrize("primary", ["procfs", "seccomp"])
 def test_dump_map_and_single_iteration_calc(tmp_path: Path, primary: str) -> None:
     if primary == "seccomp" and not harness.seccomp_supported():
-        pytest.skip("SECCOMP_RET_USER_NOTIF port detection needs kernel >= 5.0")
+        pytest.skip("SECCOMP_RET_USER_NOTIF port detection needs kernel >= 5.5")
     res = run_calc_case(tmp_path, primary)
     assert_dump_map_pass(res, harness.test_target_bin())
     assert_single_iteration_pass(res, CALC_RESPONSE)
@@ -73,7 +74,7 @@ def test_single_iteration_extra_bind_after_main(tmp_path: Path, primary: str) ->
     alongside the data socket in poll() releases them immediately.
     """
     if primary == "seccomp" and not harness.seccomp_supported():
-        pytest.skip("SECCOMP_RET_USER_NOTIF port detection needs kernel >= 5.0")
+        pytest.skip("SECCOMP_RET_USER_NOTIF port detection needs kernel >= 5.5")
     target = harness.test_target_bin()
     port = harness.free_port()
     config = harness.write_config(
@@ -90,6 +91,49 @@ def test_single_iteration_extra_bind_after_main(tmp_path: Path, primary: str) ->
     if primary == "seccomp":
         # The multiplexed poll + pump must have released the queued extra bind().
         assert "notif pump: released bind" in res.stdout, res.detail()
+
+
+def _free_port_pair() -> int:
+    """A free port whose successor is also free (the collision child binds port+1)."""
+    for _ in range(50):
+        port = harness.free_port()
+        if port >= 65535:
+            continue
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as probe:
+            try:
+                probe.bind(("127.0.0.1", port + 1))
+            except OSError:
+                continue
+        return port
+    pytest.skip("no free port pair available")
+
+
+def test_single_iteration_fork_bind_collision(tmp_path: Path) -> None:
+    """A forked child that reuses the inherited listener's fd number for a
+    socket bound to a different port must not hide the configured port from
+    seccomp detection: the (tgid, fd) keying keeps the parent's bind entry
+    intact, so the parent's later listen() still matches. With a bare
+    fd-keyed map the child's bind overwrites the entry and detection times
+    out against a healthy target.
+    """
+    if not harness.seccomp_supported():
+        pytest.skip("SECCOMP_RET_USER_NOTIF port detection needs kernel >= 5.5")
+    target = harness.test_target_bin()
+    port = _free_port_pair()
+    config = harness.write_config(
+        tmp_path,
+        target_args=[str(target), "calc", "--port", str(port), "--fork-bind-collision"],
+        port=port,
+        primary="seccomp",
+    )
+    input_file = tmp_path / "input.bin"
+    input_file.write_bytes(CALC_INPUT)
+    res = harness.run_cassowire(config, "--log-level", "debug", "test", "--input", str(input_file))
+    assert_dump_map_pass(res, target)
+    assert_single_iteration_pass(res, CALC_RESPONSE)
+    # The parent's bind on the configured port must have been recorded under
+    # its own (tgid, fd) key despite the child's bind on the reused fd number.
+    assert f"Detected bind on port {port} " in res.stdout, res.detail()
 
 
 @pytest.mark.parametrize(

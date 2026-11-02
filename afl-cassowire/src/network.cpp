@@ -54,6 +54,12 @@ std::string DetectError::to_string() const {
         case Kind::UnknownMethod:
             ss << "unknown port detection method";
             break;
+        case Kind::KernelTooOld:
+            ss << "seccomp user-notification detection needs Linux >= 5.5 "
+                  "(SECCOMP_USER_NOTIF_FLAG_CONTINUE was rejected with EINVAL; "
+                  "SECCOMP_IOCTL_NOTIF_SEND itself exists since 5.0); use "
+                  "port_detection.primary: procfs or a newer kernel";
+            break;
     }
     return ss.str();
 }
@@ -288,21 +294,29 @@ const NotifBuffers& notif_buffers() {
     return nb;
 }
 
-// Answers a received notification with CONTINUE. False means the task is gone
-// (ENOENT) or EINTR - both benign; the task simply resumes without us.
-// TODO#N1(kimi)[major]: CONTINUE requires Linux 5.5 (SECCOMP_USER_NOTIF_FLAG_CONTINUE
-// exists only since 5.5; NOTIF_SEND itself is 5.0), although seccomp mode claims
-// kernel >= 5.0 support (see AGENTS.md). On 5.0-5.4 (e.g. the Ubuntu 20.04 GA
-// 5.4 kernel) this response fails with EINVAL; callers ignore false, leaving
-// the notified target task blocked in bind()/listen() (the filter is
-// irremovable), so port detection times out against a healthy target with no
-// hint about the real cause. Fix: feature-check at startup and fall back to
-// procfs (or correct the documented minimum kernel to 5.5).
-bool notif_send_continue(int fd, const struct seccomp_notif& n) {
+// Outcome of answering a notification with CONTINUE.
+enum class NotifContinue {
+    Answered,      // the response was accepted; the syscall runs normally
+    TaskGone,      // ENOENT/EINTR: the task died or its syscall was interrupted
+                   // (benign; it resumes without us)
+    KernelTooOld,  // EINVAL: this kernel does not know
+                   // SECCOMP_USER_NOTIF_FLAG_CONTINUE (added in Linux 5.5;
+                   // SECCOMP_IOCTL_NOTIF_SEND itself exists since 5.0). The
+                   // response always carries error=0/val=0, so EINVAL can only
+                   // mean the flag is unknown. The notified task stays blocked
+                   // in bind()/listen() (the filter is irremovable), so seccomp
+                   // port detection cannot work on such a kernel: notif_port()
+                   // turns this into DetectError::Kind::KernelTooOld instead of
+                   // waiting out the timeout.
+};
+
+// Answers a received notification with CONTINUE.
+NotifContinue notif_send_continue(int fd, const struct seccomp_notif& n) {
     struct seccomp_notif_resp resp = notif_buffers().cont;
     resp.id = n.id;
-    if (ioctl(fd, SECCOMP_IOCTL_NOTIF_SEND, &resp) == 0) return true;
-    return errno == ENOENT || errno == EINTR;
+    if (ioctl(fd, SECCOMP_IOCTL_NOTIF_SEND, &resp) == 0) return NotifContinue::Answered;
+    if (errno == EINVAL) return NotifContinue::KernelTooOld;
+    return NotifContinue::TaskGone;
 }
 
 // Extracts the port from the sockaddr of a notified bind(). The pointer lives
@@ -332,6 +346,36 @@ bool notif_bind_port(const struct seccomp_notif& n, int* port_out) {
         return true;
     }
     return false;  // other families are not TCP servers we care about
+}
+
+// Resolves the thread-group id (tgid, i.e. the process) of a notifying tid.
+// n.pid is a TID: bind() and listen() may be issued by different threads of
+// one process, so the fd map must be keyed by the fd-table owner (tgid), never
+// by the tid. The notified task is blocked inside its bind()/listen() syscall
+// while the notification is pending, so /proc/<tid>/status exists for the
+// whole read; it is world-readable (unlike /proc/<tid>/fd), so targets that
+// dropped privileges still resolve. Returns -1 when the file cannot be read
+// (e.g. the task was SIGKILLed in the race): the caller then skips the entry,
+// which fails safe exactly like a missed detection.
+pid_t notif_tgid(pid_t tid) {
+    std::ifstream file("/proc/" + std::to_string(tid) + "/status");
+    if (!file.is_open()) return -1;
+    std::string line;
+    while (std::getline(file, line)) {
+        if (line.rfind("Tgid:", 0) != 0) continue;
+        std::istringstream iss(line.substr(5));
+        int tgid = -1;
+        if (iss >> tgid && tgid > 0) return static_cast<pid_t>(tgid);
+        return -1;
+    }
+    return -1;
+}
+
+// Composite (tgid, fd) key: fd numbers are process-local, so the same number
+// in two processes of the target tree must not alias.
+uint64_t notif_fd_key(pid_t tgid, int fd) {
+    return (static_cast<uint64_t>(static_cast<uint32_t>(tgid)) << 32) |
+           static_cast<uint64_t>(static_cast<uint32_t>(fd));
 }
 
 // True while any /proc/net/tcp{,6} entry shows the port in TCP_LISTEN. Used to
@@ -368,22 +412,19 @@ DetectResult notif_port(int notif_fd, pid_t target_pid, int target_port, uint64_
         return DetectError{DetectError::Kind::UnknownMethod, 0, 0};
     }
 
-    // fd -> port, recorded from bind() notifications (listen() carries no
-    // address argument). A failed bind leaves a stale entry until the next
-    // confirmation failure clears it; readiness is only ever declared after a
-    // /proc confirmation, so this cannot false-positive.
-    // TODO#N3(kimi)[major]: fd numbers are process-local, but notifications from
-    // the whole target tree share this fd-only map. A forked child that closes
-    // the inherited listener fd, opens its own socket on the reused number and
-    // binds a different port overwrites the entry before the parent's listen()
-    // arrives; the lookup then misses the configured port and detection times
-    // out against a healthy target (fails safe). Threads alone cannot trigger
-    // this (one shared fd table per process), and the fix must NOT key by the
-    // notifying tid (n.pid is a TID: bind and listen may come from different
-    // threads of one process) but by the fd-table owner: record (tgid, fd) ->
-    // port, resolving tgid from the tid via /proc/<tid>/status, or verify the
-    // socket inode via readlink(/proc/<tid>/fd/<fd>) at bind and listen.
-    std::unordered_map<int, int> bound_ports;
+    // (tgid, fd) -> port, recorded from bind() notifications (listen() carries
+    // no address argument). fd numbers are process-local, so the key includes
+    // the fd-table owner (tgid, resolved from the notifying tid): a forked
+    // child that closes the inherited listener fd, reuses the number for its
+    // own socket and binds a different port gets a separate entry instead of
+    // overwriting the parent's, while threads of one process still share a key
+    // (bind and listen may come from different threads). A failed bind leaves
+    // a stale entry until the next confirmation failure clears it; readiness
+    // is only ever declared after a /proc confirmation, so this cannot
+    // false-positive. Residual gap: a bind in one process followed by a
+    // listen() on the inherited fd from a forked child does not match across
+    // tgids (exotic; fails safe with a detection timeout).
+    std::unordered_map<uint64_t, int> bound_ports;
     std::vector<unsigned char> buf(nb.req_size);
     const uint64_t start = utils::get_time_ms();
     int wait_status = 0;
@@ -431,31 +472,43 @@ DetectResult notif_port(int notif_fd, pid_t target_pid, int target_port, uint64_
         }
 
         const int fd = static_cast<int>(n->data.args[0]);
+        const pid_t tgid = notif_tgid(static_cast<pid_t>(n->pid));
+        const uint64_t fd_key = notif_fd_key(tgid, fd);
         bool listen_on_configured_fd = false;
         if (n->data.nr == __NR_bind) {
             int port = -1;
             if (notif_bind_port(*n, &port)) {
                 if (port == 0) {
                     PROXY_LOG_WARN("target requested ephemeral port (0), skipping...");
-                } else {
-                    bound_ports[fd] = port;
-                    PROXY_LOG_DEBUG("Detected bind on port {} (fd {}, tid {})",
+                } else if (tgid < 0) {
+                    PROXY_LOG_DEBUG("bind on port {} (fd {}, tid {}) not recorded: "
+                                    "cannot resolve the notifying task's tgid",
                                     port, fd, static_cast<int>(n->pid));
+                } else {
+                    bound_ports[fd_key] = port;
+                    PROXY_LOG_DEBUG("Detected bind on port {} (fd {}, tid {}, tgid {})",
+                                    port, fd, static_cast<int>(n->pid), static_cast<int>(tgid));
                 }
             } else {
                 PROXY_LOG_DEBUG("bind notification on fd {} without a readable "
                                 "IPv4/IPv6 sockaddr (tid {})", fd, static_cast<int>(n->pid));
             }
         } else if (n->data.nr == __NR_listen) {
-            PROXY_LOG_DEBUG("Detected listen on fd {} (tid {})", fd, static_cast<int>(n->pid));
-            auto it = bound_ports.find(fd);
+            PROXY_LOG_DEBUG("Detected listen on fd {} (tid {}, tgid {})",
+                            fd, static_cast<int>(n->pid), static_cast<int>(tgid));
+            auto it = bound_ports.find(fd_key);
             if (it != bound_ports.end() && it->second == target_port) {
                 listen_on_configured_fd = true;
             }
         }
 
         // Always answer: the notified task sleeps in the kernel until we do.
-        notif_send_continue(notif_fd, *n);
+        // EINVAL means this kernel lacks SECCOMP_USER_NOTIF_FLAG_CONTINUE
+        // (< 5.5): seccomp detection cannot work, so fail fast with the real
+        // cause instead of waiting out the timeout against a wedged target.
+        if (notif_send_continue(notif_fd, *n) == NotifContinue::KernelTooOld) {
+            return DetectError{DetectError::Kind::KernelTooOld, 0, 0};
+        }
 
         if (listen_on_configured_fd) {
             // Confirm the (now resumed) bind()/listen() reached the socket
@@ -475,7 +528,7 @@ DetectResult notif_port(int notif_fd, pid_t target_pid, int target_port, uint64_
             PROXY_LOG_WARN("listen() on port {} was notified but not confirmed in /proc "
                            "(bind/listen may have failed, e.g. EADDRINUSE); continuing to wait",
                            target_port);
-            bound_ports.erase(fd);  // let a re-bind of the same fd re-arm detection
+            bound_ports.erase(fd_key);  // let a re-bind of the same fd re-arm detection
         }
     }
 
@@ -513,11 +566,13 @@ void pump_notif_listener() {
 
         // Steady state: the port is already known, every bind()/listen() the
         // target (or a worker/thread under the inherited filter) issues is
-        // simply released to run normally.
-        const char* what = (n->data.nr == __NR_bind) ? "bind" :
+        // simply released to run normally. The pump is only registered after
+        // successful detection, which proves CONTINUE works on this kernel, so
+        // KernelTooOld is unreachable here.
+        [[maybe_unused]] const char* what = (n->data.nr == __NR_bind) ? "bind" :
                            (n->data.nr == __NR_listen) ? "listen" : "traced syscall";
         PROXY_LOG_DEBUG("notif pump: released {} from tid {}", what, static_cast<int>(n->pid));
-        notif_send_continue(fd, *n);
+        (void)notif_send_continue(fd, *n);
     }
 }
 

@@ -126,7 +126,7 @@ are ignored helper-anchor fields (see Important details).
 ## Important details
 - Port detection must confirm the *configured* port, not just any `bind()`; a bound port
   of 0 (ephemeral) logs a warning and is skipped. Seccomp mode is
-  `SECCOMP_RET_USER_NOTIF`-based (kernel >= 5.0; **no ptrace anywhere**): the
+  `SECCOMP_RET_USER_NOTIF`-based (kernel >= 5.5; **no ptrace anywhere**): the
   pre-exec child installs a bind/listen filter (`SECCOMP_SET_MODE_FILTER` +
   `SECCOMP_FILTER_FLAG_NEW_LISTENER`; x86_64 arch guard, foreign arch ->
   `KILL_PROCESS`), hands the listener fd back over a private socketpair via
@@ -137,10 +137,16 @@ are ignored helper-anchor fields (see Important details).
   real host syscalls with faithful fd/sockaddr values) are fully covered.
   Readiness = a `listen` notification on an fd recorded from a `bind`
   notification for the configured port (`sockaddr` read with
-  `process_vm_readv` on the notifying tid), plus a bounded (~100 ms)
+  `process_vm_readv` on the notifying tid; the map is keyed by `(tgid, fd)`,
+  with the tgid resolved from the notifying tid via `/proc/<tid>/status`, so
+  fd numbers reused by different processes of the target tree never alias),
+  plus a bounded (~100 ms)
   `/proc/net/tcp{,6}` LISTEN confirmation — notifications carry syscall ENTRY
   only, so there is no exit value and e.g. EADDRINUSE is invisible otherwise.
-  Every notification must be answered (`SECCOMP_USER_NOTIF_FLAG_CONTINUE`):
+  Every notification must be answered (`SECCOMP_USER_NOTIF_FLAG_CONTINUE`,
+  Linux >= 5.5; on an older kernel the first response fails with EINVAL and
+  detection returns `DetectError::Kind::KernelTooOld` immediately instead of
+  timing out against a wedged target):
   the filter is irremovable, so `network::pump_notif_listener()` (non-blocking
   drain; registered after detection via `network::set_notif_listener()`) runs
   from `exchange_once`, and every socket wait in `connect_target`,
@@ -405,7 +411,7 @@ are ignored helper-anchor fields (see Important details).
   spawn, so port detection, connect, timeouts, and probe all use the cmplog values.
 - Port detection uses **no ptrace at all**: it is `SECCOMP_RET_USER_NOTIF`-based
   (listener fd handed over `SCM_RIGHTS` pre-exec, polled by the proxy; readiness =
-  `listen` notification for the configured port's fd + bounded `/proc/net/tcp`
+  `listen` notification for the configured port's `(tgid, fd)` + bounded `/proc/net/tcp`
   confirmation, since notifications carry no syscall exit value). The
   inherited filter notifies for every thread and forked child; QEMU-mode targets
   work with `seccomp` (procfs remains the default there). `PDEATHSIG` (see above)

@@ -129,7 +129,9 @@ struct PortDetectionConfig {
     // "seccomp": the target runs with a SECCOMP_RET_USER_NOTIF filter on
     // bind()/listen() installed before its execve(); the proxy polls the
     // notification fd, which aggregates those syscalls from every thread and
-    // forked descendant (kernel >= 5.0).
+    // forked descendant (kernel >= 5.5: every notification is answered with
+    // SECCOMP_USER_NOTIF_FLAG_CONTINUE, which exists only since 5.5;
+    // SECCOMP_IOCTL_NOTIF_SEND itself is 5.0).
     // procfs only (silently ignored by seccomp, which verifies ownership by
     // construction): require the matched LISTEN socket's inode to be held by the
     // target or one of its descendants (/proc/<pid>/fd readlinks), so a stale or

@@ -21,30 +21,39 @@ constexpr int kRecvTimeoutMs = 500;
 
 } // namespace
 
-int make_listener(const std::string& host, uint16_t port, const char* label) {
-    const int fd = socket(AF_INET, SOCK_STREAM, 0);
-    if (fd < 0) {
-        fatal(std::string(label) + " socket: " + std::strerror(errno));
-    }
+void bind_socket(int fd, const std::string& host, uint16_t port, const char* label) {
     const int one = 1;
     setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &one, sizeof(one));
     sockaddr_in addr{};
     addr.sin_family = AF_INET;
     addr.sin_port = htons(port);
     if (inet_pton(AF_INET, host.c_str(), &addr.sin_addr) != 1) {
-        close(fd);
         fatal("invalid bind address '" + host + "'");
     }
     if (bind(fd, reinterpret_cast<const sockaddr*>(&addr), sizeof(addr)) < 0) {
-        const std::string reason = std::strerror(errno);
-        close(fd);
-        fatal(std::string(label) + " bind(" + host + ":" + std::to_string(port) + "): " + reason);
+        fatal(std::string(label) + " bind(" + host + ":" + std::to_string(port) + "): " +
+              std::strerror(errno));
     }
+}
+
+int make_bound_socket(const std::string& host, uint16_t port, const char* label) {
+    const int fd = socket(AF_INET, SOCK_STREAM, 0);
+    if (fd < 0) {
+        fatal(std::string(label) + " socket: " + std::strerror(errno));
+    }
+    bind_socket(fd, host, port, label);
+    return fd;
+}
+
+void listen_on(int fd, const char* label) {
     if (listen(fd, kListenBacklog) < 0) {
-        const std::string reason = std::strerror(errno);
-        close(fd);
-        fatal(std::string(label) + " listen: " + reason);
+        fatal(std::string(label) + " listen: " + std::strerror(errno));
     }
+}
+
+int make_listener(const std::string& host, uint16_t port, const char* label) {
+    const int fd = make_bound_socket(host, port, label);
+    listen_on(fd, label);
     return fd;
 }
 

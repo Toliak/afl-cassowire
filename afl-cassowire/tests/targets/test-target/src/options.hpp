@@ -16,6 +16,7 @@ struct Options {
     bool bind_ephemeral_first = false;
     bool bind_extra_port = false;
     bool bind_extra_after = false;
+    bool fork_bind_collision = false;
     bool ignore_sigterm = false;
     bool keep_alive = false;
     bool with_crash = false;

@@ -22,6 +22,7 @@ namespace network {
             TargetDied,    ///< target exited or was signalled during startup (wait_status holds the waitpid status)
             WaitpidFailed, ///< waitpid() failed (sys_errno holds errno)
             UnknownMethod, ///< port_detection.primary is not a known method
+            KernelTooOld,  ///< seccomp: SECCOMP_IOCTL_NOTIF_SEND rejected SECCOMP_USER_NOTIF_FLAG_CONTINUE with EINVAL (kernel < 5.5); seccomp detection cannot work, use procfs
         };
 
         Kind kind;
@@ -46,13 +47,18 @@ namespace network {
      * passed back via SCM_RIGHTS). Notifications arrive for bind()/listen()
      * issued by ANY thread or forked descendant of the target tree (the filter
      * is inherited; no ptrace is involved), including a QEMU guest's workers.
-     * A bind notification records fd -> port (sockaddr read with
-     * process_vm_readv on the notifying tid); a listen notification on an fd
-     * bound to the configured port triggers a bounded (~100 ms) /proc/net/tcp
+     * A bind notification records (tgid, fd) -> port (sockaddr read with
+     * process_vm_readv on the notifying tid; tgid resolved from the tid via
+     * /proc/<tid>/status, so fd numbers reused by different processes of the
+     * target tree never alias); a listen notification on an fd bound to the
+     * configured port triggers a bounded (~100 ms) /proc/net/tcp
      * confirmation scan, because user notifications carry syscall ENTRY only
      * and have no exit value to prove success. Every pending notification is
      * answered with CONTINUE before returning, and the pump below keeps the
-     * (irremovable) filter usable for the target's whole life.
+     * (irremovable) filter usable for the target's whole life. CONTINUE
+     * requires Linux >= 5.5; on an older kernel the first response fails with
+     * EINVAL and detection returns DetectError::Kind::KernelTooOld instead of
+     * waiting out the timeout against a wedged target.
      *
      * The procfs method polls /proc/net/tcp{,6} for a LISTEN entry on the
      * configured port and additionally (port_detection.verify_ownership, default

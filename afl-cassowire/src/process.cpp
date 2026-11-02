@@ -36,7 +36,9 @@ extern char** environ;
 
 namespace process {
 
-// Seccomp BPF filter for user-notification port detection (kernel >= 5.0).
+// Seccomp BPF filter for user-notification port detection (kernel >= 5.5:
+// SECCOMP_USER_NOTIF_FLAG_CONTINUE, the mandatory response for every
+// notification, exists only since 5.5; SECCOMP_IOCTL_NOTIF_SEND itself is 5.0).
 // bind() and listen() are reported to the proxy over a SECCOMP_RET_USER_NOTIF
 // listener fd (SECCOMP_FILTER_FLAG_NEW_LISTENER); everything else is allowed.
 // The filter is installed in the child between fork() and execve() and is

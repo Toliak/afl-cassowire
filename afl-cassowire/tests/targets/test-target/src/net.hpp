@@ -19,6 +19,26 @@ namespace testtarget {
 int make_listener(const std::string& host, uint16_t port, const char* label);
 
 /**
+ * @brief Creates a TCP socket bound to @p host:@p port without listening.
+ *
+ * SO_REUSEADDR is set; any failure is fatal(), labeled with @p label.
+ */
+int make_bound_socket(const std::string& host, uint16_t port, const char* label);
+
+/**
+ * @brief Binds an existing socket fd to @p host:@p port (SO_REUSEADDR set).
+ *
+ * Used by --fork-bind-collision to bind a socket that reuses a specific fd
+ * number. Any failure is fatal(), labeled with @p label.
+ */
+void bind_socket(int fd, const std::string& host, uint16_t port, const char* label);
+
+/**
+ * @brief Starts listening on an already bound socket fd; fatal() on failure.
+ */
+void listen_on(int fd, const char* label);
+
+/**
  * @brief Arms the fixed recv timeout on an accepted connection fd.
  */
 void set_recv_timeout(int fd);

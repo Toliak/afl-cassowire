@@ -253,13 +253,18 @@ def run_proxy_mode(out_dir: Path, config_path: Path, corpus: str, *,
 
 
 def seccomp_supported() -> bool:
-    """SECCOMP_RET_USER_NOTIF port detection needs kernel >= 5.0."""
-    release = platform.release()
+    """SECCOMP_RET_USER_NOTIF port detection needs kernel >= 5.5.
+
+    Every notification is answered with SECCOMP_USER_NOTIF_FLAG_CONTINUE,
+    which exists only since Linux 5.5 (SECCOMP_IOCTL_NOTIF_SEND itself is 5.0).
+    """
+    parts = platform.release().split(".")
     try:
-        major = int(release.split(".")[0])
-    except ValueError:
+        major = int(parts[0])
+        minor = int(parts[1])
+    except (IndexError, ValueError):
         return False
-    return major >= 5
+    return (major, minor) >= (5, 5)
 
 
 def skip_unless_shm_available(need: int = CMP_MAP_SIZE) -> None:

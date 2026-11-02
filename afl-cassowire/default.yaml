@@ -145,7 +145,11 @@ port_detection:
                                # installed before its execve(); the proxy polls the
                                # notification fd, which aggregates those syscalls
                                # from every thread and forked descendant (works
-                               # under QEMU-mode targets too; kernel >= 5.0).
+                               # under QEMU-mode targets too; kernel >= 5.5:
+                               # every notification is answered with
+                               # SECCOMP_USER_NOTIF_FLAG_CONTINUE, which exists
+                               # only since 5.5; older kernels fail detection
+                               # fast with a clear error).
                                # Readiness is confirmed with a bounded /proc scan.
   verify_ownership: true       # procfs only: the matched LISTEN entry in /proc/net/tcp{,6}
                                # must be attributable to the target - the socket inode

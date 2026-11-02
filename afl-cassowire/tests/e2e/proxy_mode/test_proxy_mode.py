@@ -280,7 +280,7 @@ def test_cache_lottery_without_crash_stays_safe(tmp_path: Path) -> None:
 
 def test_seccomp_port_detection(proxy_runner: Callable[..., ProxyRun]) -> None:
     if not seccomp_supported():
-        pytest.skip("SECCOMP_RET_USER_NOTIF port detection needs kernel >= 5.0")
+        pytest.skip("SECCOMP_RET_USER_NOTIF port detection needs kernel >= 5.5")
     run = proxy_runner("calc", "calc/set1", primary="seccomp")
     _assert_clean_run(run)
 
