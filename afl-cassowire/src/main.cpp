@@ -248,7 +248,6 @@ SequenceBuild build_sequence(const SequenceConfig& sc, const uint8_t* input, siz
         build.ranges.emplace_back(start, session.size());
     };
 
-    bool found_delimiter = false;
     size_t msg_start = 0;
     size_t scan = 0;
     while (!delim.empty() && scan + delim.size() <= input_len) {
@@ -256,7 +255,6 @@ SequenceBuild build_sequence(const SequenceConfig& sc, const uint8_t* input, siz
             ++scan;
             continue;
         }
-        found_delimiter = true;
         const size_t match_end = scan + delim.size();
         add_message(msg_start, sc.keep_delimiter ? match_end : scan);
         msg_start = match_end;
@@ -264,17 +262,6 @@ SequenceBuild build_sequence(const SequenceConfig& sc, const uint8_t* input, siz
     }
     if (msg_start < input_len) {
         add_message(msg_start, input_len);
-    }
-    // TODO#M1(claude,kimi)[major]: an input without any delimiter is sent TWICE.
-    // With no match, msg_start stays 0, so the branch above already adds
-    // [0, input_len); this branch adds the same range again. The target gets
-    // the testcase twice on one connection, and messages_total/discovered is
-    // 2 instead of 1. Most AFL mutations destroy the delimiter, so this hits
-    // a large share of executions. The documented contract is "no delimiter =
-    // one message". Fix: delete this block (the trailing-bytes branch already
-    // covers it).
-    if (!found_delimiter && input_len > 0) {
-        add_message(0, input_len);
     }
     return build;
 }
