@@ -1,0 +1,116 @@
+--- a/include/afl-fuzz.h
++++ b/include/afl-fuzz.h
+@@ -783,10 +783,12 @@
+   u8 *stab_inter;                       /* Gate scratch: reproduced mask    */
+   u64 stab_admitted,                    /* Queue entries admitted by gate   */
+       stab_rejected,                    /* Gate candidates rejected         */
+-      stab_gate_execs;                  /* Extra executions spent in gate   */
+-  u8  stab_admit_repro;                 /* AFL_STAB_ADMIT=repro enabled     */
+-  u32 stab_repro_runs;                  /* Re-executions per gate candidate */
+-  u32 stab_only_items;                  /* Queue entries added by gate only */
++      stab_gate_execs,                  /* Extra executions spent in gate   */
++      stab_prob_skipped;                /* Candidates skipped by probability*/
++  u8     stab_admit_repro;              /* AFL_STAB_ADMIT=repro enabled     */
++  double stab_admit_m;                  /* AFL_STAB_ADMIT_M max probability */
++  u32    stab_repro_runs;               /* Re-executions per gate candidate */
++  u32    stab_only_items;               /* Queue entries added by gate only */
+ 
+ #define N_FUZZ_SIZE (1 << 21)
+   u32   *n_fuzz;
+--- a/include/envs.h
++++ b/include/envs.h
+@@ -117,7 +117,7 @@
+     "AFL_NO_CFG_FUZZING",  // afl.rs rust crate option
+     "AFL_NO_CRASH_README", "AFL_NO_FORKSRV", "AFL_NO_UI", "AFL_NO_PYTHON",
+     "AFL_NO_STARTUP_CALIBRATION", "AFL_NO_WARN_INSTABILITY",
+-    "AFL_STAB_ADMIT", "AFL_STAB_REPRO_RUNS",
++    "AFL_STAB_ADMIT", "AFL_STAB_REPRO_RUNS", "AFL_STAB_ADMIT_M",
+     "AFL_UNTRACER_FILE", "AFL_LLVM_USE_TRACE_PC", "AFL_MAP_SIZE", "AFL_MAPSIZE",
+     "AFL_MAX_DET_EXTRAS",
+     "AFL_NO_X86",  // not really an env but we dont want to warn on it
+--- a/src/afl-fuzz-bitmap.c
++++ b/src/afl-fuzz-bitmap.c
+@@ -121,6 +121,32 @@
+ 
+   if (!n) { return 0; }
+ 
++  /* Probabilistic admission: the more stable the run already is, the less
++     often we spend gate executions on unstable-only candidates. */
++  if (afl->stab_admit_m < 1.0) {
++
++    double stability = afl->last_stability / 100.0;
++    if (stability < 0.0) { stability = 0.0; }
++    if (stability > 1.0) { stability = 1.0; }
++
++    double probability = afl->stab_admit_m * (1.0 - stability);
++    if (probability <= 0.0) {
++
++      ++afl->stab_prob_skipped;
++      return 0;
++
++    }
++
++    if (probability < 1.0 &&
++        rand_below(afl, 1000000) >= (u32)(probability * 1000000.0)) {
++
++      ++afl->stab_prob_skipped;
++      return 0;
++
++    }
++
++  }
++
+   memcpy(afl->stab_inter, afl->stab_cand, afl->fsrv.map_size);
+ 
+   for (u32 r = 0; r < afl->stab_repro_runs; ++r) {
+--- a/src/afl-fuzz-state.c
++++ b/src/afl-fuzz-state.c
+@@ -156,6 +156,7 @@
+   afl->stab_cand = ck_alloc(map_size);
+   afl->stab_inter = ck_alloc(map_size);
+   afl->stab_repro_runs = 2;
++  afl->stab_admit_m = 0.8;
+   afl->top_rated = ck_alloc(map_size * sizeof(void *));
+   afl->clean_trace = ck_alloc(map_size);
+   afl->clean_trace_custom = ck_alloc(map_size);
+@@ -358,6 +359,20 @@
+ 
+             }
+ 
++          } else if (!strncmp(env, "AFL_STAB_ADMIT_M",
++
++                              afl_environment_variable_len)) {
++
++            u8 *m = (u8 *)get_afl_env("AFL_STAB_ADMIT_M");
++            if (m) {
++
++              double v = atof((char *)m);
++              if (v < 0.0) { v = 0.0; }
++              if (v > 1.0) { v = 1.0; }
++              afl->stab_admit_m = v;
++
++            }
++
+           } else if (!strncmp(env, "AFL_TRY_AFFINITY",
+ 
+                               afl_environment_variable_len)) {
+--- a/src/afl-fuzz-stats.c
++++ b/src/afl-fuzz-stats.c
+@@ -512,6 +512,7 @@
+       "stab_admitted     : %llu\n"
+       "stab_rejected     : %llu\n"
+       "stab_gate_execs   : %llu\n"
++      "stab_prob_skipped : %llu\n"
+       "havoc_expansion   : %u\n"
+       "auto_dict_entries : %u\n"
+       "testcache_size    : %llu\n"
+@@ -558,7 +559,8 @@
+       -1,
+ #endif
+       t_bytes, afl->fsrv.real_map_size, afl->var_byte_count, afl->stab_admitted,
+-      afl->stab_rejected, afl->stab_gate_execs, afl->expand_havoc,
++      afl->stab_rejected, afl->stab_gate_execs, afl->stab_prob_skipped,
++      afl->expand_havoc,
+       afl->a_extras_cnt, afl->q_testcase_cache_size,
+       afl->q_testcase_cache_count, afl->q_testcase_evictions,
+       afl->q_testcase_hits, afl->q_testcase_misses, afl->use_banner,
