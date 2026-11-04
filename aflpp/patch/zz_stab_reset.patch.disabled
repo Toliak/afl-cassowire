@@ -1,0 +1,196 @@
+--- a/include/afl-fuzz.h
++++ b/include/afl-fuzz.h
+@@ -779,12 +779,17 @@
+   u8 *virgin_unstable;                  /* Edges retired as variable that can
+                                            still be claimed through the
+                                            instability repro gate           */
++  u32 virgin_unstable_count;            /* Set bits in virgin_unstable       */
+   u8 *stab_cand;                        /* Gate scratch: candidate mask     */
+   u8 *stab_inter;                       /* Gate scratch: reproduced mask    */
+   u64 stab_admitted,                    /* Queue entries admitted by gate   */
+       stab_rejected,                    /* Gate candidates rejected         */
+       stab_gate_execs,                  /* Extra executions spent in gate   */
+-      stab_prob_skipped;                /* Candidates skipped by probability*/
++      stab_prob_skipped,                /* Candidates skipped by probability*/
++      stab_resets,                      /* Full stability resets performed  */
++      stab_reset_edges;                 /* Edges un-retired by the resets   */
++  u64 stab_reset_execs,                 /* Full reset interval (executions) */
++      stab_last_reset_execs;            /* Execs at the last full reset     */
+   u8     stab_admit_repro;              /* AFL_STAB_ADMIT=repro enabled     */
+   double stab_admit_m;                  /* AFL_STAB_ADMIT_M max probability */
+   u32    stab_repro_runs;               /* Re-executions per gate candidate */
+--- a/include/envs.h
++++ b/include/envs.h
+@@ -118,6 +118,7 @@
+     "AFL_NO_CRASH_README", "AFL_NO_FORKSRV", "AFL_NO_UI", "AFL_NO_PYTHON",
+     "AFL_NO_STARTUP_CALIBRATION", "AFL_NO_WARN_INSTABILITY",
+     "AFL_STAB_ADMIT", "AFL_STAB_REPRO_RUNS", "AFL_STAB_ADMIT_M",
++    "AFL_STAB_RESET_EXECS",
+     "AFL_UNTRACER_FILE", "AFL_LLVM_USE_TRACE_PC", "AFL_MAP_SIZE", "AFL_MAPSIZE",
+     "AFL_MAX_DET_EXTRAS",
+     "AFL_NO_X86",  // not really an env but we dont want to warn on it
+--- a/src/afl-fuzz-bitmap.c
++++ b/src/afl-fuzz-bitmap.c
+@@ -194,7 +194,12 @@
+ 
+   for (i = 0; i < afl->fsrv.map_size; ++i) {
+ 
+-    if (afl->stab_inter[i]) { afl->virgin_unstable[i] = 0; }
++    if (afl->stab_inter[i] && afl->virgin_unstable[i]) {
++
++      afl->virgin_unstable[i] = 0;
++      if (afl->virgin_unstable_count) { --afl->virgin_unstable_count; }
++
++    }
+ 
+   }
+ 
+@@ -1036,11 +1041,67 @@
+ 
+ #endif
+ 
++/* Naive full stability reset (AFL_STAB_RESET_EXECS): every N executions,
++   forget all retired variable edges, make them discoverable again, and put
++   them back into the instability gate channel. This is deliberately blunt:
++   it exists to measure whether periodic forgetting recovers transiently
++   unstable coverage or merely re-admits structural noise. */
++static void stab_maybe_reset(afl_state_t *afl) {
++
++  if (unlikely(!afl->stab_reset_execs)) { return; }
++  if (afl->fsrv.total_execs - afl->stab_last_reset_execs <
++      afl->stab_reset_execs) {
++
++    return;
++
++  }
++
++  afl->stab_last_reset_execs = afl->fsrv.total_execs;
++
++  u32 i, edges = 0;
++  for (i = 0; i < afl->fsrv.map_size; ++i) {
++
++    if (likely(!afl->var_bytes[i])) { continue; }
++
++    afl->var_bytes[i] = 0;
++    if (afl->var_bytes_shm) { afl->var_bytes_shm[i] = 0; }
++    afl->virgin_bits[i] = 0xff;
++    afl->virgin_reclaim[i] = 0;
++
++    if (afl->stab_admit_repro && !afl->virgin_unstable[i]) {
++
++      afl->virgin_unstable[i] = 0xff;
++      ++afl->virgin_unstable_count;
++
++    }
++
++    ++edges;
++
++  }
++
++  if (edges) {
++
++    afl->var_byte_count = count_bytes(afl, afl->var_bytes);
++    ++afl->stab_resets;
++    afl->stab_reset_edges += edges;
++    if (unlikely(afl->debug)) {
++
++      DEBUGF("stability reset at %llu execs: %u edges un-retired\n",
++             afl->fsrv.total_execs, edges);
++
++    }
++
++  }
++
++}
++
+ u8 __attribute__((hot)) save_if_interesting(afl_state_t *afl, void *mem,
+                                             u32 len, u8 fault) {
+ 
+   if (unlikely(len == 0)) { return 0; }
+ 
++  stab_maybe_reset(afl);
++
+   if (unlikely(fault == FSRV_RUN_TMOUT && afl->afl_env.afl_ignore_timeouts)) {
+ 
+     if (unlikely(afl->schedule >= FAST && afl->schedule <= RARE)) {
+@@ -1239,8 +1300,10 @@
+       if (san_fault == FSRV_RUN_OK) {
+ 
+         /* Instability-aware admission: no new stable coverage, but the input
+-           reproduced edges that calibration retired as variable. */
+-        if (unlikely(afl->stab_admit_repro && afl->var_byte_count) &&
++           reproduced edges that calibration retired as variable. Use the
++           gate-channel count rather than var_byte_count so a full reset does
++           not disable the gate. */
++        if (unlikely(afl->stab_admit_repro && afl->virgin_unstable_count) &&
+             stab_repro_admit(afl, mem, len)) {
+ 
+           new_bits |= NEW_BITS_STAB_MASK;
+--- a/src/afl-fuzz-run.c
++++ b/src/afl-fuzz-run.c
+@@ -543,9 +543,10 @@
+             /* Keep a second, presence-only channel for the edge: it may still
+                be admitted into the queue if a later execution reproduces it
+                (AFL_STAB_ADMIT=repro). */
+-            if (unlikely(afl->stab_admit_repro)) {
++            if (unlikely(afl->stab_admit_repro && !afl->virgin_unstable[i])) {
+ 
+               afl->virgin_unstable[i] = 0xff;
++              ++afl->virgin_unstable_count;
+ 
+             }
+ 
+--- a/src/afl-fuzz-state.c
++++ b/src/afl-fuzz-state.c
+@@ -153,10 +153,13 @@
+   afl->var_bytes_shm_id = -1;
+   afl_var_bytes_shm_create(afl, map_size);
+   afl->virgin_unstable = ck_alloc(map_size);
++  afl->virgin_unstable_count = 0;
+   afl->stab_cand = ck_alloc(map_size);
+   afl->stab_inter = ck_alloc(map_size);
+   afl->stab_repro_runs = 2;
+   afl->stab_admit_m = 0.8;
++  afl->stab_reset_execs = 0;
++  afl->stab_last_reset_execs = 0;
+   afl->top_rated = ck_alloc(map_size * sizeof(void *));
+   afl->clean_trace = ck_alloc(map_size);
+   afl->clean_trace_custom = ck_alloc(map_size);
+@@ -373,6 +376,17 @@
+ 
+             }
+ 
++          } else if (!strncmp(env, "AFL_STAB_RESET_EXECS",
++
++                              afl_environment_variable_len)) {
++
++            u8 *r = (u8 *)get_afl_env("AFL_STAB_RESET_EXECS");
++            if (r) {
++
++              afl->stab_reset_execs = strtoull((char *)r, NULL, 10);
++
++            }
++
+           } else if (!strncmp(env, "AFL_TRY_AFFINITY",
+ 
+                               afl_environment_variable_len)) {
+--- a/src/afl-fuzz-stats.c
++++ b/src/afl-fuzz-stats.c
+@@ -513,6 +513,9 @@
+       "stab_rejected     : %llu\n"
+       "stab_gate_execs   : %llu\n"
+       "stab_prob_skipped : %llu\n"
++      "stab_resets       : %llu\n"
++      "stab_reset_edges  : %llu\n"
++      "virgin_unstable   : %u\n"
+       "havoc_expansion   : %u\n"
+       "auto_dict_entries : %u\n"
+       "testcache_size    : %llu\n"
+@@ -560,6 +563,7 @@
+ #endif
+       t_bytes, afl->fsrv.real_map_size, afl->var_byte_count, afl->stab_admitted,
+       afl->stab_rejected, afl->stab_gate_execs, afl->stab_prob_skipped,
++      afl->stab_resets, afl->stab_reset_edges, afl->virgin_unstable_count,
+       afl->expand_havoc,
+       afl->a_extras_cnt, afl->q_testcase_cache_size,
+       afl->q_testcase_cache_count, afl->q_testcase_evictions,

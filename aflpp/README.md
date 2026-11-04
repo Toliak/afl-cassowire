@@ -13,6 +13,8 @@ support the **afl-cassowire** project (a proxy/fork-server bridge for fuzzing ne
 | `force_loc.patch` | Required for the `afl-cassowire` binary. Adds `AFL_CASSOWIRE_LLVM_ONLY_FSRV` to disable LLVM PC-guard coverage writes (removing coverage noise) while preserving fork-server/persistence mode, and `AFL_CASSOWIRE_FORCE_FINAL_LOC` to force the `afl_area_map` size via `__afl_final_loc` so the map can be passed through to the target unchanged. |
 | `qemu_bridge_cmplog_log.patch` | Adds opt-in debug logging to the QEMU bridge cmplog implementation. Setting `AFL_QEMU_CMPLOG_DEBUG` prints cmplog map attach info, RTN enablement, and the first INS/RTN comparison operands per map slot. |
 | `instability_admission.patch` | Experimental instability-aware coverage admission (PoC). Keeps a second, presence-only `virgin_unstable` channel for edges that calibration retires as variable. With `AFL_STAB_ADMIT=repro`, an execution that finds no new stable coverage is re-run `AFL_STAB_REPRO_RUNS` times (default 2); edges reproducing on every run are claimed and the input is queued with `+stab`. Such entries are marked `stab_only`, excluded from `top_rated`/favoured scoring, and do not advance the coverage find clock. Adds `stab_admitted`, `stab_rejected`, `stab_gate_execs` to `fuzzer_stats`. Off by default; `virgin_unstable` is not yet persisted across resume. |
+| `zz_stab_prob.patch` | Adds probabilistic gate admission (`AFL_STAB_ADMIT_M`, default 0.8): once a candidate is found, it is admitted with probability `M * (1 - stability)`. Adds `stab_prob_skipped` to `fuzzer_stats`. |
+| `zz_stab_reset.patch` | Adds a naive full stability reset (`AFL_STAB_RESET_EXECS`, default 0 = off): every N executions all `var_bytes` are cleared, `virgin_bits` is re-armed, and the edges are put back into the gate channel. Adds `stab_resets`, `stab_reset_edges`, `virgin_unstable` to `fuzzer_stats`. |
 | `debug.patch.disabled` | Disabled. Instruments `updateCoverageBitmap` to `fprintf` every PC-guard index to stderr; very noisy, kept for reference only. |
 
 New env vars introduced by the patches:
@@ -23,6 +25,10 @@ New env vars introduced by the patches:
 - `AFL_STAB_ADMIT` — set to `repro` (or `1`/`on`) to enable instability-aware
   coverage admission (see `instability_admission.patch`). Default: disabled.
 - `AFL_STAB_REPRO_RUNS` — re-executions per admission candidate, 1-8 (default 2).
+- `AFL_STAB_ADMIT_M` — maximum probabilistic gate admission weight, 0.0-1.0
+  (default 0.8). The actual probability is `M * (1 - stability)`.
+- `AFL_STAB_RESET_EXECS` — naive full stability reset interval in executions
+  (default 0 = disabled).
 
 ## Usage
 
