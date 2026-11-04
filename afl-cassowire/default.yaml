@@ -214,5 +214,11 @@ sequence:
   max_messages: 64             # Hard cap per iteration; truncation logs a WARN.
   # message_prefix: ""         # Bytes prepended to every message (str or !!binary).
   # message_suffix: ""         # Bytes appended to every message (str or !!binary).
+  # escape: !!binary fQ==      # Optional single-byte escape marker (here '}'); omit to
+                               # disable. When set, a message may embed the delimiter:
+                               # `escape escape` decodes to a literal escape byte and
+                               # `escape delimiter` to a literal delimiter inside the
+                               # message (no split). Any other escape occurrence is passed
+                               # through verbatim. The byte must not occur in `delimiter`.
   # NOTE: payload.prefix/suffix cannot be combined with sequence.enabled; use the
   # message_* keys above instead.

@@ -380,6 +380,12 @@
         "message_suffix": {
           "$ref": "#/definitions/bytes_value",
           "description": "Bytes appended to every message after splitting (plain string or YAML !!binary bytes)."
+        },
+        "escape": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 1,
+          "description": "Optional single-byte escape marker (plain string or YAML !!binary bytes). Presence enables delimiter escaping: in the testcase `escape escape` decodes to a literal escape byte and `escape delimiter` to a literal delimiter inside a message (so it does not split); any other escape occurrence is passed through verbatim. The byte must not occur inside `delimiter` (enforced by the loader). Omit the key to disable escaping."
         }
       }
     },

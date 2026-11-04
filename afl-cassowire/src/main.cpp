@@ -229,6 +229,14 @@ struct SequenceBuild {
  * no delimiter at all is one message. Empty input yields zero messages.
  * At most sequence.max_messages messages are built; the rest are counted in
  * SequenceBuild::discovered so the caller can log the truncation.
+ *
+ * With sequence.escape set, the testcase can embed a literal delimiter inside
+ * a message: `escape escape` decodes to a literal escape byte and
+ * `escape delimiter` to a literal delimiter (which therefore does not split).
+ * Any other escape occurrence (including a lone escape at EOF) is passed
+ * through verbatim, so arbitrary fuzz input always decodes deterministically
+ * and never fails. The escape byte is guaranteed by the loader to be absent
+ * from the delimiter, so the encoding is unambiguous.
  */
 SequenceBuild build_sequence(const SequenceConfig& sc, const uint8_t* input, size_t input_len,
                              std::vector<uint8_t>& session) {
@@ -236,33 +244,60 @@ SequenceBuild build_sequence(const SequenceConfig& sc, const uint8_t* input, siz
     session.clear();
     const auto& delim = sc.delimiter;
     const size_t cap = static_cast<size_t>(sc.max_messages);
+    const bool escaping = !sc.escape.empty();
+    const uint8_t esc = escaping ? sc.escape[0] : 0;
 
-    auto add_message = [&](size_t begin, size_t end) {
-        if (end <= begin) return;  // empty message (e.g. stripped delimiter)
+    // Decoded bytes of the message currently being assembled. Escaping makes a
+    // message non-contiguous in the input, so it is built up byte by byte
+    // instead of being copied as one input range.
+    std::vector<uint8_t> msg;
+    msg.reserve(input_len);
+
+    auto flush = [&]() {
+        if (msg.empty()) return;  // empty message (e.g. stripped delimiter)
         ++build.discovered;
-        if (build.ranges.size() >= cap) return;
-        const size_t start = session.size();
-        session.insert(session.end(), sc.message_prefix.begin(), sc.message_prefix.end());
-        session.insert(session.end(), input + begin, input + end);
-        session.insert(session.end(), sc.message_suffix.begin(), sc.message_suffix.end());
-        build.ranges.emplace_back(start, session.size());
+        if (build.ranges.size() < cap) {
+            const size_t start = session.size();
+            session.insert(session.end(), sc.message_prefix.begin(), sc.message_prefix.end());
+            session.insert(session.end(), msg.begin(), msg.end());
+            session.insert(session.end(), sc.message_suffix.begin(), sc.message_suffix.end());
+            build.ranges.emplace_back(start, session.size());
+        }
+        msg.clear();
     };
 
-    size_t msg_start = 0;
     size_t scan = 0;
-    while (!delim.empty() && scan + delim.size() <= input_len) {
-        if (std::memcmp(input + scan, delim.data(), delim.size()) != 0) {
+    while (scan < input_len) {
+        // A raw (unescaped) delimiter terminates the current message.
+        if (!delim.empty() && scan + delim.size() <= input_len &&
+            std::memcmp(input + scan, delim.data(), delim.size()) == 0) {
+            if (sc.keep_delimiter) {
+                msg.insert(msg.end(), delim.begin(), delim.end());
+            }
+            flush();
+            scan += delim.size();
+            continue;
+        }
+        if (escaping && input[scan] == esc) {
+            if (scan + 1 < input_len && input[scan + 1] == esc) {
+                msg.push_back(esc);  // `escape escape` -> literal escape
+                scan += 2;
+                continue;
+            }
+            if (!delim.empty() && scan + 1 + delim.size() <= input_len &&
+                std::memcmp(input + scan + 1, delim.data(), delim.size()) == 0) {
+                msg.insert(msg.end(), delim.begin(), delim.end());  // literal delimiter
+                scan += 1 + delim.size();
+                continue;
+            }
+            msg.push_back(esc);  // lone/other escape: pass through verbatim
             ++scan;
             continue;
         }
-        const size_t match_end = scan + delim.size();
-        add_message(msg_start, sc.keep_delimiter ? match_end : scan);
-        msg_start = match_end;
-        scan = match_end;
+        msg.push_back(input[scan]);
+        ++scan;
     }
-    if (msg_start < input_len) {
-        add_message(msg_start, input_len);
-    }
+    flush();
     return build;
 }
 

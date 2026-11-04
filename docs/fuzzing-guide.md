@@ -97,11 +97,19 @@ The generated config is `data/cassowire.seq.yaml`; the knobs live in its
 - `initial_poll_us` — optional banner drain before the first message.
 - `final_poll_us` — drain after `shutdown(SHUT_WR)`.
 - `max_messages` — per-iteration cap; truncation logs a WARN.
+- `escape` — optional single-byte escape marker. When set, a message may embed
+  the delimiter: `escape escape` decodes to a literal escape byte and
+  `escape delimiter` to a literal delimiter inside the message (so it does not
+  split); any other escape occurrence is passed through verbatim. The byte must
+  not occur in `delimiter`. Omit the key to disable escaping (default).
 
 `payload.prefix/suffix` cannot be combined with sequence mode; use
 `sequence.message_prefix/message_suffix` instead. Because mutation is still
 byte-level, keep the dictionary (`_fuzz/dict/http-seq.dict`) close at hand and
-prefer `response_poll_us` low for throughput.
+prefer `response_poll_us` low for throughput. If a protocol's message body can
+legitimately contain the delimiter (e.g. a nested request in an HTTP body),
+enable `escape` and write the in-message delimiter as `escape delimiter` in the
+seeds; a synthetic "unique" delimiter is not needed.
 
 ### Probe coverage isolation
 

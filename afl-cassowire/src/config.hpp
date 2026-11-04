@@ -195,6 +195,13 @@ struct SequenceConfig {
     // Per-message wrapping applied to every message after splitting.
     std::vector<uint8_t> message_prefix;
     std::vector<uint8_t> message_suffix;
+    // Optional single-byte escape marker (empty = escaping disabled). When set,
+    // the testcase may express a literal delimiter inside a message by
+    // prefixing it with this byte (`escape escape` decodes to a literal escape,
+    // `escape delimiter` to a literal delimiter inside the message). A lone or
+    // otherwise unused escape byte is passed through verbatim. The byte must
+    // not occur inside `delimiter` (rejected by the loader).
+    std::vector<uint8_t> escape;
 };
 
 struct Config {

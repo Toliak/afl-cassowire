@@ -2,6 +2,7 @@
 
 #include "config.hpp"
 #include <yaml-cpp/yaml.h>
+#include <algorithm>
 #include <cstdlib>
 #include <fstream>
 #include <sstream>
@@ -370,7 +371,7 @@ ConfigError parse_sequence_section(const YAML::Node& node, SequenceConfig& out) 
     static const std::unordered_set<std::string> sequence_allowed = {
         "enabled", "delimiter", "keep_delimiter", "response_poll_us",
         "initial_poll_us", "final_poll_us", "max_messages",
-        "message_prefix", "message_suffix"};
+        "message_prefix", "message_suffix", "escape"};
     ConfigError err = check_unknown_keys(node, sequence_allowed, "sequence");
     if (!err.message.empty()) {
         return err;
@@ -393,6 +394,28 @@ ConfigError parse_sequence_section(const YAML::Node& node, SequenceConfig& out) 
                            "Missing or empty delimiter in sequence mode",
                            "non-empty string or !!binary bytes",
                            node["delimiter"] ? "empty" : "missing"};
+    }
+
+    // Optional single-byte escape marker. Presence enables delimiter escaping:
+    // `escape escape` decodes to a literal escape byte and `escape delimiter`
+    // to a literal delimiter inside a message. The byte must not occur in the
+    // delimiter, otherwise the encoding would be ambiguous.
+    if (node["escape"]) {
+        if (!read_bytes_value(node["escape"], out.escape)) {
+            return ConfigError{"sequence.escape", "Invalid type", "string or !!binary bytes",
+                               "not a string or binary"};
+        }
+        if (out.escape.size() != 1) {
+            return ConfigError{"sequence.escape", "Must be exactly one byte",
+                               "single-byte string or !!binary bytes",
+                               out.escape.empty() ? "empty" : std::to_string(out.escape.size()) + " bytes"};
+        }
+        if (std::find(out.delimiter.begin(), out.delimiter.end(), out.escape[0]) != out.delimiter.end()) {
+            return ConfigError{"sequence.escape",
+                               "Escape byte must not occur inside sequence.delimiter",
+                               "a byte absent from the delimiter",
+                               "byte occurs in the delimiter"};
+        }
     }
 
     if (node["keep_delimiter"]) {

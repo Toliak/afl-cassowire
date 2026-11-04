@@ -321,25 +321,28 @@ def test_failed_exchange_returns_nonzero(tmp_path: Path) -> None:
 
 
 def _sequence_config(tmp_path: Path, *, port: int, request_log: Path | None = None,
-                     primary: str = "procfs") -> Path:
+                     primary: str = "procfs", escape: bytes | None = None) -> Path:
     target = harness.test_target_bin()
     extra = ["--multi-request"]
     if request_log is not None:
         extra += ["--log-requests", str(request_log)]
+    sequence: dict[str, object] = {
+        "enabled": True,
+        "delimiter": b"\n",
+        "keep_delimiter": True,
+        "response_poll_us": 10000,
+        "initial_poll_us": 0,
+        "final_poll_us": 5000,
+        "max_messages": 16,
+    }
+    if escape is not None:
+        sequence["escape"] = escape
     return harness.write_config(
         tmp_path,
         target_args=[str(target), "calc", "--port", str(port), *extra],
         port=port,
         primary=primary,
-        sequence={
-            "enabled": True,
-            "delimiter": b"\n",
-            "keep_delimiter": True,
-            "response_poll_us": 10000,
-            "initial_poll_us": 0,
-            "final_poll_us": 5000,
-            "max_messages": 16,
-        },
+        sequence=sequence,
     )
 
 
@@ -376,6 +379,79 @@ def test_sequence_empty_input_sends_nothing(tmp_path: Path) -> None:
     assert "Sequence: sent 0/0 messages" in res.stdout, res.detail()
     assert "Pass 2 (Single Iteration) completed successfully." in res.stdout
     assert request_log.read_text() == ""
+
+
+def test_sequence_escape_embeds_delimiter(tmp_path: Path) -> None:
+    # `escape delimiter` decodes to a literal delimiter inside the message, so
+    # the two calc lines travel as ONE message (the target still frames them at
+    # '\n' and answers both).
+    port = harness.free_port()
+    request_log = tmp_path / "requests.log"
+    config = _sequence_config(tmp_path, port=port, request_log=request_log, escape=b"\x1b")
+    input_file = tmp_path / "input.bin"
+    input_file.write_bytes(b"2 + 2\x1b\n3 * 3\n")
+
+    res = harness.run_cassowire(config, "test", "--input", str(input_file))
+
+    assert_dump_map_pass(res, harness.test_target_bin())
+    assert res.returncode == 0, res.detail()
+    assert harness.error_lines(res.stdout) == [], res.detail()
+    assert "Sequence: sent 1/1 messages" in res.stdout, res.detail()
+    assert "Message 1/1 response (4 bytes): '" + harness.escaped(b"4\n9\n") + "'" in res.stdout
+    assert request_log.read_text().splitlines() == ["1 6", "2 6"]
+
+
+def test_sequence_escape_escape_byte(tmp_path: Path) -> None:
+    # `escape escape` decodes to a single literal escape byte: the message is
+    # 7 bytes ("2 + 2\x1b\n"), not 8, and the target answers ERR for it.
+    port = harness.free_port()
+    request_log = tmp_path / "requests.log"
+    config = _sequence_config(tmp_path, port=port, request_log=request_log, escape=b"\x1b")
+    input_file = tmp_path / "input.bin"
+    input_file.write_bytes(b"2 + 2\x1b\x1b\n")
+
+    res = harness.run_cassowire(config, "test", "--input", str(input_file))
+
+    assert_dump_map_pass(res, harness.test_target_bin())
+    assert res.returncode == 0, res.detail()
+    assert "Sequence: sent 1/1 messages" in res.stdout, res.detail()
+    assert "Message 1/1 response (4 bytes): '" + harness.escaped(b"ERR\n") + "'" in res.stdout
+    assert request_log.read_text().splitlines() == ["1 7"]
+
+
+def test_sequence_escape_dangling_passthrough(tmp_path: Path) -> None:
+    # A lone escape byte at EOF is passed through verbatim (never an error).
+    port = harness.free_port()
+    request_log = tmp_path / "requests.log"
+    config = _sequence_config(tmp_path, port=port, request_log=request_log, escape=b"\x1b")
+    input_file = tmp_path / "input.bin"
+    input_file.write_bytes(b"2 + 2\x1b")
+
+    res = harness.run_cassowire(config, "test", "--input", str(input_file))
+
+    assert_dump_map_pass(res, harness.test_target_bin())
+    assert res.returncode == 0, res.detail()
+    assert "Sequence: sent 1/1 messages" in res.stdout, res.detail()
+    assert request_log.read_text().splitlines() == ["1 6"]
+
+
+def test_sequence_rejects_escape_in_delimiter(tmp_path: Path) -> None:
+    # The escape byte must not occur in the delimiter (ambiguous encoding).
+    port = harness.free_port()
+    target = harness.test_target_bin()
+    config = harness.write_config(
+        tmp_path,
+        target_args=[str(target), "calc", "--port", str(port)],
+        port=port,
+        sequence={"enabled": True, "delimiter": b"\n", "escape": b"\n"},
+    )
+    input_file = tmp_path / "input.bin"
+    input_file.write_bytes(b"2 + 2\n")
+
+    res = harness.run_cassowire(config, "test", "--input", str(input_file))
+
+    assert res.returncode == 1, res.detail()
+    assert "Escape byte must not occur inside sequence.delimiter" in res.stdout, res.detail()
 
 
 def test_sequence_rejects_payload_combination(tmp_path: Path) -> None:

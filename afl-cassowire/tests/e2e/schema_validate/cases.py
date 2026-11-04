@@ -276,6 +276,18 @@ CASES: list[Case] = [
         # Delimiter may be a plain string.
         lambda: base_config(sequence=sequence_block(delimiter="\n", keep_delimiter=False)),
     ),
+    Case(
+        "valid_sequence_escape",
+        True,
+        # A single-byte escape marker enables delimiter escaping.
+        lambda: base_config(sequence=sequence_block(escape="}")),
+    ),
+    Case(
+        "valid_sequence_escape_binary",
+        True,
+        # The escape marker may be !!binary bytes (rendered as a 1-char string).
+        lambda: base_config(sequence=sequence_block(escape=b"\x00")),
+    ),
     # ------------------------------- must fail -------------------------------
     Case(
         "invalid_afl_loop_count_zero",
@@ -352,6 +364,24 @@ CASES: list[Case] = [
         False,
         # A delimiter must be a scalar (string or !!binary), not a list.
         lambda: base_config(sequence=sequence_block(delimiter=["\r\n", "\r\n"])),
+    ),
+    Case(
+        "invalid_sequence_escape_multi_byte",
+        False,
+        # The escape marker must be exactly one byte.
+        lambda: base_config(sequence=sequence_block(escape="ab")),
+    ),
+    Case(
+        "invalid_sequence_escape_empty",
+        False,
+        # An empty escape marker is rejected (omit the key to disable escaping).
+        lambda: base_config(sequence=sequence_block(escape="")),
+    ),
+    Case(
+        "invalid_sequence_escape_type",
+        False,
+        # The escape marker must be a scalar (string or !!binary), not a list.
+        lambda: base_config(sequence=sequence_block(escape=["}"])),
     ),
     Case(
         "invalid_afl_msg_log_level",

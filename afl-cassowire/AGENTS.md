@@ -241,6 +241,15 @@ are ignored helper-anchor fields (see Important details).
   optional banner drain before message 1; `final_poll_us` is the post-SHUT_WR
   drain. All waits go through `recv_window`/`send_all`, so the seccomp listener
   fd is multiplexed and no explicit pump is needed mid-sequence.
+  `sequence.escape` (optional single byte, absent = disabled) enables delimiter
+  escaping: `escape escape` decodes to a literal escape byte and
+  `escape delimiter` to a literal delimiter inside a message (no split); any
+  other escape occurrence (including a lone escape at EOF) is passed through
+  verbatim, so arbitrary fuzz input always decodes deterministically. The loader
+  rejects an escape byte that occurs inside the delimiter. Escaping makes a
+  message non-contiguous in the testcase, so `build_sequence()` assembles the
+  decoded message in a scratch buffer before wrapping it; `payload_buf`/`.data`
+  dumps therefore hold the decoded wire session while `.input` stays raw.
 - Startup-coverage fix (stability): `main.cpp` has a file-scope `__AFL_COVERAGE()`
   (afl-cc `-D` macro; no-op placeholder in `afl_compat.h`). afl-cassowire is built with
   the patched `afl-clang-fast++` (`patch/force_loc.patch`), which skips PC-guard edge
@@ -403,7 +412,8 @@ are ignored helper-anchor fields (see Important details).
   the announced map. Keeping `AFL_MAP_SIZE` only in `target.env` (the historical
   workaround) remains valid and recommended: the target-side value only
   satisfies the runtime's `>= MAP_SIZE` check and sizes nothing.
-- Config keys added after the original design: `target.env`, `target.env_preserve`, `target.stdin_path`, `payload.*`, `sequence.*`,
+- Config keys added after the original design: `target.env`, `target.env_preserve`, `target.stdin_path`, `payload.*`, `sequence.*`
+  (including `sequence.escape`),
   `afl.cov_discard_init`, `afl.cov_discard_probe`, `afl.cov_discard_probe_cmplog`,
   `afl.dump_history`, `afl.history_dedup`, `afl.var_bytes_method`,
   `afl.var_bytes_stats_path`, `afl.msg_log_level`,
@@ -438,8 +448,10 @@ are ignored helper-anchor fields (see Important details).
   sum of the windows, each independently capped by `network.timeout_ms`. This is
   execution semantics only: AFL++ still mutates the testcase byte-wise, so
   message boundaries are not protected (dictionary entries for verbs/framing
-  help). `payload.prefix/suffix` is rejected in sequence mode; use
-  `sequence.message_prefix/message_suffix`.
+  help). A message body that legitimately contains the delimiter is expressed
+  with `sequence.escape` (`escape delimiter` in the testcase) instead of a
+  synthetic "unique" delimiter. `payload.prefix/suffix` is rejected in sequence
+  mode; use `sequence.message_prefix/message_suffix`.
 - `network::wait_response()` reads until the peer closes the connection (EOF) or
   `network.timeout_ms` expires. A keep-alive server (nginx) that ignores the
   half-close (`shutdown(SHUT_WR)` in `exchange_once`) may keep the connection open
